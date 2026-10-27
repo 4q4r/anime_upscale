@@ -117,6 +117,28 @@ def _pinned_connection_class(pins: dict[str, str]) -> type:
     )
 
 
+class _PinnedPoolManager(urllib3.PoolManager):
+    """
+    PoolManager that swaps the connection class AFTER pool construction.
+
+    Passing connection_class through connection_pool_kw would leak into
+    urllib3's PoolKey (TypeError) — _new_pool is the correct seam.
+    """
+
+    pins: dict[str, str]
+
+    def _new_pool(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        request_context: Any = None,  # noqa: ANN401 - urllib3 opaque context
+    ) -> urllib3.HTTPConnectionPool:
+        pool = super()._new_pool(scheme, host, port, request_context)
+        pool.ConnectionCls = _pinned_connection_class(self.pins)
+        return pool
+
+
 class PinnedSession(requests.Session):
     """Session with per-host DoH pins; proxy env is ignored (incompatible with pinning)."""
 
@@ -147,9 +169,10 @@ class _PinnedAdapter(HTTPAdapter):
         super().__init__(**kwargs)
 
     def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
-        """Install the pinned connection class (dial-by-IP, hostname TLS)."""
-        kwargs["connection_class"] = _pinned_connection_class(self._pins)
-        super().init_poolmanager(*args, **kwargs)
+        """Install the pinned pool manager (dial-by-IP, hostname TLS)."""
+        manager = _PinnedPoolManager(*args, **kwargs)
+        manager.pins = self._pins
+        self.poolmanager = manager
 
 
 # ── wt (X-Website-Token) — ported verbatim from gofile-dl run.py:121-144 ────────────────
