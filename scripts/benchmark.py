@@ -30,9 +30,22 @@ def _count_frames(path: Path) -> int:
     """Real decoded frame count via ffprobe (ffprobe is a resolved tool, §12.3)."""
     ffprobe = resolve_tool("ffprobe")
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0",
-         "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True, check=True,
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return int(result.stdout.strip() or 0)
 
@@ -54,14 +67,9 @@ def main() -> int:
         return 1
 
     ffmpeg_path = resolve_tool("ffmpeg", config.tools.ffmpeg)
-    hardware = detect_hardware(
-        config.hardware, cli_num_streams=None, nn_stages_selected=True
-    )
+    hardware = detect_hardware(config.hardware, cli_num_streams=None, nn_stages_selected=True)
     gpu_label = format_gpu_summary(hardware).replace("×1", "").replace("×", "x").strip(", ")
-    gpu_slug = (
-        gpu_label.split(",")[0].replace(" ", "").replace("NVIDIA", "").strip("-")
-        or "GPU"
-    )
+    gpu_slug = gpu_label.split(",")[0].replace(" ", "").replace("NVIDIA", "").strip("-") or "GPU"
     rows: list[str] = []
 
     for chain_name, stages in CHAINS.items():
