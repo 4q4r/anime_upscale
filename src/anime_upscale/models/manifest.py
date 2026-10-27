@@ -46,9 +46,13 @@ def load_manifest(manifest_path: Path) -> dict[str, ModelEntry]:
 
 
 def expected_model_path(models_dir: Path, entry: ModelEntry) -> Path:
-    """models/upscale/<member-or-name>.pth layout (plan §2/§6)."""
-    """models/upscale/<member-or-name>.pth layout (plan §2/§6)."""
-    filename = entry.member or f"{entry.name}.pth"
+    """
+    Flat models/upscale/<member-basename> layout (plan §2/§6).
+
+    The manifest's `member` carries the full path INSIDE the release zip
+    (folder prefix); the local artifact layout stays flat.
+    """
+    filename = Path(entry.member).name if entry.member else f"{entry.name}.pth"
     return models_dir / "upscale" / filename
 
 

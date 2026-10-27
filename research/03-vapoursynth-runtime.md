@@ -128,20 +128,37 @@ import os, vapoursynth as vs
 from vapoursynth import core
 import vsmlrt
 
+
 def process(src):
-    rgb = core.resize.Bicubic(src, format=vs.RGBH, matrix_in_s="709",
-                              transfer_in_s="709", primaries_in_s="709")
+    rgb = core.resize.Bicubic(
+        src, format=vs.RGBH, matrix_in_s="709", transfer_in_s="709", primaries_in_s="709"
+    )
     be = vsmlrt.Backend.TRT_RTX(fp16=True, num_streams=2)
     rgb = vsmlrt.RealESRGANv2(rgb, model=vsmlrt.RealESRGANv2Model["animejanaiV3_HD_L2"], backend=be)
-    if os.getenv('VSPIPE_RIFE', '0') == '1':
-        be = vsmlrt.Backend.TRT(fp16=True, tf32=False, output_format=1, use_cublas=False,
-                                use_cuda_graph=True, use_cudnn=False, num_streams=1)
-        rgb = vsmlrt.RIFE(rgb, model=vsmlrt.RIFEModel["v4_7"].value,
-                          ensemble=True, backend=be, scale=1.0, _implementation=1)
-    return core.resize.Bicubic(rgb, format=vs.YUV420P10, matrix_s="709",
-                               transfer_s="709", primaries_s="709")
+    if os.getenv("VSPIPE_RIFE", "0") == "1":
+        be = vsmlrt.Backend.TRT(
+            fp16=True,
+            tf32=False,
+            output_format=1,
+            use_cublas=False,
+            use_cuda_graph=True,
+            use_cudnn=False,
+            num_streams=1,
+        )
+        rgb = vsmlrt.RIFE(
+            rgb,
+            model=vsmlrt.RIFEModel["v4_7"].value,
+            ensemble=True,
+            backend=be,
+            scale=1.0,
+            _implementation=1,
+        )
+    return core.resize.Bicubic(
+        rgb, format=vs.YUV420P10, matrix_s="709", transfer_s="709", primaries_s="709"
+    )
 
-src = core.bs.VideoSource(args['in'], cachemode=3, cachepath=args['cache'])
+
+src = core.bs.VideoSource(args["in"], cachemode=3, cachepath=args["cache"])
 process(src).set_output()
 ```
 Typical args visible: fp16 everywhere (`RGBH` input + `output_format=1`), `num_streams=2`
@@ -151,14 +168,26 @@ for the upscaler, `ensemble=True` on RIFE, TRT-RTX backend for the ESRGAN, BestS
 `[community, github.com/natural-harmonia-gropius/mpv-config → portable_config/filters/rife.py]`:
 ```python
 from vsmlrt import RIFE, BackendV2, RIFEModel
+
+
 def rife(clip, fps):
     pixel_format = clip.format.id
     clip = clip.misc.SCDetect(threshold=0.2)
     clip = clip.resize.Bilinear(format=vs.RGBH, matrix_in=vs.MATRIX_BT709)
-    clip = RIFE(clip, model=RIFEModel.v4_26, ensemble=False,
-                backend=BackendV2.TRT(num_streams=4, fp16=True, output_format=1,
-                                      use_cuda_graph=True, engine_folder=gettempdir()),
-                video_player=True, _implementation=2)
+    clip = RIFE(
+        clip,
+        model=RIFEModel.v4_26,
+        ensemble=False,
+        backend=BackendV2.TRT(
+            num_streams=4,
+            fp16=True,
+            output_format=1,
+            use_cuda_graph=True,
+            engine_folder=gettempdir(),
+        ),
+        video_player=True,
+        _implementation=2,
+    )
     clip = clip.resize.Bilinear(format=pixel_format, matrix=vs.MATRIX_BT709)
     return clip, fps * 2
 ```
@@ -348,14 +377,20 @@ import vapoursynth as vs
 from vsmlrt import RIFE, RIFEModel, BackendV2  # scripts/vsmlrt.py from vs-mlrt release
 
 core = vs.core()
-src = core.bs.VideoSource(r"/path/input.mkv")                 # BestSource (bundled with VS R65+)
-rgb = src.resize.Bilinear(format=vs.RGBH, matrix_in=vs.MATRIX_BT709)   # fp16 RGB
-rgb = rgb.misc.SCDetect(threshold=0.2)                        # scene detection BEFORE RIFE
-interp = RIFE(rgb, multi=Fraction(5, 2),                      # 23.976 -> 59.94 fps, one pass
-              model=RIFEModel.v4_7, ensemble=False,
-              backend=BackendV2.TRT(fp16=True, num_streams=2, output_format=1,
-                                    use_cuda_graph=True, static_shape=True),
-              video_player=False, _implementation=2)
+src = core.bs.VideoSource(r"/path/input.mkv")  # BestSource (bundled with VS R65+)
+rgb = src.resize.Bilinear(format=vs.RGBH, matrix_in=vs.MATRIX_BT709)  # fp16 RGB
+rgb = rgb.misc.SCDetect(threshold=0.2)  # scene detection BEFORE RIFE
+interp = RIFE(
+    rgb,
+    multi=Fraction(5, 2),  # 23.976 -> 59.94 fps, one pass
+    model=RIFEModel.v4_7,
+    ensemble=False,
+    backend=BackendV2.TRT(
+        fp16=True, num_streams=2, output_format=1, use_cuda_graph=True, static_shape=True
+    ),
+    video_player=False,
+    _implementation=2,
+)
 out = interp.resize.Bilinear(format=vs.YUV420P10, matrix=vs.MATRIX_BT709)
 out.set_output()  # vspipe consumes clip 0; or in-Python: out.output(sys.stdout.buffer, y4m=True)
 ```
@@ -363,14 +398,24 @@ out.set_output()  # vspipe consumes clip 0; or in-Python: out.output(sys.stdout.
 ### Skeleton — arbitrary-FPS gold path (vsrife inside the same VS process)
 ```python
 import vapoursynth as vs
-from vsrife import rife   # pip install vsrife; PyTorch cu130 + torch_tensorrt for trt=True
+from vsrife import rife  # pip install vsrife; PyTorch cu130 + torch_tensorrt for trt=True
+
 core = vs.core()
 src = core.bs.VideoSource(r"/path/input.mkv")
 rgb = src.resize.Bilinear(format=vs.RGBH, matrix_in=vs.MATRIX_BT709)
-interp = rife(rgb, model="4.25", fps_num=60000, fps_den=1001,  # exact 59.94 target, single pass
-              sc=True, sc_threshold=0.15, scale=1.0,
-              trt=True, trt_static_shape=True, trt_opt_shape=[1920, 1080],
-              trt_cache_dir="/home/whoami/.cache/vsrife")
+interp = rife(
+    rgb,
+    model="4.25",
+    fps_num=60000,
+    fps_den=1001,  # exact 59.94 target, single pass
+    sc=True,
+    sc_threshold=0.15,
+    scale=1.0,
+    trt=True,
+    trt_static_shape=True,
+    trt_opt_shape=[1920, 1080],
+    trt_cache_dir="/home/whoami/.cache/vsrife",
+)
 interp.resize.Bilinear(format=vs.YUV420P10, matrix=vs.MATRIX_BT709).set_output()
 # then: vspipe -c y4m script.vpy - | ffmpeg -i - -c:v hevc_nvenc -crf 20 out.mkv
 ```

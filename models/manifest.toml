@@ -1,0 +1,16 @@
+# models/manifest.toml — закреплённые артефакты моделей (sha256-пины). План §6.
+# Бинарники в git не попадают: `anime-pipeline models fetch` скачивает и верифицирует.
+
+[models.2x_AnimeJaNai_HD_V3_Compact]
+url = "https://github.com/the-database/mpv-AnimeJaNai/releases/download/3.0.0/2x_AnimeJaNai_HD_V3_ModelsOnly.zip"
+member = "2x_AnimeJaNai_HD_V3_ModelsOnly/2x_AnimeJaNai_HD_V3_Compact.pth"   # извлекается из релизного zip
+sha256 = "af7307eee19e5982a8014dd0e4650d3bde2e25aa78d2105a4bdfd947636e4c8f"
+license = "CC-BY-NC-SA-4.0"
+
+# Документационная запись: веса интерполяции управляются обёрткой vsrife.
+# Модель 4.25 скачивается самой обёрткой (vsrife auto-download) из релизов
+# HolyWu/vs-rife при первом запуске стадии interpolate; кэш TensorRT-движков —
+# в каталоге [stages.interpolate] trt_cache_dir. Локально НЕ закрепляется.
+[models.rife_4_25]
+source = "vsrife 5.7.0 wrapper release (auto-download); NOT locally pinned"
+license = "MIT"

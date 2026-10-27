@@ -24,7 +24,7 @@ class TestManifest:
         entries = load_manifest(REPO / "models" / "manifest.toml")
         entry = entries["2x_AnimeJaNai_HD_V3_Compact"]
         assert entry.sha256 == GOOD_SHA
-        assert entry.member == "2x_AnimeJaNai_HD_V3_Compact.pth"
+        assert entry.member == "2x_AnimeJaNai_HD_V3_ModelsOnly/2x_AnimeJaNai_HD_V3_Compact.pth"
         assert "mpv-AnimeJaNai/releases/download/3.0.0" in entry.url
         assert entry.license == "CC-BY-NC-SA-4.0"
         assert entries["rife_4_25"].source_note  # documentational entry
@@ -56,7 +56,7 @@ class TestFetchModel:
         import anime_upscale.models.fetch as fetch_mod
 
         content = b"PTHBYTES"
-        body = _zip_bytes("2x_AnimeJaNai_HD_V3_Compact.pth", content)
+        body = _zip_bytes("2x_AnimeJaNai_HD_V3_ModelsOnly/2x_AnimeJaNai_HD_V3_Compact.pth", content)
         real_sha = __import__("hashlib").sha256(content).hexdigest()
         entry = load_manifest(REPO / "models" / "manifest.toml")["2x_AnimeJaNai_HD_V3_Compact"]
         pinned = type(entry)(
@@ -89,7 +89,9 @@ class TestFetchModel:
     ) -> None:
         import anime_upscale.models.fetch as fetch_mod
 
-        body = _zip_bytes("2x_AnimeJaNai_HD_V3_Compact.pth", b"tampered")
+        body = _zip_bytes(
+            "2x_AnimeJaNai_HD_V3_ModelsOnly/2x_AnimeJaNai_HD_V3_Compact.pth", b"tampered"
+        )
         entry = self._entry()
 
         class _Resp:

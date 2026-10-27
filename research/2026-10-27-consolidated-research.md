@@ -26,10 +26,18 @@ Provenance: every claim in the sub-reports carries `[V]` (verified via GitHub/Py
 
 ```python
 from vsrife import rife
-out = rife(rgb_h, model="4.25",
-           fps_num=60000, fps_den=1001,     # exact 59.94 target — ONE pass, no x2 stacking
-           sc=True, sc_threshold=0.15,      # scene-change passthrough
-           trt=True, trt_opt_shape=[1920, 1080], trt_cache_dir="~/.cache/vsrife")
+
+out = rife(
+    rgb_h,
+    model="4.25",
+    fps_num=60000,
+    fps_den=1001,  # exact 59.94 target — ONE pass, no x2 stacking
+    sc=True,
+    sc_threshold=0.15,  # scene-change passthrough
+    trt=True,
+    trt_opt_shape=[1920, 1080],
+    trt_cache_dir="~/.cache/vsrife",
+)
 ```
 
 Why (all verified):

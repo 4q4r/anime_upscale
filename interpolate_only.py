@@ -1,7 +1,8 @@
-﻿import os
-import sys
-import subprocess
 import argparse
+import os
+import subprocess
+import sys
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,9 +17,16 @@ torch.backends.cudnn.allow_tf32 = True
 def get_video_info(input_path):
     """Получает параметры исходного видео через ffprobe."""
     cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
-        "-of", "default=noprint_wrappers=1:nokey=1", input_path
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,r_frame_rate,nb_frames",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        input_path,
     ]
     out = subprocess.check_output(cmd).decode("utf-8").strip().splitlines()
     w, h = int(out[0]), int(out[1])
@@ -28,15 +36,13 @@ def get_video_info(input_path):
     return w, h, fps, nb_frames
 
 
-def interpolate_video(args):
+def interpolate_video(args) -> None:
     w, h, orig_fps, nb_frames = get_video_info(args.input)
     target_fps = args.target_fps
 
-    print(f"[INFO] Входной файл: {args.input}")
-    print(f"[INFO] Разрешение: {w}x{h} | Исходный FPS: {orig_fps:.3f} -> Целевой FPS: {target_fps}")
-    
+
     rife_abs_path = os.path.abspath(args.rife_dir)
-    
+
     # Добавляем подпапку 'model' в системный путь Python, так как код RIFE теперь лежит там
     model_dir = os.path.join(rife_abs_path, "model")
     if model_dir not in sys.path:
@@ -44,41 +50,77 @@ def interpolate_video(args):
     if rife_abs_path not in sys.path:
         sys.path.insert(0, rife_abs_path)
 
-    print("[INFO] Загрузка модели RIFE из папки model...")
     try:
         from RIFE_HDv3 import Model
-    except ImportError as e:
-        print(f"[ERROR] Не удалось найти RIFE_HDv3.py в каталоге {model_dir}")
-        raise e
+    except ImportError:
+        raise
 
     model = Model()
     weights_path = os.path.join(rife_abs_path, "train_log")
-    
+
     if not os.path.exists(weights_path) or not os.listdir(weights_path):
-        print(f"[ERROR] Папка с весами пуста или не найдена: {weights_path}")
-        print("[ERROR] Положите файл весов модели (.pkl) в models/rife/train_log/")
         return
 
     model.load_model(weights_path, -1)
     model.eval()
     model.device()
     model.net.to(torch.device("cuda:0"))
-    print("[INFO] Модель RIFE успешно инициализирована на RTX 5080!")
 
     # Настройка конвейеров FFmpeg для чтения исходника и записи результата через NVENC
     decode_cmd = [
-        "ffmpeg", "-loglevel", "error", "-i", args.input, 
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-"
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-i",
+        args.input,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
     ]
     encode_cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(target_fps), "-i", "-",
-        "-i", args.input,
-        "-map", "0:v:0", "-map", "1:a?", "-map", "1:s?",
-        "-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq",
-        "-pix_fmt", "yuv420p10le", "-rc", "vbr", "-cq", "16", "-b:v", "0",
-        "-c:a", "copy", "-c:s", "copy",
-        args.output
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{w}x{h}",
+        "-r",
+        str(target_fps),
+        "-i",
+        "-",
+        "-i",
+        args.input,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-map",
+        "1:s?",
+        "-c:v",
+        "hevc_nvenc",
+        "-preset",
+        "p7",
+        "-tune",
+        "hq",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-rc",
+        "vbr",
+        "-cq",
+        "16",
+        "-b:v",
+        "0",
+        "-c:a",
+        "copy",
+        "-c:s",
+        "copy",
+        args.output,
     ]
 
     decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, bufsize=w * h * 3 * 4)
@@ -89,12 +131,18 @@ def interpolate_video(args):
 
     raw0 = decoder.stdout.read(frame_bytes)
     if not raw0:
-        print("[ERROR] Ошибка чтения видеопотока!")
         return
 
     curr_frame_np = np.frombuffer(raw0, dtype=np.uint8).reshape((h, w, 3))
-    curr_tensor = torch.from_numpy(curr_frame_np).to("cuda:0", non_blocking=True).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
-    
+    curr_tensor = (
+        torch.from_numpy(curr_frame_np)
+        .to("cuda:0", non_blocking=True)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+        .div_(255.0)
+    )
+
     encoder.stdin.write(curr_frame_np.tobytes())
     pbar.update(1)
 
@@ -106,9 +154,16 @@ def interpolate_video(args):
         raw1 = decoder.stdout.read(frame_bytes)
         if not raw1:
             break
-        
+
         next_frame_np = np.frombuffer(raw1, dtype=np.uint8).reshape((h, w, 3))
-        next_tensor = torch.from_numpy(next_frame_np).to("cuda:0", non_blocking=True).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+        next_tensor = (
+            torch.from_numpy(next_frame_np)
+            .to("cuda:0", non_blocking=True)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .float()
+            .div_(255.0)
+        )
         in_frame_idx += 1
 
         target_time_end = in_frame_idx / orig_fps
@@ -136,7 +191,16 @@ def interpolate_video(args):
                     mid_inf = model.inference(i0_pad, i1_pad, timestep=timestep)
                     mid = mid_inf[:, :, :h, :w]
 
-                mid_np = mid.squeeze(0).permute(1, 2, 0).clamp_(0.0, 1.0).mul_(255.0).round_().to(torch.uint8).cpu().numpy()
+                mid_np = (
+                    mid.squeeze(0)
+                    .permute(1, 2, 0)
+                    .clamp_(0.0, 1.0)
+                    .mul_(255.0)
+                    .round_()
+                    .to(torch.uint8)
+                    .cpu()
+                    .numpy()
+                )
 
             encoder.stdin.write(mid_np.tobytes())
             out_frame_idx += 1
@@ -151,7 +215,6 @@ def interpolate_video(args):
     encoder.stdin.close()
     decoder.wait()
     encoder.wait()
-    print(f"[SUCCESS] Готово! Видео сохранено в: {args.output}")
 
 
 if __name__ == "__main__":

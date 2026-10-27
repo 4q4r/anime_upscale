@@ -3,7 +3,7 @@
 **Status:** PLAN v1.2 (documentation only; no production code written by this document).
 **Scope:** restructure two standalone scripts (`process_anime.py`, `interpolate_only.py`) into a modular, user-friendly pipeline where every stage is optional and independently runnable: `descale → deband → upscale → interpolate → encode`, selectable as an arbitrary subset or as the full chain.
 **Fixed stack (from research/, treat as decisions, not proposals):** VapourSynth R81, vsrife 5.7.0 (model 4.25, `fps_num/fps_den`, `sc=True`, `trt=True`), 2x_AnimeJaNai HD V3 Compact `.pth` (sha256 `af7307eee19e5982a8014dd0e4650d3bde2e25aa78d2105a4bdfd947636e4c8f`) via spandrel, deband via f3kdb/vs-deband, **encode = CPU-only libx265 10-bit (owner decision 2026-10-27, confirmed by research/04-encoders.md; NVENC backend removed from config — evidence: CQ16-scale mismatch +85% size, no psy-RDO/dark-AQ equivalents, UHQ temporal filter contraindicated for animated content)**. Flag sheet: research/05-encode-flags.md.
-**Owner standing rules applied:** everything in one TOML config, no env vars; Russian TTY output with color + explicit `--no-color`; no slang in identifiers/strings; uv (PEP 621, `src/` layout, no version pinning in manifests, committed `uv.lock`); single source of truth, no fallback config chains; target machine RTX 5080 / Linux.
+**Owner standing rules applied:** everything in one TOML config, no env vars; Russian TTY output with color + explicit `--no-color`; no slang in identifiers/strings; uv (PEP 621, `src/` layout, no version pinning in manifests, committed `uv.lock`); single source of truth, no fallback config chains; target machine RTX 5080 — **the pipeline MUST run on both Linux and Windows (owner rule, 2026-10-28): see §12 cross-platform requirements**.
 
 ---
 
@@ -418,7 +418,7 @@ models/
 ## 7. Migration plan (ordered, from current two scripts to the new structure)
 
 1. **git init + .gitignore** (owner authorization for repo creation; models binaries ignored, `input/*` + `output/*` ignored, `uv.lock` committed). Initial commit = current state, so deletion steps stay revertible. Create `input/` and `output/` directories (empty, `.gitkeep`-only).
-2. **uv scaffold:** `pyproject.toml` (PEP 621, `[project.scripts] anime-pipeline`), `src/anime_upscale/` skeleton, `uv add` deps: `vapoursynth`, `vsrife`, `spandrel`, `torch` (CUDA build), `numpy`, `tqdm`; dev group: `pytest`, `ruff` (`select=ALL` per owner gate), `ty`. No version pins in the manifest.
+2. **uv scaffold:** `pyproject.toml` (PEP 621, `[project.scripts] anime-pipeline`), `src/anime_upscale/` skeleton, `uv add` deps: `vapoursynth`, `vsrife`, `spandrel`, `torch` (CUDA build), `numpy`, `tqdm`; dev group: `pytest`, `ruff` (`select=ALL` per owner gate), `ty`. No version pins in the manifest. **Venv discipline (owner rule, 2026-10-28): EVERY runtime and dev dependency must be declared in `pyproject.toml` and resolved into the project `.venv` — the uv venv is the ONLY runtime environment. System-installed Python packages (e.g. distro vapoursynth/torch) MUST NOT be relied upon, imported via system site-packages, sys.path hacks, or `--system`/`--system-site-packages` escapes, even when they are importable on this machine. All execution and gates go through `uv run …` inside the project; verify with `uv run python -c "import vapoursynth"` (etc.) resolving from `.venv`. System tools that are NOT Python packages (ffmpeg, git, nvidia-smi) stay system-level.**
 3. **Config first:** write `config.toml` + `config.py` (load → validate → merge; includes the v1.1 `[hardware]` override and `[upload]` sections), with tests. Nothing else imports ffmpeg/VS yet.
 4. **Stage port, interpolation first:** `stages/interpolate.py` + `stages/encode.py` + `pipeline.py` minimal path reproduces `interpolate_only.py` behavior (arbitrary target fps, scene guard, 10-bit HEVC, audio/subs copy) — now via vsrife 4.25 instead of pre-4.22 PyTorch RIFE. `interpolate_only.py`'s per-output-frame timestep logic is superseded by vsrife's `fps_num/fps_den` — do not port it.
 5. **Upscale port:** `stages/upscale.py` reuses the spandrel loading pattern from `process_anime.py` (ModelLoader → fp16) inside the `std.ModifyFrame` selector; the hand-rolled numpy→tensor→numpy plumbing and the ffmpeg rawvideo decode pipe are **not** ported (replaced by VS graph + y4m).
@@ -658,6 +658,17 @@ Semantics (owner requirement: «подача списка файлов на па
 - **Literal duplicate entries** (identical strings) → deduplicated to one with a printed warning.
 - **Output side:** the v1.1 overwrite-with-warning rule (§3) applies per file; the batch summary (§11.5) lists every overwritten output.
 - **Cross-run:** the §11.1 idempotent-skip rule applies — re-running the same batch skips already-downloaded URL entries and processes them from `input/` as-is (owner requirement); bare-name entries behave identically to v1.1.
+
+---
+
+## 12. Cross-platform requirements (Linux + Windows) — v1.3, owner rule 2026-10-28
+
+1. **Paths:** all filesystem handling via `pathlib`; state/cache locations platform-aware — state file resolves to `%LOCALAPPDATA%\anime_upscale\state\gofile_guest.toml` on Windows, `$XDG_STATE_HOME`/`~/.local/state/anime_upscale/` on Linux (one resolution function, platform branch, same TOML format); TRT cache dirs likewise. No hardcoded `/`-prefixed or `~`-only paths in code.
+2. **Processes:** multi-GPU workers and all subprocess plumbing must be **spawn-safe** (`multiprocessing.get_context("spawn")` semantics, `if __name__ == "__main__":` guards, picklable-only worker args) — Windows has no fork, and spawn-safety must not depend on Linux accident; worker GPU pinning via `CUDA_VISIBLE_DEVICES` (works on both platforms).
+3. **External tools discovery:** ffmpeg/ffprobe resolved from PATH first, with an optional `[tools] ffmpeg = "path"` / `[tools] ffprobe = "path"` config override (single resolution helper; loud error naming the missing tool and the override key when not found). nvidia-smi is diagnostic-only — its absence never blocks (torch is the detection source). README documents per-OS prerequisites (ffmpeg in PATH, NVIDIA driver, uv install).
+4. **Console:** Russian colored TTY on Windows — enable VT processing on win32 before first colored output (stdlib `os.system("")` trick or ctypes `SetConsoleMode`, no mandatory colorama dependency); `--no-color`/`--no-tty` behave identically on both OSes; `sys.stdout.isatty()` is the TTY test.
+5. **Wheels reality:** vapoursynth/vsrife/spandrel/torch-tensorrt Windows wheels exist for the current stack — if any wheel is missing for the running platform at install time, that is a loud BLOCKED error (never a silent CPU/system fallback); record the verified platform matrix in the report (Linux verified live; Windows wheels verified via PyPI metadata, not live-installed).
+6. **Subprocess/text:** all pipes binary-mode (y4m raw), text decoding only where explicit; no shell=True anywhere; argparse/progress `\r` handling works on both consoles.
 
 ---
 

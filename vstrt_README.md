@@ -21,20 +21,19 @@ Arguments:
   ```python3
   from typing import TypedDict
 
+
   class Output(TypedDict):
       clip: vs.VideoNode
       num_planes: int
 
-  prop = "planes" # arbitrary non-empty string
-  output = core.trt.Model(src, engine_path, flexible_output_prop=prop) # type: Output
+
+  prop = "planes"  # arbitrary non-empty string
+  output = core.trt.Model(src, engine_path, flexible_output_prop=prop)  # type: Output
 
   clip = output["clip"]
   num_planes = output["num_planes"]
 
-  output_planes = [
-      clip.std.PropToClip(prop=f"{prop}{i}")
-      for i in range(num_planes)
-  ] # type: list[vs.VideoNode]
+  output_planes = [clip.std.PropToClip(prop=f"{prop}{i}") for i in range(num_planes)]  # type: list[vs.VideoNode]
   ```
   
 When `overlap` and `tilesize` are not specified, the filter will internally try to resize the network to fit the input clips. This might not always work (for example, the network might require the width to be divisible by 8), and the filter will error out in this case.
@@ -63,7 +62,11 @@ In vpy script:
 # DPIR
 src = core.std.BlankClip(src, width=640, height=360, format=vs.GRAYS)
 sigma = 10.0
-flt = core.trt.Model([src, core.std.BlankClip(src, color=sigma/255.0)], engine_path="dpir_gray_1080p_dynamic.engine", tilesize=[640, 360])
+flt = core.trt.Model(
+    [src, core.std.BlankClip(src, color=sigma / 255.0)],
+    engine_path="dpir_gray_1080p_dynamic.engine",
+    tilesize=[640, 360],
+)
 ```
 
 ## trtexec useful arguments
