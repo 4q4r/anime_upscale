@@ -74,6 +74,8 @@ ignore = [
 "src/anime_upscale/stages/*" = ["PLC0415"]
 # The CLI driver keeps heavy imports (VS-backed stage registry, model fetch) lazy.
 "src/anime_upscale/cli.py" = ["PLC0415"]
+# Standalone scripts are not packages (INP001); benchmark.py imports the venv package.
+"scripts/*" = ["INP001"]
 
 [tool.ty.environment]
 python-version = "3.14"

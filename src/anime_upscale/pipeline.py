@@ -43,7 +43,11 @@ def build_graph(ctx: StageContext, clip: vs.VideoNode) -> vs.VideoNode:
         if name == "upscale" or (name == "interpolate" and "upscale" not in ctx.run.stages):
             clip = _to_rgbh(clip)
         clip = get_builder(name)(ctx, clip)
-    return clip.resize.Bicubic(format=vs.YUV420P10, matrix=vs.MATRIX_BT709)  # ty: ignore[unresolved-attribute]
+    if clip.format.color_family == vs.RGB:
+        # RGB → YUV needs the matrix; YUV → YUV depth conversion must NOT pass one
+        # (zimg has no same-family path with a matrix — live-verified in benchmark).
+        return clip.resize.Bicubic(format=vs.YUV420P10, matrix=vs.MATRIX_BT709)  # ty: ignore[unresolved-attribute]
+    return clip.resize.Bicubic(format=vs.YUV420P10)  # ty: ignore[unresolved-attribute]
 
 
 def check_target_fps(source_fps: Fraction, target_fps: tuple[int, int]) -> None:
