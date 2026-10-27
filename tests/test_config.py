@@ -1,0 +1,179 @@
+"""Config layer tests: schema validation, merge precedence, rational fps parsing."""
+
+from pathlib import Path
+
+import pytest
+
+from anime_upscale.config import (
+    ConfigError,
+    load_config,
+    parse_fps_argument,
+    resolve_run,
+)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_default() -> object:
+    return load_config(REPO_ROOT / "config.toml")
+
+
+class TestDefaults:
+    def test_load_default_config_matches_plan_values(self) -> None:
+        cfg = _load_default()
+        assert cfg.pipeline_order == ("descale", "deband", "upscale", "interpolate", "encode")
+        assert cfg.stages.interpolate.target_fps == (60000, 1001)
+        assert cfg.stages.interpolate.model == "4.25"
+        assert cfg.stages.interpolate.trt is True
+        assert cfg.stages.encode.crf == 16
+        assert cfg.stages.encode.preset == "slow"
+        assert cfg.stages.encode.x265_params == tuple(sorted(cfg.stages.encode.x265_params))
+        assert ("no-sao", "1") in cfg.stages.encode.x265_params
+        assert ("psy-rd", "2.0") in cfg.stages.encode.x265_params
+        assert cfg.stages.upscale.model == "2x_AnimeJaNai_HD_V3_Compact"
+        assert cfg.stages.descale.kernel == "bicubic"
+        assert cfg.stages.deband.radius == 16
+        assert cfg.models.manifest == Path("models/manifest.toml")
+        assert set(cfg.profiles) == {"full", "upscale-only", "interp-only"}
+
+    def test_profiles_stage_lists(self) -> None:
+        cfg = _load_default()
+        assert cfg.profiles["full"].stages == (
+            "descale",
+            "deband",
+            "upscale",
+            "interpolate",
+            "encode",
+        )
+        assert cfg.profiles["upscale-only"].stages == ("upscale", "encode")
+        assert cfg.profiles["interp-only"].stages == ("interpolate", "encode")
+        assert cfg.profiles["full"].upload is True
+
+    def test_gofile_fetch_defaults_from_source(self) -> None:
+        cfg = _load_default()
+        assert cfg.fetch.gofile.wt_salt == "12af056dacea0b"
+        assert cfg.fetch.gofile.language == "en-US"
+        assert "Chrome/126.0.0.0" in cfg.fetch.gofile.user_agent
+
+
+class TestUnknownKeys:
+    def test_unknown_stage_key_is_hard_error(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            '[stages.descale]\nkernel = "bicubic"\nnot_a_key = 1\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="not_a_key"):
+            load_config(cfg_file)
+
+    def test_unknown_top_level_section_is_hard_error(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[mystery]\nkey = 1\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="mystery"):
+            load_config(cfg_file)
+
+    def test_unknown_profile_key_is_hard_error(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            '[profiles.full]\nstages = ["encode"]\nwhoops = true\n', encoding="utf-8"
+        )
+        with pytest.raises(ConfigError, match="whoops"):
+            load_config(cfg_file)
+
+
+class TestRationalFps:
+    def test_fraction_string(self) -> None:
+        assert parse_fps_argument("60000/1001") == (60000, 1001)
+
+    def test_integer_string(self) -> None:
+        assert parse_fps_argument("60") == (60, 1)
+
+    def test_ntsc_decimal_maps_to_exact_rational(self) -> None:
+        assert parse_fps_argument("23.976") == (24000, 1001)
+        assert parse_fps_argument("59.94") == (60000, 1001)
+
+    def test_plain_decimal_exact(self) -> None:
+        assert parse_fps_argument("24.5") == (49, 2)
+
+    def test_zero_and_negative_rejected(self) -> None:
+        with pytest.raises(ConfigError):
+            parse_fps_argument("0")
+        with pytest.raises(ConfigError):
+            parse_fps_argument("-5")
+
+    def test_garbage_rejected(self) -> None:
+        with pytest.raises(ConfigError):
+            parse_fps_argument("sixty")
+
+
+class TestResolveRun:
+    def test_profile_selects_stages(self) -> None:
+        cfg = _load_default()
+        run = resolve_run(cfg, profile="interp-only")
+        assert run.stages == ("interpolate", "encode")
+        assert run.interpolate.target_fps == (60, 1)  # per-profile deep override
+
+    def test_no_profile_and_no_stages_is_error_listing_profiles(self) -> None:
+        cfg = _load_default()
+        with pytest.raises(ConfigError, match="interp-only"):
+            resolve_run(cfg, profile=None)
+
+    def test_profile_not_found_lists_available(self) -> None:
+        cfg = _load_default()
+        with pytest.raises(ConfigError, match="upscale-only"):
+            resolve_run(cfg, profile="nonexistent")
+
+    def test_stages_override_profile(self) -> None:
+        cfg = _load_default()
+        run = resolve_run(cfg, profile="full", stages=("interpolate", "encode"))
+        assert run.stages == ("interpolate", "encode")
+
+    def test_unknown_stage_name_rejected(self) -> None:
+        cfg = _load_default()
+        with pytest.raises(ConfigError, match="teleport"):
+            resolve_run(cfg, stages=("teleport", "encode"))
+
+    def test_cli_target_fps_beats_profile(self) -> None:
+        cfg = _load_default()
+        run = resolve_run(cfg, profile="interp-only", target_fps=(60000, 1001))
+        assert run.interpolate.target_fps == (60000, 1001)
+
+    def test_descale_selected_without_height_is_error(self) -> None:
+        cfg = _load_default()
+        with pytest.raises(ConfigError, match="descale"):
+            resolve_run(cfg, stages=("descale", "encode"))
+
+    def test_descale_height_from_profile(self) -> None:
+        cfg = _load_default()
+        run = resolve_run(cfg, profile="upscale-only")
+        assert run.descale_height == 1080
+
+    def test_descale_height_from_cli(self) -> None:
+        cfg = _load_default()
+        run = resolve_run(cfg, stages=("descale", "encode"), descale_height=720)
+        assert run.descale_height == 720
+
+    def test_encode_required_for_file_run(self) -> None:
+        cfg = _load_default()
+        with pytest.raises(ConfigError, match="encode"):
+            resolve_run(cfg, stages=("interpolate", "deband"))
+
+    def test_stage_order_is_canonical_even_if_given_unordered(self) -> None:
+        cfg = _load_default()
+        run = resolve_run(cfg, stages=("encode", "upscale", "interpolate"))
+        assert run.stages == ("upscale", "interpolate", "encode")
+
+    def test_upload_flag_precedence(self) -> None:
+        cfg = _load_default()
+        assert resolve_run(cfg, profile="full").upload is True
+        assert resolve_run(cfg, profile="full", upload=False).upload is False
+        assert resolve_run(cfg, profile="interp-only", upload=True).upload is True
+        assert resolve_run(cfg, profile="interp-only").upload is False
+
+    def test_run_is_frozen(self) -> None:
+        cfg = _load_default()
+        run = resolve_run(cfg, profile="interp-only")
+        import dataclasses
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            run.stages = ("encode",)  # type: ignore[misc]

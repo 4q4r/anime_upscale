@@ -1,0 +1,90 @@
+[project]
+name = "anime-upscale"
+version = "0.1.0"
+description = "Anime video pipeline: descale, deband, AI-upscale, RIFE interpolation, x265 encode."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.4",
+    "requests>=2.34.2",
+    "spandrel>=0.4.2",
+    "torch",
+    "torch-tensorrt",
+    "tqdm>=4.70.1",
+    "vapoursynth>=81",
+    "vapoursynth-bestsource>=22",
+    "vapoursynth-descale>=12",
+    "vsdeband",
+    "vsrife>=5.7.0",
+]
+
+[project.scripts]
+anime-pipeline = "anime_upscale.cli:main"
+
+[dependency-groups]
+dev = ["ruff", "ty", "pytest", "pytest-cov", "pip-audit"]
+
+[build-system]
+requires = ["uv_build>=0.11,<1.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# torch / torch-tensorrt come from the PyTorch CUDA-13.0 index (owner machine: CUDA GPU).
+# explicit = true: only packages named in [tool.uv.sources] resolve from this index.
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torch-tensorrt = { index = "pytorch-cu130" }
+vsdeband = { git = "https://github.com/Jaded-Encoding-Thaumaturgy/vs-deband" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    # Legacy pre-migration scripts (deleted by migration steps 11/14; cp1251/legacy style).
+    "process_anime.py",
+    "interpolate_only.py",
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D203", "D212", "COM812", "ISC001",  # owner gate canon
+    "CPY001",   # no copyright-header policy in this project
+    "RUF001", "RUF002", "RUF003",  # false positives on Russian user-facing strings/comments (owner requirement)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Conventional test relaxations (owner quality-gate canon).
+"tests/**" = [
+    "S101", "ANN", "D", "ARG", "PLC0415", "SLF001", "PLR2004", "TRY003",
+    "EM101", "EM102", "FBT", "S314", "S310", "PT018", "INP001", "N999",
+    "A002", "ANN401", "PLR0913", "TRY300", "TRY301", "PERF401", "RET504",
+    "S105", "S106", "S107",  # fake tokens/credentials in mocked HTTP tests
+    "B017", "B018",  # frozen-dataclass probes and placeholder attribute checks
+    "RUF012",  # mutable class attrs only hold per-class fakes in test doubles
+]
+# Stage builders import VS/torch/vsrife lazily: keeps CLI startup light and lets
+# encode-only runs avoid loading GPU stacks entirely.
+"src/anime_upscale/stages/*" = ["PLC0415"]
+# The CLI driver keeps heavy imports (VS-backed stage registry, model fetch) lazy.
+"src/anime_upscale/cli.py" = ["PLC0415"]
+
+[tool.ty.environment]
+python-version = "3.14"
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-q", "--strict-markers"]
+markers = [
+    "gpu: requires a CUDA device (deselected automatically without one)",
+    "vapoursynth: requires importable VapourSynth (skipped gracefully otherwise)",
+]

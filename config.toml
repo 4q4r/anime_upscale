@@ -1,0 +1,112 @@
+# config.toml — единственный источник настроек. Переменные окружения не используются.
+
+[pipeline]
+# Канонический порядок стадий. Профили и --stages выбирают ПОДМНОЖЕСТВО; порядок неизменен.
+order = ["descale", "deband", "upscale", "interpolate", "encode"]
+
+[hardware]                        # Явные override'ы автодетекта — приоритет: CLI > [hardware] > детект > встроенный дефолт.
+# Всё опционально: пустая секция = полностью автодетект (§9 плана).
+# num_streams = 3                 # потоков инференса на GPU (иначе: VRAM-бюджет, §9.2)
+# gpus = [0]                      # какие GPU использовать (иначе: ВСЕ обнаруженные — мульти-GPU fan-out по умолчанию)
+# encode_threads = 12             # потоков libx265 (иначе: все логические ядра / число активных кодировщиков)
+
+[stages.descale]
+kernel = "bicubic"                # "bicubic" | "bilinear"
+src_left = 0.0
+src_top = 0.0
+# Целевая высота — свойство ИСТОЧНИКА: задаётся на прогон (--descale-height) или в профиле.
+
+[stages.deband]
+radius = 16
+threshold = [48, 48, 48]          # luma, chroma_u, chroma_v (f3kdb semantics; builder tunes defaults)
+grain = [0, 0]
+
+[stages.upscale]
+model = "2x_AnimeJaNai_HD_V3_Compact"   # имя из models/manifest.toml (sha256 pinned)
+fp16 = true
+
+[stages.interpolate]
+model = "4.25"                    # vsrife model name (auto-download, wrapper-managed)
+target_fps = "60000/1001"         # рациональная строка; --target-fps 60 → "60/1"; 23.976 → "24000/1001"
+scene_detection = true
+scene_threshold = 0.15            # vsrife sc_threshold
+trt = true                        # Torch-TensorRT backend
+trt_cache_dir = "~/.cache/vsrife"
+
+[stages.encode]
+# Решение владельца (2026-10-27): только процессная сборка libx265 — совместимость + качество.
+# NVENC удалён из конфига; registry-механизм в stages/encode.py сохранён как точка расширения.
+# Канон флагов и обоснование каждого: research/05-encode-flags.md §1.1/§6.
+crf = 16                          # 14 = transparent/collection; 16 = VCB workhorse (владельческий референс); 18 = community floor
+preset = "slow"                   # efficiency knee: slower→veryslow ≈ +78% времени за ~0% размера (doom9 2020)
+pix_fmt = "yuv420p10le"
+profile = "main10"
+colorspace = "bt709"              # теги форвардятся в HEVC VUI (libavcodec/libx265.c) — защита от «вымытых» цветов
+color_primaries = "bt709"
+color_trc = "bt709"
+color_range = "tv"
+
+[stages.encode.x265_params]       # pass-through в -x265-params
+no-sao = 1                        # SAO = «Smoothing All Objects» — убивает детали; no-sao при CRF ≤ 17 (VCB-правило)
+no-strong-intra-smoothing = 1
+deblock = "-1,-1"
+psy-rd = 2.0                      # 1.5 при CRF ≥ 18 (вариант (b))
+psy-rdoq = 1.0                    # 1.5–2.0 для зернистых источников
+rdoq-level = 2                    # medium оставляет 0 — классическая причина «каши» на x265
+aq-mode = 3                       # bias к тёмным сценам — главный анти-бэндинг для аниме
+aq-strength = 0.8
+qcomp = 0.65                      # «динамический битрейт» по сложности сцены (0.7 — экшен)
+# no-cutree = 1                   # ВКЛЮЧАТЬ только при CRF < 15 (VCB-правило); на 16 cutree остаётся включённым
+# qg-size = 16                    # polish-кнопка варианта (a); дефолт slow = 32
+# ref = 5                         # polish-кнопка варианта (a); дефолт slow = 4
+bframes = 8
+rc-lookahead = 60
+# keyint/min-keyint считает СТУДИЯ кодировщика по правилу «10 с / 1 с контента» из фактического выходного fps:
+#   23.976 fps → 240/24;  59.94 fps (интерполяция) → 600/60. Ручной override — опционален.
+no-open-gop = 1
+tskip = 1
+cbqpoffs = -2
+crqpoffs = -2
+# tune НЕ используется: --tune animation = psy-rd 0.4/aq 0.4/deblock 1:1 (усиление мыла) — JET: «НЕ для аниме».
+
+[models]
+dir = "models"
+manifest = "models/manifest.toml"
+
+[upload]                          # Пост-шаг выгрузки (§10 плана) — НЕ стадия пайплайна.
+# Включение: флаг --upload > ключ upload = true в профиле > false (по умолчанию выкл).
+
+[upload.gofile]
+token = ""                        # ОПЦИОНАЛЬНО: токен premium-аккаунта gofile (cookie accountToken).
+                                  # Пусто = анонимная загрузка. Секрет в config.toml — норма владельца; env-переменных нет.
+                                  # Если задан — используется и для СКАЧИВАНИЙ (§11.2, приоритет 1).
+
+[fetch]                           # Вход по URL/ссылкам (§11 плана). Локальные -i от секции не зависят;
+                                  # каталог загрузок фиксирован правилами -i (input/) — отдельного ключа dir нет.
+
+[fetch.gofile]                    # Переопределения констант wt-схемы (§11.3); дефолты — константы из gofile-dl.
+wt_salt = "12af056dacea0b"        # соль wt.obf.js (последнее известное значение); ротируется gofile — обновлять при стойком error-notPremium
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+language = "en-US"                # X-BL: захешированные UA/language ОБЯЗАНЫ совпадать с заголовками запроса
+
+[tools]                           # (§12.3) Явные пути к внешним инструментам; пусто = поиск в PATH.
+# ffmpeg = "C:\\ffmpeg\\bin\\ffmpeg.exe"
+# ffprobe = "C:\\ffmpeg\\bin\\ffprobe.exe"
+
+# ── Профили ──────────────────────────────────────────────────────────────
+[profiles.full]
+stages = ["descale", "deband", "upscale", "interpolate", "encode"]
+upload = true                     # пример: профиль может включать gofile-выгрузку без CLI-флага
+descale_height = 1080             # descale требует целевую высоту; для full-профиля задаётся здесь
+
+[profiles.upscale-only]
+stages = ["upscale", "encode"]
+descale_height = 1080             # unused in this profile; illustrates optional per-profile keys
+
+[profiles.interp-only]
+stages = ["interpolate", "encode"]
+
+[profiles.interp-only.overrides.interpolate]   # per-profile deep overrides (merged last before CLI).
+target_fps = "60/1"                            # NOTE: план §4 показывал [profiles.X.stages.Y] — такой TOML
+                                               # невалиден (ключ stages не может быть и списком, и таблицей);
+                                               # контролёр уведомлён — overrides вынесены в отдельную подтаблицу.
