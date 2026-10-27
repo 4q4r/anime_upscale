@@ -1,0 +1,36 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.ty_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Project-local media (input/output are the ONLY I/O dirs; contents never committed) ---
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
+# --- Model binaries (manifest.toml stays committed; .pth re-fetched via `anime-pipeline models fetch`) ---
+models/**/*.pth
+models/**/*.pkl
+models/**/*.onnx
+models/**/*.engine
+
+# --- Superseded RIFE machinery deleted during migration (never commit) ---
+rife_master.zip
+# models/rife/ is legacy pre-4.22 RIFE machinery (deleted in migration). Its inner
+# trees contain nested .git dirs (Practical-RIFE checkout + the owner's gofile-dl
+# tool), which git would track as foreign gitlinks. Binaries are ignored by the
+# rules above; code is upstream-reproducible; gofile-dl is preserved by relocation.
+models/rife/
+
+# --- Benchmarks: generated markdown reports are committed, raw sample clips are not ---
+benchmarks/*.mkv
+benchmarks/*.mp4
+benchmarks/*.y4m
