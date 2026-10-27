@@ -4,7 +4,7 @@ import subprocess
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any
 
 from anime_upscale.tools import resolve_tool
 
@@ -68,7 +68,7 @@ class Encoder:
     tail: list[bytes] = field(default_factory=list)
 
     @property
-    def stdin(self) -> BinaryIO | None:
+    def stdin(self) -> Any:  # noqa: ANN401 - Popen.stdin is IO[bytes] | None
         """The y4m write end (clip.output target)."""
         return self.process.stdin
 

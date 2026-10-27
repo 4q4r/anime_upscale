@@ -302,7 +302,7 @@ class TestFolderExpansion:
         fake = _FakeSession()
         fake._queue("contents/x", _folder_payload([{"type": "file", "name": "no_link.mkv"}]))
         client = _client(fake, state_path=tmp_path / "g.toml")
-        with pytest.raises(GofileError, match="ссылка link"):
+        with pytest.raises(GofileError, match=r"нет ссылки link"):
             client.expand_entries("x")
 
 

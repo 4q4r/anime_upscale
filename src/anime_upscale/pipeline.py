@@ -97,7 +97,7 @@ def run_pipeline(
     try:
         try:
             graph.output(
-                encoder.stdin,  # ty: ignore[invalid-argument-type] - PIPE is IO[bytes]
+                encoder.stdin,
                 y4m=True,
                 prefetch=max(1, ctx.hardware.num_streams_per_gpu) if ctx.hardware.gpus else 0,
                 progress_update=progress_update,

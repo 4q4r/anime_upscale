@@ -38,6 +38,27 @@ def pick_server(client: GofileClient) -> str:
     return str(servers[0]["name"])
 
 
+class _ChunkReader:
+    """File-like adapter over a chunk generator (requests requires .read)."""
+
+    def __init__(self, generator: Iterator[bytes]) -> None:
+        self._generator = generator
+        self._buffer = b""
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            drained = self._buffer + b"".join(self._generator)
+            self._buffer = b""
+            return drained
+        while len(self._buffer) < size:
+            try:
+                self._buffer += next(self._generator)
+            except StopIteration:
+                break
+        chunk, self._buffer = self._buffer[:size], self._buffer[size:]
+        return chunk
+
+
 def upload_file(
     path: Path,
     client: GofileClient,
@@ -64,12 +85,12 @@ def upload_file(
                 yield chunk
 
     token = client.ensure_token()
-    # requests types its `files` param narrowly; a chunked byte generator is a
-    # documented valid stream source (the plan's chunked-multipart contract).
-    files_dict: dict[str, tuple[str, Iterator[bytes]]] = {"file": (path.name, file_stream())}
+    # requests requires a file-like (reads via .read()); the reader keeps the
+    # chunked-multipart contract and the progress callback.
+    files_dict = {"file": (path.name, _ChunkReader(file_stream()))}
     response = client.session.post(
         f"https://{host}/uploadfile",
-        files=files_dict,  # ty: ignore[invalid-argument-type]
+        files=files_dict,
         cookies={"accountToken": token} if token else {},
         timeout=(10, 3600),
     )

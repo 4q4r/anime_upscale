@@ -36,8 +36,10 @@ class _FakeSession:
         files = kwargs.get("files")
         if files and "file" in files:
             name, stream = files["file"]
-            consumed = b"".join(stream)  # emulate requests consuming the upload stream
-            kwargs = {**kwargs, "files": {"file": (name, consumed)}}
+            chunks = []
+            while chunk := stream.read(65536):  # emulate requests draining the stream
+                chunks.append(chunk)
+            kwargs = {**kwargs, "files": {"file": (name, b"".join(chunks))}}
         self.post_kwargs = {"url": url, **kwargs}
         return self.post_response
 

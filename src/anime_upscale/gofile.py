@@ -135,7 +135,8 @@ class _PinnedPoolManager(urllib3.PoolManager):
         request_context: Any = None,  # noqa: ANN401 - urllib3 opaque context
     ) -> urllib3.HTTPConnectionPool:
         pool = super()._new_pool(scheme, host, port, request_context)
-        pool.ConnectionCls = _pinned_connection_class(self.pins)
+        # Runtime-valid: urllib3 pools accept a BaseHTTPSConnection subclass.
+        pool.ConnectionCls = _pinned_connection_class(self.pins)  # ty: ignore[invalid-assignment]
         return pool
 
 
@@ -418,9 +419,24 @@ class GofileClient:
             raise GofileError(msg)
         return found
 
+    @staticmethod
+    def _children_list(children: Any) -> list[dict[str, Any]]:  # noqa: ANN401 - live payload
+        """
+        Normalize gofile's children payload for the walk.
+
+        LIVE API (verified 2026-10-28): a dict keyed by child id; older
+        documented shapes used a plain list — both normalize here.
+        """
+        if isinstance(children, dict):
+            return [child for child in children.values() if isinstance(child, dict)]
+        if isinstance(children, list):
+            return [child for child in children if isinstance(child, dict)]
+        msg = "gofile: повреждённые данные children (ожидается dict или list)."
+        raise GofileError(msg)
+
     def _walk(
         self,
-        children: list[dict[str, Any]],
+        children: Any,  # noqa: ANN401 - live API payload
         found: list[ResolvedChild],
         reporter: Reporter | None,
         depth: int,
@@ -428,11 +444,14 @@ class GofileClient:
         if depth > _MAX_FOLDER_DEPTH:
             msg = "Слишком глубокая вложенность папки gofile (лимит 10 уровней)."
             raise GofileError(msg)
+        normalized = self._children_list(children)
         folders = sorted(
-            (c for c in children if c.get("type") == "folder"), key=lambda c: str(c.get("name", ""))
+            (c for c in normalized if c.get("type") == "folder"),
+            key=lambda c: str(c.get("name", "")),
         )
         files = sorted(
-            (c for c in children if c.get("type") != "folder"), key=lambda c: str(c.get("name", ""))
+            (c for c in normalized if c.get("type") != "folder"),
+            key=lambda c: str(c.get("name", "")),
         )
         for folder in folders:
             sub = self.fetch_contents(str(folder.get("id", "")))
@@ -450,7 +469,7 @@ class GofileClient:
                 continue
             link = child.get("link")
             if not link:
-                msg = f"gofile: у файла «{name}» отсутствует ссылка link (повреждённые данные)."
+                msg = f"gofile: у файла «{name}» нет ссылки link (повреждённые данные)."
                 raise GofileError(msg)
             found.append(ResolvedChild(name=name, link=str(link)))
 
