@@ -96,16 +96,27 @@ class TestGpuStages:
         out = interp_apply(_ctx(_run_config(("interpolate", "encode"))), rgbh)
         assert out.fps.numerator == 60000 and out.fps.denominator == 1001
 
-    @pytest.mark.gpu
     def test_upscale_requires_model(self) -> None:
+        """Missing pinned artifact = loud manifest error BEFORE any GPU work
+        (offline-safe forever: the model dir is empty by construction)."""
         _skip_without_vs()
-        pytest.importorskip("torch")
-        pytest.importorskip("spandrel")
+        from pathlib import Path
+
         from anime_upscale.stages.upscale import apply as upscale_apply
 
+        repo = Path(__file__).resolve().parent.parent
         rgbh = _blank(vs.RGBH, 64, 64)
+        ctx = _ctx(_run_config(("upscale", "encode")))
+        ctx_empty = StageContext(
+            run=ctx.run,
+            hardware=ctx.hardware,
+            project_root=ctx.project_root,
+            reporter=ctx.reporter,
+            models_dir=Path("/nonexistent-models"),
+            models_manifest=repo / "models" / "manifest.toml",
+        )
         with pytest.raises(Exception, match=r"models fetch|не найдена|Модель"):
-            upscale_apply(_ctx(_run_config(("upscale", "encode"))), rgbh)
+            upscale_apply(ctx_empty, rgbh)
 
     def test_interpolate_requires_gpu(self) -> None:
         """The stage refuses a GPU-less context loudly, before any vsrife work."""
