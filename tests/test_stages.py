@@ -125,3 +125,36 @@ class TestGpuStages:
 
         with pytest.raises(RuntimeError, match="CUDA"):
             interp_apply(_ctx(_run_config(("interpolate", "encode")), with_gpu=False), _blank())
+
+
+class TestUpscaleFramePull:
+    def test_modifyframe_selector_contract_with_real_model(self) -> None:
+        """Regression (parity gate): VS R81 calls selectors with KEYWORD args n=/f=,
+        VideoFrame exposes plane views via frame[plane] (no get_read_array), and
+        spandrel expects a batched [B,C,H,W] tensor. Pulls 3 REAL frames through
+        the fetched model — runs only with CUDA + a fetched+verified model."""
+        _skip_without_vs()
+        pytest.importorskip("torch")
+        pytest.importorskip("spandrel")
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip("no CUDA device")
+        from pathlib import Path
+
+        from anime_upscale.stages.upscale import apply as upscale_apply
+
+        repo = Path(__file__).resolve().parent.parent
+        ctx = _ctx(_run_config(("upscale", "encode")))
+        manifest = repo / "models" / "manifest.toml"
+        if not manifest.is_file():
+            pytest.skip("no manifest")
+        rgbh = _blank(vs.RGBH, 64, 64)
+        try:
+            out = upscale_apply(ctx, rgbh)
+            frame = out.get_frame(2)  # force the selector to execute
+            assert frame.width == 128 and frame.height == 128
+        except Exception as exc:  # model not fetched → loud manifest error is fine offline
+            if "models fetch" in str(exc) or "не найдена" in str(exc):
+                pytest.skip(f"model not fetched: {exc}")
+            raise

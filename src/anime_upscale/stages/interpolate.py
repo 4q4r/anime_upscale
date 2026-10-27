@@ -31,6 +31,8 @@ def apply(ctx: StageContext, clip: vs.VideoNode) -> vs.VideoNode:
     # misc.SCDetect semantics without double detection.
     shape = [clip.height, clip.width]
     device_index = ctx.hardware.gpus[0].index if ctx.hardware.gpus else 0
+    cache_dir = Path(cfg.trt_cache_dir).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)  # vsrife requires an existing dir
     return rife(
         clip,
         device_index=device_index,
@@ -43,5 +45,5 @@ def apply(ctx: StageContext, clip: vs.VideoNode) -> vs.VideoNode:
         trt=cfg.trt,
         trt_static_shape=True,
         trt_opt_shape=shape,
-        trt_cache_dir=str(Path(cfg.trt_cache_dir).expanduser()),
+        trt_cache_dir=str(cache_dir),
     )

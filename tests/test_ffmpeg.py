@@ -11,7 +11,7 @@ class TestMuxArgs:
             video_args=["-c:v", "libx265", "-crf", "16"],
         )
         assert args[:2] == ["ffmpeg", "-y"]
-        assert "-f" in args and args[args.index("-f") + 1] == "y4m"
+        assert "-f" in args and args[args.index("-f") + 1] == "yuv4mpegpipe"
         assert args[args.index("-i") + 1] == "-"
         src_index = args.index("/proj/input/src.mkv")
         assert args[src_index - 1] == "-i"

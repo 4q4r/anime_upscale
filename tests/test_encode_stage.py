@@ -45,7 +45,7 @@ class TestVideoArgs:
             ("-colorspace", "bt709"),
             ("-color_primaries", "bt709"),
             ("-color_trc", "bt709"),
-            ("-colorrange", "tv"),
+            ("-color_range", "tv"),
         ):
             assert args[args.index(flag) + 1] == value
 

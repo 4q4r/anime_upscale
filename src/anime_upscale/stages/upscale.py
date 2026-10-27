@@ -48,18 +48,21 @@ def apply(ctx: StageContext, clip: vs.VideoNode) -> vs.VideoNode:
     out_width, out_height = clip.width * scale, clip.height * scale
     canvas = core.std.BlankClip(clip, width=out_width, height=out_height)  # ty: ignore[unresolved-attribute]
 
-    def selector(_n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:
+    def selector(n: int, f: list[vs.VideoFrame]) -> vs.VideoFrame:  # noqa: ARG001 - n required by VS
+        # VS R81 invokes selectors with keyword arguments `n` and `f` — keep exact names.
         src, dst_template = f[1], f[0]
-        planes = [np.asarray(src.get_read_array(i)) for i in range(3)]  # ty: ignore[unresolved-attribute]
+        planes = []
+        for plane in range(3):
+            with src[plane] as view:  # numpy view over the RGBH half-float plane
+                planes.append(np.array(view, copy=True))
         tensor = torch.from_numpy(np.stack(planes)).to(device=device, non_blocking=True)
         with torch.inference_mode():
-            result = model(tensor).clamp_(0.0, 1.0)
+            result = model(tensor.unsqueeze(0)).squeeze(0).clamp_(0.0, 1.0)
+        result_np = result.cpu().numpy()
         out = dst_template.copy()
         for plane in range(3):
-            np.copyto(
-                np.asarray(out.get_write_array(plane)),  # ty: ignore[unresolved-attribute]
-                result[plane].cpu().numpy(),
-            )
+            with out[plane] as view:
+                np.copyto(np.asarray(view), result_np[plane])
         for key in src.props:
             out.props[key] = src.props[key]
         return out

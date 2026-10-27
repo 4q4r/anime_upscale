@@ -90,19 +90,25 @@ def run_pipeline(
     )
     args = build_mux_args(input_path, output_path, video_args, ffmpeg=ffmpeg_path)
 
-    process = spawn_encoder(args)
-    if process.stdin is None:
+    encoder = spawn_encoder(args)
+    if encoder.stdin is None:
         msg = "ffmpeg не открыл stdin для y4m-потока (неожиданный сбой Popen)."
         raise PipelineError(msg)
     try:
-        graph.output(
-            process.stdin,  # ty: ignore[invalid-argument-type] - PIPE is IO[bytes], runtime-valid
-            y4m=True,
-            prefetch=max(1, ctx.hardware.num_streams_per_gpu) if ctx.hardware.gpus else 0,
-            progress_update=progress_update,
-        )
+        try:
+            graph.output(
+                encoder.stdin,  # ty: ignore[invalid-argument-type] - PIPE is IO[bytes]
+                y4m=True,
+                prefetch=max(1, ctx.hardware.num_streams_per_gpu) if ctx.hardware.gpus else 0,
+                progress_update=progress_update,
+            )
+        except OSError as exc:
+            # A dead ffmpeg surfaces as EPIPE on the VS side; re-raise with the tail.
+            finish_encoder(encoder)
+            msg = f"Поток в ffmpeg оборвался во время кодирования: {exc}"
+            raise PipelineError(msg) from exc
     finally:
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
-    finish_encoder(process)
+        if encoder.stdin is not None and not encoder.stdin.closed:
+            encoder.stdin.close()
+    finish_encoder(encoder)
     return (output_fps.numerator, output_fps.denominator)

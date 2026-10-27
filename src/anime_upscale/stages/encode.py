@@ -50,7 +50,7 @@ def build_video_args(
         cfg.color_primaries,
         "-color_trc",
         cfg.color_trc,
-        "-colorrange",
+        "-color_range",
         cfg.color_range,
     ]
     if threads is not None:

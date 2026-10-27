@@ -188,6 +188,7 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     queue = build_queue(entries, client_factory, reporter)
     if "upscale" in run.stages:
         verify_all(root / config.models.manifest, root / config.models.dir)
+    output_override = _resolve_output_override(args.output, len(queue))
 
     ctx = _stage_context(config, run, hardware, root, reporter)
     results: list[tuple[str, bool, str]] = []
@@ -201,6 +202,7 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
             output_dir,
             client_factory,
             ffmpeg_path,
+            output_override=output_override,
             upload_enabled=run.upload,
         )
         if outcome is None:
@@ -217,6 +219,22 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     return EXIT_OK
 
 
+def _resolve_output_override(output: str | None, queue_len: int) -> str | None:
+    """Validate -o: bare name only, .mkv forced; ambiguous with a batch = loud error."""
+    if output is None:
+        return None
+    if "/" in output or "\\" in output or ".." in output:
+        msg = f"Некорректное имя вывода: «{output}» — допустимы только имена файлов из output/."
+        raise EntryError(msg)
+    if queue_len > 1:
+        msg = (
+            f"-o задан для батча из {queue_len} файлов — имя вывода неоднозначно. "
+            "Либо один -i/-o, либо omit -o (stem каждого файла)."
+        )
+        raise EntryError(msg)
+    return output if output.endswith(".mkv") else f"{output}.mkv"
+
+
 def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     ctx: StageContext,
     item: "QueueItem",
@@ -225,6 +243,7 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     client_factory: Callable[[], GofileClient],
     ffmpeg_path: str,
     *,
+    output_override: str | None = None,
     upload_enabled: bool,
 ) -> tuple[str, str] | None:
     """
@@ -236,7 +255,7 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     reporter = ctx.reporter
     try:
         source_path = fetch_queue_item(item, input_dir, client_factory, reporter)
-        output_name = f"{Path(item.name).stem}.mkv"
+        output_name = output_override or f"{Path(item.name).stem}.mkv"
         output_path = output_dir / output_name
         if output_path.exists():
             reporter.warn(f"Файл существует, будет перезаписан: output/{output_name}")
@@ -257,7 +276,7 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
             )
     except UploadError as exc:
         return ("upload", f"пайплайн ok, загрузка не удалась: {exc}")
-    except (PipelineError, EntryError, GofileError, RuntimeError) as exc:
+    except (PipelineError, EntryError, GofileError, RuntimeError, OSError) as exc:
         return ("pipeline", str(exc))
     return None
 
