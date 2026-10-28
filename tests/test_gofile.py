@@ -99,6 +99,31 @@ class TestStateFile:
             os.umask(old_umask)
         assert path.stat().st_mode & 0o777 == 0o600
 
+    def test_temp_created_owner_only_no_world_readable_window(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR1-review Minor: write_text created the .tmp world-readable (0644)
+        and only chmod'ed AFTER the content hit disk — the token sat exposed
+        for the write duration. The temp must be CREATED at 0o600 (os.open
+        mode), closing the permission window entirely."""
+        import os
+
+        real_open = os.open
+        creations: list[tuple[str, int, int]] = []
+
+        def spy_open(path: object, flags: int, mode: int = 0o777, **kw: object) -> int:
+            if str(path).endswith(".tmp") and flags & os.O_CREAT:
+                creations.append((str(path), flags, mode))
+            return real_open(path, flags, mode)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "open", spy_open)
+        path = tmp_path / "guest.toml"
+        save_guest("abc123", path)
+        # Round-trip stays intact through the new write path.
+        assert load_saved_guest(path) == "abc123"
+        assert creations, "temp file must be created via os.open(O_CREAT), not write_text"
+        assert creations[0][2] == 0o600, creations
+
     def test_platform_state_paths(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setattr(gofile, "_is_windows", lambda: False)
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))

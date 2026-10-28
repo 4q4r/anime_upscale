@@ -178,3 +178,70 @@ def test_pipeline_failure_outranks_upload_failure_on_mixed_batch(
     out = capsys.readouterr().out
     assert exit_code == 1
     assert "upload dead" in out and "батч-фейк" in out
+
+
+def test_vsless_batch_run_is_loud_russian_not_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR1-review Minor: the lazy pipeline import sits INSIDE the guarded
+    region — a VS-less machine gets the loud Russian error through the batch
+    summary (exit 1), never a raw ModuleNotFoundError traceback."""
+    import sys
+
+    import anime_upscale
+
+    _tmp_project(tmp_path, monkeypatch)
+    # VS-less simulation seam: None in sys.modules makes `import vapoursynth`
+    # raise ImportError. Evicting the cached pipeline module AND the package
+    # attribute (earlier imports cache it there — `from pkg import mod` hits
+    # the attribute first) forces the lazy re-import to actually hit it.
+    monkeypatch.setitem(sys.modules, "vapoursynth", None)
+    monkeypatch.delitem(sys.modules, "anime_upscale.pipeline", raising=False)
+    monkeypatch.delattr(anime_upscale, "pipeline", raising=False)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+    exit_code = cli.main(["--profile", "enc", "-i", "a.mkv", "--config", "config.toml"])
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "VapourSynth не найден" in out
+
+
+def test_upload_time_network_error_gets_dedicated_exit_3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR1-review nit pin: a connection death DURING upload (pick_server /
+    upload_file session calls) is wrapped by upload_output into UploadError →
+    the dedicated exit 3 — NOT mislabeled as a pipeline failure (exit 1).
+    (Verified already-correct on main via live probe; this test pins it.)"""
+    import requests
+
+    class DeadSession:
+        def get(self, *a: object, **kw: object) -> object:
+            raise requests.ConnectionError("Connection reset by peer")
+
+        def post(self, *a: object, **kw: object) -> object:
+            raise requests.ConnectionError("Connection reset by peer")
+
+        def pin(self, *a: object, **kw: object) -> None:
+            return None
+
+    class DeadClient:
+        def __init__(self, *a: object, **kw: object) -> None:
+            self.session = DeadSession()
+
+    _tmp_project(tmp_path, monkeypatch)
+    # The real upload runs: the (faked) pipeline's output must exist so
+    # upload_file reaches pick_server, where the session dies.
+    (tmp_path / "output" / "a.mkv").write_bytes(b"x")
+    monkeypatch.setattr(
+        "anime_upscale.pipeline.run_pipeline",
+        lambda ctx, s, o, ffmpeg_path, progress_update=None: (60, 1),
+    )
+    monkeypatch.setattr(cli, "GofileClient", DeadClient)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+    exit_code = cli.main(["--profile", "upl", "-i", "a.mkv", "--config", "config.toml"])
+    out = capsys.readouterr().out
+    assert exit_code == cli.EXIT_UPLOAD == 3
+    assert "Connection reset by peer" in out
+    assert "загрузка не удалась" in out
