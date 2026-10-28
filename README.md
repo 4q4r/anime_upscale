@@ -219,7 +219,7 @@ The pipeline targets both Linux and Windows: pathlib everywhere, spawn-safe proc
 The `misc` plugin step differs per platform:
 
 - **Linux** — `scripts/build_misc_plugin.sh` (canonical; compiles the pinned source into the venv).
-- **Windows** — `scripts\build_misc_plugin.bat` (faithful mirror: same commit/tag pins, same URLs, same `core.misc` verification). Zero-intervention compiler ladder: uses an existing `g++` (MinGW-W64) or `cl.exe` (VS Developer prompt); if neither exists it bootstraps one unattended via winget — installing winget itself first (official winget-cli release) when missing — as `BrechtSanders.WinLibs.POSIX.UCRT` (portable 64-bit g++), falling back to `MSYS2.MSYS2` + `pacman mingw-w64-x86_64-gcc`. Manual options (WinLibs by hand; `misc.dll` from an official VapourSynth installer ≤ R80 into `%APPDATA%\VapourSynth\plugins64\`) remain documented in the terminal error as a last resort only.
+- **Windows** — `scripts\build_misc_plugin.bat` (faithful mirror: same commit/tag pins, same URLs, same `core.misc` verification). Zero-intervention compiler ladder: uses an existing `g++` (MinGW-W64) or `cl.exe` (VS Developer prompt); if neither exists it bootstraps one unattended via winget — installing winget itself first (official winget-cli release) when missing — as `BrechtSanders.WinLibs.POSIX.UCRT` (portable 64-bit g++), falling back to `MSYS2.MSYS2` + `pacman mingw-w64-x86_64-gcc` (the MSYS2 fallback needs an elevated console — skipped with a loud note otherwise). Manual options (WinLibs by hand; `misc.dll` from an official VapourSynth installer ≤ R80 into `%APPDATA%\VapourSynth\plugins64\`) remain documented in the terminal error as a last resort only.
 
 ## 🧪 Development
 

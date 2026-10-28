@@ -52,10 +52,10 @@ if not exist "%VS_PKG_DIR%" goto :vs_missing
 set "PLUGIN_DIR=%VS_PKG_DIR%\plugins\misc"
 
 set "BASE=https://raw.githubusercontent.com/vapoursynth"
-curl.exe -fsSL "%BASE%/vs-miscfilters-obsolete/%MISC_PIN%/src/miscfilters.cpp" -o "%WORK%\miscfilters.cpp" || goto :dl_fail
-curl.exe -fsSL "%BASE%/vapoursynth/%VS_TAG%/include/VSHelper4.h" -o "%WORK%\VSHelper4.h" || goto :dl_fail
-curl.exe -fsSL "%BASE%/vapoursynth/%VS_TAG%/include/VSConstants4.h" -o "%WORK%\VSConstants4.h" || goto :dl_fail
-curl.exe -fsSL "%BASE%/vapoursynth/%VS_TAG%/include/VapourSynth4.h" -o "%WORK%\VapourSynth4.h" || goto :dl_fail
+curl.exe -fsSL --connect-timeout 15 --max-time 120 "%BASE%/vs-miscfilters-obsolete/%MISC_PIN%/src/miscfilters.cpp" -o "%WORK%\miscfilters.cpp" || goto :dl_fail
+curl.exe -fsSL --connect-timeout 15 --max-time 120 "%BASE%/vapoursynth/%VS_TAG%/include/VSHelper4.h" -o "%WORK%\VSHelper4.h" || goto :dl_fail
+curl.exe -fsSL --connect-timeout 15 --max-time 120 "%BASE%/vapoursynth/%VS_TAG%/include/VSConstants4.h" -o "%WORK%\VSConstants4.h" || goto :dl_fail
+curl.exe -fsSL --connect-timeout 15 --max-time 120 "%BASE%/vapoursynth/%VS_TAG%/include/VapourSynth4.h" -o "%WORK%\VapourSynth4.h" || goto :dl_fail
 
 if not exist "%PLUGIN_DIR%" mkdir "%PLUGIN_DIR%"
 
@@ -71,9 +71,10 @@ popd
 goto :built
 
 :no_compiler
-echo [ОШИБКА] Автоустановка компилятора не удалась. Было попробовано:
-echo   1) winget install BrechtSanders.WinLibs.POSIX.UCRT (portable g++);
-echo   2) winget install MSYS2.MSYS2 + pacman mingw-w64-x86_64-gcc.
+echo [ОШИБКА] Автоустановка компилятора не удалась.
+echo Итог попыток:
+echo   1) WinLibs (portable g++) через winget — установлена, но g++ не найден;
+echo   2) MSYS2: %MSYS2_NOTE%
 echo Вывод winget/pacman — выше по тексту.
 echo Последний резерв вручную (если автоматизация недоступна):
 echo   (а) скачать и распаковать 64-битный WinLibs (https://winlibs.com) и добавить
@@ -90,28 +91,24 @@ goto :have_winget
 :install_winget
 echo [ЭТАП] winget не найден — устанавливаю App Installer с официального релиза winget-cli…
 set "WINGET_URL="
-powershell -NoProfile -Command "(Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest').assets | Where-Object { $_.name -eq 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle' } | Select-Object -First 1 -ExpandProperty browser_download_url" > "%WORK%\winget_url.txt" 2>nul
+powershell -NoProfile -Command "(Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -TimeoutSec 120).assets | Where-Object { $_.name -eq 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle' } | Select-Object -First 1 -ExpandProperty browser_download_url" > "%WORK%\winget_url.txt"
 set /p WINGET_URL=<"%WORK%\winget_url.txt"
 if not defined WINGET_URL goto :winget_fail
-curl.exe -fsSL -o "%WORK%\winget.msixbundle" "%WINGET_URL%" || goto :winget_fail
+curl.exe -fsSL --connect-timeout 15 --max-time 300 -o "%WORK%\winget.msixbundle" "%WINGET_URL%" || goto :winget_fail
 powershell -NoProfile -Command "Add-AppxPackage -Path '%WORK%\winget.msixbundle'" || goto :winget_fail
 winget --version >nul 2>nul || goto :winget_fail
 
 :have_winget
-echo [ЭТАП] winget доступен — устанавливаю WinLibs g++ (portable, 64-битный)…
-winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity || goto :msys2_route
-REM Portable manifest behavior (InstallerType: zip, NestedInstallerType: portable):
-REM binaries land under %LOCALAPPDATA%\Microsoft\WinGet\Packages\ and winget
-REM exposes the Commands through %LOCALAPPDATA%\Microsoft\WinGet\Links\; the
-REM session PATH is NOT refreshed, so locate and prepend manually. The registry
-REM user PATH points at the same Links dir, so a registry re-read adds nothing.
-set "GXX_BIN="
-if exist "%LOCALAPPDATA%\Microsoft\WinGet\Links\g++.exe" set "GXX_BIN=%LOCALAPPDATA%\Microsoft\WinGet\Links"
+echo [ЭТАП] winget доступен — проверяю WinLibs g++ (portable, 64-битный)…
+REM Probe-first: winget exits NON-zero on "already installed", so locate
+REM BEFORE installing and re-locate after any exit code (normalize).
+call :locate_gxx
 if defined GXX_BIN goto :have_gxx
-set "GXX_ANY="
-for /r "%LOCALAPPDATA%\Microsoft\WinGet\Packages" %%G in (g++.exe) do if not defined GXX_ANY set "GXX_ANY=%%~dpG"
-set "GXX_BIN=%GXX_ANY%"
-if not defined GXX_BIN goto :msys2_route
+echo [ЭТАП] WinLibs g++ не найден — устанавливаю через winget…
+winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
+call :locate_gxx
+if defined GXX_BIN goto :have_gxx
+goto :msys2_route
 
 :have_gxx
 set "PATH=%GXX_BIN%;%PATH%"
@@ -120,15 +117,28 @@ echo [ЭТАП] g++ доступен: %GXX_BIN%
 goto :compile_gxx
 
 :msys2_route
-echo [ЭТАП] WinLibs через winget недоступен — пробую MSYS2…
-winget install --id MSYS2.MSYS2 -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity || goto :no_compiler
+REM MSYS2.MSYS2 is ElevationRequirement: elevationRequired — from a
+REM non-elevated console its UAC prompt would wait on a human. Probe first.
+set "MSYS2_NOTE=установка MSYS2 не удалась"
+net session >nul 2>&1 || goto :msys2_no_elevation
+if exist "C:\msys64\mingw64\bin\g++.exe" goto :have_msys2_gxx
+echo [ЭТАП] MSYS2 g++ не найден — устанавливаю MSYS2 через winget…
+winget install --id MSYS2.MSYS2 -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
 if not exist "C:\msys64\usr\bin\bash.exe" goto :no_compiler
 echo [ЭТАП] Устанавливаю mingw-w64-x86_64-gcc через pacman…
 "C:\msys64\usr\bin\bash.exe" -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-gcc" || goto :no_compiler
 if not exist "C:\msys64\mingw64\bin\g++.exe" goto :no_compiler
+
+:have_msys2_gxx
 set "GXX_BIN=C:\msys64\mingw64\bin"
 set "PATH=%GXX_BIN%;%PATH%"
 echo [ЭТАП] g++ доступен: %GXX_BIN%
+goto :compile_gxx
+
+:msys2_no_elevation
+echo [ОШИБКА] MSYS2 требует прав администратора (UAC) — пропущен в неинтерактивном режиме.
+set "MSYS2_NOTE=пропущен: требует прав администратора (UAC)"
+goto :no_compiler
 
 :compile_gxx
 echo [ЭТАП] Собираю misc.dll…
@@ -190,6 +200,20 @@ echo [ОШИБКА] Проверка не прошла: vapoursynth загруз
 echo Подсказка: скорее всего misc.dll собран не под 64-битный Python (проверьте разрядность
 echo компилятора) либо DLL не экспортирует VapourSynthPluginInit2; логи компилятора выше.
 goto :fail
+
+:locate_gxx
+REM WinLibs manifest: InstallerType zip + NestedInstallerType portable +
+REM ArchiveBinariesDependOnPath true -> per the winget installer schema the
+REM install location is added directly to the (registry) PATH. The session
+REM PATH is NOT refreshed either way, so locate and prepend manually:
+REM Links shims first, then a Packages walk as belt-and-suspenders.
+set "GXX_BIN="
+if exist "%LOCALAPPDATA%\Microsoft\WinGet\Links\g++.exe" set "GXX_BIN=%LOCALAPPDATA%\Microsoft\WinGet\Links"
+if defined GXX_BIN exit /b 0
+set "GXX_ANY="
+for /r "%LOCALAPPDATA%\Microsoft\WinGet\Packages" %%G in (g++.exe) do if not defined GXX_ANY set "GXX_ANY=%%~dpG"
+set "GXX_BIN=%GXX_ANY%"
+exit /b 0
 
 :fail
 popd
