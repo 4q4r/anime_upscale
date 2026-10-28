@@ -52,6 +52,34 @@ class TestGrammar:
         with pytest.raises(EntryError, match="HTTPS"):
             classify_entry("http://gofile.io/d/AbCdEf")
 
+    def test_store_gofile_host_rejected_loudly(self) -> None:
+        """M6: store.gofile.io is gofile-family — a direct store link is a loud
+        spec error (only gofile.io/d/<id> is accepted), never a DirectUrl."""
+        with pytest.raises(EntryError, match=r"gofile\.io/d"):
+            classify_entry("https://store.gofile.io/download/abc123/ep.mkv")
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "https://api.gofile.io/contents/abc",
+            "https://store.gofile.io/download/x/ep.mkv",
+            "https://beta.gofile.io/d/abc",  # subdomain ≠ the canonical share host path
+        ],
+    )
+    def test_gofile_family_hosts_require_share_path(self, bad: str) -> None:
+        """M6: any *.gofile.io host without a /d/<id> path = loud error."""
+        with pytest.raises(EntryError, match=r"gofile\.io/d"):
+            classify_entry(bad)
+
+    def test_share_match_anchored_to_url_path_not_query(self) -> None:
+        """M6: a share link embedded in another gofile URL's QUERY string must not
+        resurrect the entry — the path (/download) is what classifies."""
+        with pytest.raises(EntryError, match=r"gofile\.io/d"):
+            classify_entry("https://gofile.io/download?u=https://gofile.io/d/abc")
+        # the canonical forms keep working (query params are fine, path decides)
+        assert classify_entry("https://www.gofile.io/d/x1?x=2") == GofileLink("x1")
+        assert classify_entry("https://gofile.io/d/AbCdEf#frag") == GofileLink("AbCdEf")
+
     @pytest.mark.parametrize(
         "bad",
         [

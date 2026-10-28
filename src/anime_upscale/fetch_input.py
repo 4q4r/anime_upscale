@@ -61,13 +61,21 @@ def classify_entry(entry: str) -> BareName | DirectUrl | GofileLink:
         )
         raise EntryError(msg)
     if text.startswith(("https://",)):
-        host = (urlparse(text).hostname or "").removeprefix("www.")
-        if host == "gofile.io":
-            match = GOFILE_SHARE_RE.search(text)
+        parsed = urlparse(text)
+        host = (parsed.hostname or "").removeprefix("www.")
+        is_share_host = host == "gofile.io"
+        if is_share_host or host.endswith(".gofile.io"):
+            # gofile-family hosts are NOT generic direct URLs: §11.1 accepts ONLY
+            # the canonical share link gofile.io/d/<id>. Every other shape —
+            # store/api subdomains (even with a /d/ path), /upload, /contents,
+            # bare ids — is a loud spec error, never a silent DirectUrl.
+            match = GOFILE_SHARE_RE.match(parsed.path) if is_share_host else None
             if not match:
                 msg = (
                     f"Непонятная форма ссылки gofile: «{entry}». Поддерживаются только "
-                    "ссылки вида gofile.io/d/<id>."
+                    "ссылки вида gofile.io/d/<id>; прочие формы (поддомены вроде "
+                    "store.gofile.io, /upload, /contents, голый id) входными "
+                    "ссылками не являются."
                 )
                 raise EntryError(msg)
             return GofileLink(content_id=match.group(1))

@@ -44,7 +44,9 @@ CONTENTS_QUERY_PARAMS: dict[str, Any] = {
     "sortDirection": -1,
 }
 
-GOFILE_SHARE_RE = re.compile(r"gofile\.io/d/([^/?#\s]+)", re.IGNORECASE)
+# Share path INSIDE a gofile URL — matched against urlparse(...).path only,
+# never the whole string (a /d/<id> shape in a query string must not classify).
+GOFILE_SHARE_RE = re.compile(r"^/d/([^/?#]+)$", re.IGNORECASE)
 
 # Video whitelist (spec addendum 1): only these extensions are queued from folders.
 VIDEO_EXTENSIONS = frozenset({".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v", ".ts", ".m2ts"})
