@@ -7,6 +7,7 @@ allowed; otherwise plain machine-readable lines with zero ANSI.
 
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TextIO
 
@@ -125,3 +126,40 @@ class Reporter:
                 self.error(f"{name}: {detail}")
         failed = len(results) - ok_count
         self.banner_line(f"Итог: {ok_count}/{len(results)} успешно, {failed} с ошибкой")
+
+
+class ProgressThrottle:
+    """
+    ≤10%-interval pipeline progress lines (§10.4 policy, extended to the pipeline).
+
+    The VS ``output(progress_update=...)`` callback fires per frame (~86k calls
+    per episode) — emitting every call would flood the console. This throttle
+    emits at most one line per 10% step plus the final frame; unknown totals
+    stay silent (nothing honest to report).
+    """
+
+    def __init__(self, reporter: Reporter, label: str = "Обработка") -> None:
+        """Bind a reporter and a line label (batch entries prefix the file name)."""
+        self._reporter = reporter
+        self._label = label
+        self._last_percent = -10  # so the first in-window step (0%) is not skipped
+
+    def update(self, done: int, total: int) -> bool:
+        """Feed one progress callback; returns True when a line was emitted."""
+        if total <= 0 or done < 0:
+            return False
+        percent = min(100, int(done * 100 / total))
+        at_end = done >= total
+        if not at_end and percent < self._last_percent + 10:
+            return False
+        self._last_percent = percent
+        self._reporter.line(f"{self._label}: {percent}% (кадр {done}/{total})")
+        return True
+
+    def callback(self) -> Callable[[int, int], None]:
+        """Adapter matching the VS output(progress_update=…) signature."""
+
+        def _update(done: int, total: int) -> None:
+            self.update(done, total)
+
+        return _update

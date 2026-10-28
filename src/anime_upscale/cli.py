@@ -24,7 +24,12 @@ from anime_upscale.hardware import HardwareError, HardwareProfile, detect_hardwa
 from anime_upscale.models.fetch import FetchError, verify_all
 from anime_upscale.models.manifest import ManifestError
 from anime_upscale.pipeline import PipelineError, run_pipeline
-from anime_upscale.reporting import Reporter, enable_windows_console_vt, resolve_mode
+from anime_upscale.reporting import (
+    ProgressThrottle,
+    Reporter,
+    enable_windows_console_vt,
+    resolve_mode,
+)
 from anime_upscale.stages import StageContext
 from anime_upscale.tools import ToolError, resolve_tool
 from anime_upscale.upload import UploadError, upload_output
@@ -260,9 +265,9 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
         if output_path.exists():
             reporter.warn(f"Файл существует, будет перезаписан: output/{output_name}")
 
-        def progress(done: int, total: int, _name: str = item.name) -> None:
-            if total > 0:
-                reporter.line(f"[{_name}] Кадр: {done}/{total}")
+        # ≤10%-interval progress (§10.4 extended to the pipeline): the VS callback
+        # fires per frame — unthrottled printing would flood the console.
+        progress = ProgressThrottle(reporter, label=f"[{item.name}] Обработка").callback()
 
         run_pipeline(
             ctx, source_path, output_path, ffmpeg_path=ffmpeg_path, progress_update=progress
