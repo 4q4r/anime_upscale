@@ -265,11 +265,20 @@ def load_saved_guest(path: Path | None = None) -> str:
 
 
 def save_guest(token: str, path: Path | None = None) -> Path:
-    """Persist the guest token once (creation is the rate-limited operation)."""
+    """
+    Persist the guest token once (creation is the rate-limited operation).
+
+    The token is a credential: written via temp file + os.replace (atomic — a
+    crash mid-write never leaves a corrupt state file behind) and chmod 0600
+    (owner-only, independent of umask).
+    """
     path = path or state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    path.write_text(f'token = "{token}"\ncreated = "{created}"\n', encoding="utf-8")
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(f'token = "{token}"\ncreated = "{created}"\n', encoding="utf-8")
+    temp.chmod(0o600)
+    temp.replace(path)  # atomic: only complete, owner-only files reach the state path
     return path
 
 
