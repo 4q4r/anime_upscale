@@ -27,7 +27,7 @@ from anime_upscale.config import (
 from anime_upscale.fetch_input import EntryError, QueueItem, build_queue, fetch_queue_item
 from anime_upscale.gofile import GofileClient, GofileError
 from anime_upscale.hardware import HardwareError, HardwareProfile, detect_hardware, print_banner
-from anime_upscale.models.fetch import FetchError, verify_all
+from anime_upscale.models.fetch import FetchError, ensure_vsrife_seed, verify_all
 from anime_upscale.models.manifest import ManifestError
 from anime_upscale.reporting import (
     ProgressThrottle,
@@ -207,6 +207,11 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     queue = build_queue(entries, client_factory, reporter, strict_tls=config.network.strict_tls)
     if "upscale" in run.stages:
         verify_all(root / config.models.manifest, root / config.models.dir)
+    if "interpolate" in run.stages:
+        # E01/E02 recurrence guard: vsrife's run-time auto-download from github
+        # is unreliable under TLS interception — the seed must be pre-placed by
+        # `models fetch` (verified sha256) before any batch work starts.
+        ensure_vsrife_seed(root / config.models.manifest)
     output_override = _resolve_output_override(args.output, len(queue))
 
     ctx = _stage_context(config, run, hardware, root, reporter)

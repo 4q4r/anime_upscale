@@ -97,12 +97,17 @@ flowchart LR
    bash scripts/build_misc_plugin.sh
    ```
 
-4. **Fetch + verify the upscale model** (sha256-pinned in `models/manifest.toml`):
+4. **Fetch + verify the pinned models** (sha256-pinned in `models/manifest.toml`):
 
    ```bash
    uv run anime-pipeline models fetch
    uv run anime-pipeline models verify
    ```
+
+   This fetches the AnimeJaNai upscale weights **and pre-seeds the RIFE 4.25
+   weights** into the vsrife package cache (`<site-packages>/vsrife/models/`),
+   so the interpolate stage never downloads from github.com at run time.
+   Batches selecting `interpolate` fail loudly until the seed is in place.
 
 5. **Run a chain** — put a file into `input/`, then:
 
