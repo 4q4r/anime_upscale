@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from anime_upscale.config import HardwareOverrides, load_config, resolve_run
+from anime_upscale.config import load_config, resolve_run
 from anime_upscale.hardware import detect_hardware, format_gpu_summary
 from anime_upscale.pipeline import run_pipeline
 from anime_upscale.reporting import Reporter, resolve_mode
@@ -79,7 +79,7 @@ def main() -> int:
         run = resolve_run(config, stages=stages, **kwargs)
         nn = bool({"upscale", "interpolate"} & set(stages))
         hw = detect_hardware(
-            HardwareOverrides(),
+            config.hardware,
             cli_num_streams=None,
             nn_stages_selected=nn,
         )
