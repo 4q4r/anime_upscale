@@ -297,6 +297,71 @@ class TestFolderExpansion:
         with pytest.raises(GofileError, match="парол"):
             client.expand_entries("x")
 
+    def test_nested_dict_children_real_shape(self, tmp_path: Path) -> None:
+        """F1 regression: subfolder children use the SAME dict normalizer as the
+        root (the live API returns dict payloads at every nesting level)."""
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue(
+            "contents/root",
+            _folder_payload(
+                [
+                    {"type": "folder", "name": "sub", "id": "subid", "children": None},
+                ]
+            ),
+        )
+        fake._queue(
+            "contents/subid",
+            _folder_payload([_file("inside.mkv", "https://s/in")]),
+        )
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        children = client.expand_entries("root")
+        assert [c.name for c in children] == ["inside.mkv"]
+
+    def test_empty_subfolder_skipped_with_note(self, tmp_path: Path) -> None:
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue(
+            "contents/root",
+            _folder_payload(
+                [
+                    _file("a.mkv"),
+                    {"type": "folder", "name": "void", "id": "voidid", "children": None},
+                ]
+            ),
+        )
+        fake._queue(
+            "contents/voidid",
+            {"status": "ok", "data": {"type": "folder", "children": {}}},
+        )
+        reporter = _FakeReporter()
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        children = client.expand_entries("root", reporter)
+        assert [c.name for c in children] == ["a.mkv"]
+        assert "Пропуск (пустая папка): void" in reporter.notes
+
+    def test_null_subfolder_children_skipped_with_note(self, tmp_path: Path) -> None:
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue(
+            "contents/root",
+            _folder_payload(
+                [
+                    _file("real.mkv"),
+                    {"type": "folder", "name": "ghost", "id": "ghostid", "children": None},
+                ]
+            ),
+        )
+        fake._queue(
+            "contents/ghostid",
+            {"status": "ok", "data": {"type": "folder", "children": None}},
+        )
+        reporter = _FakeReporter()
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        children = client.expand_entries("root", reporter)
+        assert [c.name for c in children] == ["real.mkv"]
+        assert "Пропуск (пустая папка): ghost" in reporter.notes
+
     def test_child_missing_link_is_loud(self, tmp_path: Path) -> None:
         save_guest("g", tmp_path / "g.toml")
         fake = _FakeSession()

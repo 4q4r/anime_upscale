@@ -456,9 +456,13 @@ class GofileClient:
         for folder in folders:
             sub = self.fetch_contents(str(folder.get("id", "")))
             sub_children = sub.get("data", {}).get("children")
-            if not isinstance(sub_children, list):
-                msg = f"gofile: у подпапки «{folder.get('name')}» повреждены данные children."
-                raise GofileError(msg)
+            if not sub_children:
+                # null / {} / [] — an empty subfolder contributes nothing (skip note),
+                # it is not a corruption abort (same policy as the root normalizer).
+                if reporter is not None:
+                    reporter.note(f"Пропуск (пустая папка): {folder.get('name')}")
+                continue
+            # Same normalizer as the root: live API shapes are dict-keyed or list.
             self._walk(sub_children, found, reporter, depth + 1)
         for child in files:
             name = str(child.get("name", ""))
