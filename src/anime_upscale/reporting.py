@@ -101,7 +101,6 @@ class Reporter:
 
     def progress_bytes(self, label: str, done: int, total: int) -> None:
         """Plain percentage line, ≤10% granularity (§10.4)."""
-        """Plain percentage line, ≤10% granularity (TTY bars are handled by tqdm upstream)."""
         if total <= 0:
             self._emit(f"{label}: {done} байт")
             return

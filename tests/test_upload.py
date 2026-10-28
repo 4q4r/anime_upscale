@@ -79,6 +79,13 @@ class TestPickServer:
         with pytest.raises(UploadError, match="error-x"):
             pick_server(_client(fake))
 
+    def test_data_null_is_loud_not_attribute_error(self) -> None:
+        """M1: `"data": null` from /servers must hit the loud no-servers branch."""
+        fake = _FakeSession()
+        fake.get_map["https://api.gofile.io/servers"] = _Response({"status": "ok", "data": None})
+        with pytest.raises(UploadError, match="без серверов"):
+            pick_server(_client(fake))
+
 
 class TestUploadFile:
     def test_anonymous_upload_no_cookie(self, tmp_path: Path) -> None:
@@ -124,6 +131,15 @@ class TestUploadFile:
         with pytest.raises(UploadError, match="error-serverError"):
             upload_file(file, client)
         assert file.read_bytes() == before
+
+    def test_data_null_ok_payload_is_loud_not_attribute_error(self, tmp_path: Path) -> None:
+        """M1: `"data": null` in a 200-OK upload response = loud, not AttributeError."""
+        file, fake = _setup(tmp_path)
+        fake.post_response = _Response({"status": "ok", "data": None})
+        client = _client(fake)
+        client.token = "g"
+        with pytest.raises(UploadError, match="downloadPage"):
+            upload_file(file, client)
 
 
 class TestUploadOutput:

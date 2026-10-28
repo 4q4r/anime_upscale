@@ -65,14 +65,17 @@ ignore = [
     "S101", "ANN", "D", "ARG", "PLC0415", "SLF001", "PLR2004", "TRY003",
     "EM101", "EM102", "FBT", "S314", "S310", "PT018", "INP001", "N999",
     "A002", "ANN401", "PLR0913", "TRY300", "TRY301", "PERF401", "RET504",
+    "N802",  # fakes mirror upstream API names (e.g. VS core.bs.VideoSource)
     "S105", "S106", "S107",  # fake tokens/credentials in mocked HTTP tests
     "B017", "B018",  # frozen-dataclass probes and placeholder attribute checks
     "RUF012",  # mutable class attrs only hold per-class fakes in test doubles
 ]
-# Stage builders import VS/torch/vsrife lazily: keeps CLI startup light and lets
-# encode-only runs avoid loading GPU stacks entirely.
+# Stage builders resolve their heavy backends (vsdeband, vsrife, spandrel)
+# inside the builder body; the registry module itself is VS-free
+# (vapoursynth is TYPE_CHECKING-only there).
 "src/anime_upscale/stages/*" = ["PLC0415"]
-# The CLI driver keeps heavy imports (VS-backed stage registry, model fetch) lazy.
+# The CLI driver imports the VS/torch-touching modules (pipeline, stages)
+# lazily — `models fetch/verify` and usage errors never load the GPU stacks.
 "src/anime_upscale/cli.py" = ["PLC0415"]
 # Standalone scripts are not packages (INP001); benchmark.py imports the venv package.
 "scripts/*" = ["INP001"]
@@ -86,7 +89,5 @@ error-on-warning = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-q", "--strict-markers"]
-markers = [
-    "gpu: requires a CUDA device (deselected automatically without one)",
-    "vapoursynth: requires importable VapourSynth (skipped gracefully otherwise)",
-]
+# gpu/vapoursynth markers are registered in tests/conftest.py (M8): the same
+# module owns deselection-without-CUDA and VS-less collection-ignores.

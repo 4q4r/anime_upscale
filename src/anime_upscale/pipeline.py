@@ -14,7 +14,7 @@ from pathlib import Path
 import vapoursynth as vs
 
 from anime_upscale.ffmpeg import build_mux_args, finish_encoder, spawn_encoder
-from anime_upscale.stages import (  # noqa: F401 (registry import)  # noqa: F401
+from anime_upscale.stages import (  # noqa: F401 - descale/deband/interpolate/upscale register via import
     STAGE_BUILDERS,
     StageContext,
     deband,
@@ -111,6 +111,16 @@ def run_pipeline(
             finish_encoder(encoder)
             msg = f"Поток в ffmpeg оборвался во время кодирования: {exc}"
             raise PipelineError(msg) from exc
+        except BaseException:
+            # M2: ANY other escape (VS-internal failure, KeyboardInterrupt) must reap
+            # the child — ffmpeg never outlives this call — while the ORIGINAL
+            # exception stays the loud failure. If ffmpeg died too, its tail is
+            # reported without masking the cause.
+            try:
+                finish_encoder(encoder)
+            except Exception as teardown_exc:  # noqa: BLE001 - teardown must not mask the cause
+                ctx.reporter.warn(f"ffmpeg не завершился чисто после сбоя графа: {teardown_exc}")
+            raise
     finally:
         if encoder.stdin is not None and not encoder.stdin.closed:
             encoder.stdin.close()

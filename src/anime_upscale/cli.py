@@ -1,14 +1,20 @@
 """
 CLI root command + models subcommand (plan §3; batch §11.5-§11.6; ruling: continue-and-summarize).
 
-Exit codes: 0 = every entry ok; 1 = pipeline/pre-flight failure; 2 = usage;
-3 = pipeline ok but a per-file upload failed (plan §10 dedicated code).
+Exit codes: 0 = every entry ok; 1 = pipeline/pre-flight failure; 3 = pipeline
+ok but a per-file upload failed (plan §10 dedicated code). Usage errors exit
+2 — argparse's own SystemExit, not a module constant.
+
+VS/torch-touching imports (pipeline, stages) are lazy: `models fetch/verify`
+and usage errors must never load the GPU stacks.
 """
+
+from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from anime_upscale.config import (
     Config,
@@ -23,16 +29,19 @@ from anime_upscale.gofile import GofileClient, GofileError
 from anime_upscale.hardware import HardwareError, HardwareProfile, detect_hardware, print_banner
 from anime_upscale.models.fetch import FetchError, verify_all
 from anime_upscale.models.manifest import ManifestError
-from anime_upscale.pipeline import PipelineError, run_pipeline
 from anime_upscale.reporting import (
     ProgressThrottle,
     Reporter,
     enable_windows_console_vt,
     resolve_mode,
 )
-from anime_upscale.stages import StageContext
 from anime_upscale.tools import ToolError, resolve_tool
 from anime_upscale.upload import UploadError, upload_output
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from anime_upscale.stages import StageContext
 
 MEDIA_EXTENSIONS = frozenset(
     {".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".flv"}
@@ -98,12 +107,17 @@ def main(argv: list[str] | None = None) -> int:
         HardwareError,
         ManifestError,
         FetchError,
-        PipelineError,
         UploadError,
     ) as exc:
         reporter.error(str(exc))
         return EXIT_FAILURE
     except RuntimeError as exc:  # stage-level loud failures
+        reporter.error(str(exc))
+        return EXIT_FAILURE
+    except OSError as exc:
+        # Safety net for pre-flight I/O that escaped specific wrapping
+        # (requests.RequestException is an OSError subclass): the loud-error
+        # contract forbids raw tracebacks on any documented failure path.
         reporter.error(str(exc))
         return EXIT_FAILURE
     except KeyboardInterrupt:
@@ -113,7 +127,6 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_models(args: argparse.Namespace, reporter: Reporter) -> int:
     from anime_upscale.models.fetch import fetch_all
-    from anime_upscale.models.fetch import verify_all as verify_models
 
     root = Path.cwd()
     config = load_config(root / args.config)
@@ -122,7 +135,7 @@ def _run_models(args: argparse.Namespace, reporter: Reporter) -> int:
     if args.action == "fetch":
         fetch_all(manifest_path, models_dir, reporter)
         return EXIT_OK
-    verified = verify_models(manifest_path, models_dir)
+    verified = verify_all(manifest_path, models_dir)
     for name, path in verified.items():
         reporter.success(f"{name}: {path}")
     reporter.line(f"Проверено моделей: {len(verified)}.")
@@ -242,7 +255,7 @@ def _resolve_output_override(output: str | None, queue_len: int) -> str | None:
 
 def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     ctx: StageContext,
-    item: "QueueItem",
+    item: QueueItem,
     input_dir: Path,
     output_dir: Path,
     client_factory: Callable[[], GofileClient],
@@ -257,6 +270,11 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     Returns None on success, or ("pipeline" | "upload", detail) on failure —
     the continue-and-summarize ruling keeps the batch alive either way.
     """
+    # Lazy VS/torch stack (M7): resolved at call time as a MODULE so tests can
+    # patch anime_upscale.pipeline.run_pipeline and the attribute lookup at the
+    # call site sees the patch.
+    from anime_upscale import pipeline as pipeline_mod
+
     reporter = ctx.reporter
     try:
         source_path = fetch_queue_item(item, input_dir, client_factory, reporter)
@@ -269,7 +287,7 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
         # fires per frame — unthrottled printing would flood the console.
         progress = ProgressThrottle(reporter, label=f"[{item.name}] Обработка").callback()
 
-        run_pipeline(
+        pipeline_mod.run_pipeline(
             ctx, source_path, output_path, ffmpeg_path=ffmpeg_path, progress_update=progress
         )
         if upload_enabled:
@@ -281,7 +299,7 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
             )
     except UploadError as exc:
         return ("upload", f"пайплайн ok, загрузка не удалась: {exc}")
-    except (PipelineError, EntryError, GofileError, RuntimeError, OSError) as exc:
+    except (pipeline_mod.PipelineError, EntryError, GofileError, RuntimeError, OSError) as exc:
         return ("pipeline", str(exc))
     return None
 

@@ -44,7 +44,9 @@ CONTENTS_QUERY_PARAMS: dict[str, Any] = {
     "sortDirection": -1,
 }
 
-GOFILE_SHARE_RE = re.compile(r"gofile\.io/d/([^/?#\s]+)", re.IGNORECASE)
+# Share path INSIDE a gofile URL — matched against urlparse(...).path only,
+# never the whole string (a /d/<id> shape in a query string must not classify).
+GOFILE_SHARE_RE = re.compile(r"^/d/([^/?#]+)$", re.IGNORECASE)
 
 # Video whitelist (spec addendum 1): only these extensions are queued from folders.
 VIDEO_EXTENSIONS = frozenset({".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v", ".ts", ".m2ts"})
@@ -265,11 +267,20 @@ def load_saved_guest(path: Path | None = None) -> str:
 
 
 def save_guest(token: str, path: Path | None = None) -> Path:
-    """Persist the guest token once (creation is the rate-limited operation)."""
+    """
+    Persist the guest token once (creation is the rate-limited operation).
+
+    The token is a credential: written via temp file + os.replace (atomic — a
+    crash mid-write never leaves a corrupt state file behind) and chmod 0600
+    (owner-only, independent of umask).
+    """
     path = path or state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    path.write_text(f'token = "{token}"\ncreated = "{created}"\n', encoding="utf-8")
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(f'token = "{token}"\ncreated = "{created}"\n', encoding="utf-8")
+    temp.chmod(0o600)
+    temp.replace(path)  # atomic: only complete, owner-only files reach the state path
     return path
 
 
@@ -311,19 +322,25 @@ class GofileClient:
             self.token = saved
             return self.token
         self.session.pin("api.gofile.io")
-        response = self.session.post(
-            "https://api.gofile.io/accounts",
-            headers={"User-Agent": self.user_agent, "Origin": "https://gofile.io"},
-            timeout=30,
-        )
+        try:
+            response = self.session.post(
+                "https://api.gofile.io/accounts",
+                headers={"User-Agent": self.user_agent, "Origin": "https://gofile.io"},
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            # §11.3: a pre-flight connection failure is a loud Russian error, not a traceback.
+            msg = f"Сетевая ошибка при создании гостевого токена gofile: {exc}"
+            raise GofileError(msg) from exc
         payload = response.json() if response.status_code == _HTTP_OK else {}
-        if payload.get("status") != "ok" or not payload.get("data", {}).get("token"):
+        data = payload.get("data") or {}  # live API may send explicit `"data": null`
+        if payload.get("status") != "ok" or not data.get("token"):
             msg = (
                 f"Не удалось создать гостевой токен gofile: HTTP {response.status_code}, "
                 f"ответ: {payload.get('status', response.text[:200])}"
             )
             raise GofileError(msg)
-        self.token = payload["data"]["token"]
+        self.token = data["token"]
         if not self._account_token:  # account tokens never overwrite the guest state file
             save_guest(self.token, self.state_path)
         return self.token
@@ -337,18 +354,26 @@ class GofileClient:
         max_attempts = 4
         for attempt in range(max_attempts):
             window_offset = -1 if attempt >= 1 else 0  # current window, then −1 once
-            response = self.session.get(
-                url,
-                headers=content_headers(
-                    self.token,
-                    user_agent=self.user_agent,
-                    language=self.language,
-                    salt=self.wt_salt,
-                    window_offset=window_offset,
-                ),
-                params=CONTENTS_QUERY_PARAMS,
-                timeout=60,
-            )
+            try:
+                response = self.session.get(
+                    url,
+                    headers=content_headers(
+                        self.token,
+                        user_agent=self.user_agent,
+                        language=self.language,
+                        salt=self.wt_salt,
+                        window_offset=window_offset,
+                    ),
+                    params=CONTENTS_QUERY_PARAMS,
+                    timeout=60,
+                )
+            except requests.RequestException as exc:
+                # §11.3: connection reset etc. = loud error quoting the diagnosis.
+                msg = (
+                    f"Сетевая ошибка при запросе gofile /contents/{content_id} "
+                    f"(попытка {attempt + 1}/{max_attempts}): {exc}"
+                )
+                raise GofileError(msg) from exc
             if response.status_code != _HTTP_OK:
                 msg = f"gofile /contents/{content_id}: HTTP {response.status_code}."
                 raise GofileError(msg)
@@ -396,7 +421,7 @@ class GofileClient:
         never silent); empty-after-filter = loud error.
         """
         payload = self.fetch_contents(content_id)
-        data = payload.get("data", {})
+        data = payload.get("data") or {}  # live API may send explicit `"data": null`
         if data.get("passwordStatus", "passwordOk") != "passwordOk":
             msg = (
                 f"gofile: содержимое {content_id} защищено паролем "
@@ -455,7 +480,7 @@ class GofileClient:
         )
         for folder in folders:
             sub = self.fetch_contents(str(folder.get("id", "")))
-            sub_children = sub.get("data", {}).get("children")
+            sub_children = (sub.get("data") or {}).get("children")  # "data": null tolerated
             if not sub_children:
                 # null / {} / [] — an empty subfolder contributes nothing (skip note),
                 # it is not a corruption abort (same policy as the root normalizer).

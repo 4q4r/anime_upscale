@@ -2,18 +2,22 @@
 Stage registry: name → builder(ctx, clip) -> clip (plan §2).
 
 Canonical order and subset validation live in config.resolve_run; this registry
-only binds names to implementations. Unknown stage = loud error.
+only binds names to implementations. Unknown stage = loud error. The module is
+VS-free: importing the registry (e.g. for StageContext) must not load the
+VapourSynth stack — vapoursynth here is TYPE_CHECKING-only.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-
-import vapoursynth as vs
+from typing import TYPE_CHECKING
 
 from anime_upscale.config import RunConfig
 from anime_upscale.hardware import HardwareProfile
 from anime_upscale.reporting import Reporter
+
+if TYPE_CHECKING:
+    import vapoursynth as vs
 
 
 @dataclass(frozen=True)
@@ -28,7 +32,7 @@ class StageContext:
     models_manifest: Path = Path("models/manifest.toml")
 
 
-StageBuilder = Callable[[StageContext, vs.VideoNode], vs.VideoNode]
+StageBuilder = Callable[[StageContext, "vs.VideoNode"], "vs.VideoNode"]
 
 STAGE_BUILDERS: dict[str, StageBuilder] = {}
 
