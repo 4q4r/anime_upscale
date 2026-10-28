@@ -270,13 +270,16 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     Returns None on success, or ("pipeline" | "upload", detail) on failure —
     the continue-and-summarize ruling keeps the batch alive either way.
     """
-    # Lazy VS/torch stack (M7): resolved at call time as a MODULE so tests can
-    # patch anime_upscale.pipeline.run_pipeline and the attribute lookup at the
-    # call site sees the patch.
-    from anime_upscale import pipeline as pipeline_mod
-
     reporter = ctx.reporter
     try:
+        # Lazy VS/torch stack (M7): resolved at call time as a MODULE so tests
+        # can patch anime_upscale.pipeline.run_pipeline and the attribute
+        # lookup at the call site sees the patch. The import sits INSIDE the
+        # guarded region (PR1-review Minor): on a VS-less machine the
+        # ImportError surfaces as the loud Russian error below, not a raw
+        # ModuleNotFoundError traceback.
+        from anime_upscale import pipeline as pipeline_mod
+
         source_path = fetch_queue_item(item, input_dir, client_factory, reporter)
         output_name = output_override or f"{Path(item.name).stem}.mkv"
         output_path = output_dir / output_name
@@ -297,6 +300,12 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
                 reporter,
                 progress=lambda done, total: reporter.progress_bytes("Загрузка", done, total),
             )
+    except ImportError as exc:
+        # Must precede the pipeline_mod tuple below: with the import itself
+        # failed, pipeline_mod is unbound and evaluating that tuple would
+        # raise NameError over the real cause.
+        msg = f"VapourSynth не найден — установите зависимости (`uv sync`) ({exc})."
+        return ("pipeline", msg)
     except UploadError as exc:
         return ("upload", f"пайплайн ok, загрузка не удалась: {exc}")
     except (pipeline_mod.PipelineError, EntryError, GofileError, RuntimeError, OSError) as exc:

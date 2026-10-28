@@ -45,6 +45,15 @@ class TestGrammar:
         assert classify_entry("https://gofile.io/d/AbCdEf") == GofileLink("AbCdEf")
         assert classify_entry("https://www.gofile.io/d/x1?x=2") == GofileLink("x1")
 
+    def test_share_link_trailing_slash_accepted(self) -> None:
+        """PR1-review Minor: gofile.io/d/<id>/ (trailing slash) IS the canonical
+        share form users paste — accepted with id case preserved; a double
+        slash stays a loud spec error."""
+        assert classify_entry("https://gofile.io/d/abc/") == GofileLink("abc")
+        assert classify_entry("https://www.gofile.io/d/AbCdEf/") == GofileLink("AbCdEf")
+        with pytest.raises(EntryError, match=r"gofile\.io/d"):
+            classify_entry("https://gofile.io/d/abc//")
+
     def test_plain_http_entry_rejected_https_only(self) -> None:
         """F4: plain-HTTP ingestion bypasses DoH pinning — loud https-only error."""
         with pytest.raises(EntryError, match="HTTPS"):

@@ -46,7 +46,7 @@ CONTENTS_QUERY_PARAMS: dict[str, Any] = {
 
 # Share path INSIDE a gofile URL — matched against urlparse(...).path only,
 # never the whole string (a /d/<id> shape in a query string must not classify).
-GOFILE_SHARE_RE = re.compile(r"^/d/([^/?#]+)$", re.IGNORECASE)
+GOFILE_SHARE_RE = re.compile(r"^/d/([^/?#]+?)/?$", re.IGNORECASE)
 
 # Video whitelist (spec addendum 1): only these extensions are queued from folders.
 VIDEO_EXTENSIONS = frozenset({".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v", ".ts", ".m2ts"})
@@ -270,16 +270,19 @@ def save_guest(token: str, path: Path | None = None) -> Path:
     """
     Persist the guest token once (creation is the rate-limited operation).
 
-    The token is a credential: written via temp file + os.replace (atomic — a
-    crash mid-write never leaves a corrupt state file behind) and chmod 0600
-    (owner-only, independent of umask).
+    The token is a credential: the temp file is CREATED at 0600 via os.open
+    (owner-only from the first byte — no world-readable window before a
+    post-write chmod), then published with os.replace (atomic — a crash
+    mid-write never leaves a corrupt state file behind).
     """
     path = path or state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     temp = path.with_name(path.name + ".tmp")
-    temp.write_text(f'token = "{token}"\ncreated = "{created}"\n', encoding="utf-8")
-    temp.chmod(0o600)
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f'token = "{token}"\ncreated = "{created}"\n')
+    temp.chmod(0o600)  # umask-proof re-assert (Windows: read-only attribute only)
     temp.replace(path)  # atomic: only complete, owner-only files reach the state path
     return path
 

@@ -37,7 +37,7 @@ class TestDeselectHelper:
             _FakeItem("c", {"vapoursynth"}),
         ]
         deselected = conftest.deselect_gpu_items(items, cuda_available=False)
-        assert deselected == ["a"]
+        assert [item.nodeid for item in deselected] == ["a"]
         assert [item.nodeid for item in items] == ["b", "c"]
 
     def test_with_cuda_nothing_is_deselected(self) -> None:
@@ -47,12 +47,78 @@ class TestDeselectHelper:
         assert len(items) == 1
 
 
+class _HookRecorder:
+    def __init__(self) -> None:
+        self.deselected: list[object] = []
+
+    def pytest_deselected(self, items: list[object]) -> None:
+        self.deselected.extend(items)
+
+
+class _FakeConfig:
+    def __init__(self) -> None:
+        self.hook = _HookRecorder()
+
+
+class TestDeselectedHook:
+    def test_modifyitems_reports_dropped_items_via_hook(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR1-review Minor: deselection must be VISIBLE — the removed items go
+        through config.hook.pytest_deselected (item objects, not bare ids), so
+        pytest's summary shows the drop instead of a silently smaller count."""
+        conftest = _load_conftest()
+        monkeypatch.setattr(conftest, "_cuda_available", lambda: False)
+        config = _FakeConfig()
+        items = [_FakeItem("gpu1", {"gpu"}), _FakeItem("plain", set())]
+        conftest.pytest_collection_modifyitems(config, items)  # type: ignore[arg-type]
+        assert [item.nodeid for item in config.hook.deselected] == ["gpu1"]
+        assert [item.nodeid for item in items] == ["plain"]
+
+    def test_modifyitems_hook_silent_when_cuda_present(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conftest = _load_conftest()
+        monkeypatch.setattr(conftest, "_cuda_available", lambda: True)
+        config = _FakeConfig()
+        items = [_FakeItem("gpu1", {"gpu"})]
+        conftest.pytest_collection_modifyitems(config, items)  # type: ignore[arg-type]
+        assert config.hook.deselected == []
+        assert len(items) == 1
+
+    def test_deselection_visible_in_run_output(self) -> None:
+        """PR1-review Minor: with CUDA hidden the summary must carry the drop
+        (pytest's own ``N deselected`` tail) plus the reason line."""
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests/test_stages.py", "--no-header"],
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            env=env,
+            check=False,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "1 deselected" in combined
+        assert "gpu tests (no CUDA device)" in combined
+
+
 class TestVsCollectionGate:
     def test_vs_modules_ignored_only_without_vapoursynth(self) -> None:
         conftest = _load_conftest()
         assert conftest.vs_ignored_modules(vapoursynth_available=True) == []
         ignored = conftest.vs_ignored_modules(vapoursynth_available=False)
-        assert "test_pipeline.py" in ignored and "test_stages.py" in ignored
+        # test_batch/test_benchmark join the matrix (PR1-review Minor): they
+        # patch/import the pipeline module at RUNTIME, so VS-less machines
+        # would otherwise hit ModuleNotFoundError mid-test, not at collection.
+        assert {
+            "test_pipeline.py",
+            "test_stages.py",
+            "test_batch.py",
+            "test_benchmark.py",
+        } == set(ignored)
 
     def test_conftest_computes_ignores_for_this_machine(self) -> None:
         conftest = _load_conftest()
