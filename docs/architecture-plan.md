@@ -7,6 +7,22 @@
 
 ---
 
+## v1.3 as-implemented amendments (2026-10-28, controller-folded after the full implementation)
+
+The implementation (branch `feature/full-pipeline-v1`, 13 commits, parity PASSED, all gates green) surfaced these plan corrections — the CODE is the authority now; this section records what changed vs v1.2:
+
+1. **Batch failure policy (§8 decision #7): RESOLVED = option 2** — continue-and-summarize with non-zero exit at batch end; pre-flight failures abort before entry 1; upload failures use dedicated exit code 3.
+2. **§11.4 gofile FOLDER SUPPORT (owner addendum 1)** — folder links expand in place: recursive children walk, order folders-first-then-files (alphabetical), video whitelist `.mkv .mp4 .avi .webm .mov .m4v .ts .m2ts` (case-insensitive), non-video children = printed skip note, empty-after-filter = loud error, banners use the expanded queue, idempotence+collisions per child. LIVE API fact: folder `children` is a **dict keyed by child id** (not a list); every share link resolves to a folder wrapper — normalizer handles both shapes.
+3. **§9.3 multi-GPU fan-out: NOT IMPLEMENTED in v1 (honest scope cut)** — vsrife's public API has no global-frame-offset parameter (verified from installed source), so the seam-bit-identity segment design is unachievable as written. v1 ships single-GPU (detection reports devices; no fake driver). Amendment options for a future plan: vsmlrt `RIFEMerge`-based path with explicit global offset, per-chunk boundary re-interpolation, or an upstream vsrife feature request.
+4. **Machine reality: NVIDIA GeForce GTX 1650 4 GB** (not the RTX 5080 assumed in early research context). Everything runs on it (CUDA 13.0 supports sm_75; TRT builds/infers; VRAM budget → 1 stream). First benchmark entry records the REAL GPU; 5080-class figures remain formula-derived until run on such hardware.
+5. **§4 profiles**: `[profiles.X.stages.Y]` was invalid TOML (key redefinition) → implemented as `[profiles.X.overrides.Y]`; `[profiles.full]` gained the required `descale_height = 1080`.
+6. **§5 engines as actually shipped**: `misc.SCDetect` no longer exists in VS R81/PyPI → `scripts/build_misc_plugin.sh` compiles it into `.venv` (re-run after `uv sync`; Windows: manual misc.dll per README); vsdeband PyPI 1.3.3 is an empty stub → dependency pinned from JET git, API = `vsdeband.f3k_deband()` over vszip; descale v12 = per-kernel `Debicubic`/`Debilinear` requiring float32 input (stage converts to 444PS).
+7. **§9.2 VRAM formula**: stated constants could not produce the stated anchors → calibrated constant block (`_RIFE_STREAM_BUDGET_MB` et al.) reproduces both anchors; single tunable block for benchmark refinement.
+8. **ffmpeg 9 renames**: demuxer `y4m` → `yuv4mpegpipe`; option `-colorrange` → `-color_range` (both regression-tested).
+9. **Windows** (§12): verified via PyPI/index metadata only (all wheels present incl. torch-tensorrt cp314 win_amd64); live-tested on Linux; misc plugin on Windows = manual dll copy (documented).
+
+---
+
 ## v1.2 changes (2026-10-27)
 
 v1.2 integrates three new owner requirements on top of the approved v1.1 core — **batch input lists**, **URL/gofile input ingestion**, and a **gofile download client with a guest-token lifecycle** — as a new §11 plus additive edits to §2 (tree), §3 (CLI), §4 (config), §7 (migration), §8 (decisions), and §10 (DoH scope + delegation). No v1.0/v1.1 decision is reopened: the fixed stack, TOML single-config discipline, DoH policy, and TTY/plain progress policy are reused, not redefined.
