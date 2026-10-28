@@ -207,14 +207,19 @@ anime_upscale/
 │   ├── models/               # manifest parse + sha256 fetch/verify
 │   └── stages/               # registry: descale, deband, upscale, interpolate, encode
 ├── tests/                    # 138 tests; GPU/VS-marked tests skip gracefully
-├── scripts/                  # benchmark.py + build_misc_plugin.sh
+├── scripts/                  # benchmark.py + build_misc_plugin.{sh,bat}
 ├── benchmarks/               # dated per-GPU results
 └── research/                 # verified canon the stack decisions came from
 ```
 
 ## 🪟 Windows notes
 
-The pipeline targets both Linux and Windows: pathlib everywhere, spawn-safe process model (no fork), platform-aware state paths, `[tools]` overrides for ffmpeg/ffprobe, VT-enabled colored console, identical `--no-color`/`--no-tty`. Wheels verified for the current stack (see the architecture plan §12). The `misc` plugin step differs: on Windows take `misc.dll` from the official VapourSynth installer and drop it into `.venv\Lib\site-packages\vapoursynth\plugins\misc\` instead of running the g++ script.
+The pipeline targets both Linux and Windows: pathlib everywhere, spawn-safe process model (no fork), platform-aware state paths, `[tools]` overrides for ffmpeg/ffprobe, VT-enabled colored console, identical `--no-color`/`--no-tty`. Wheels verified for the current stack (see the architecture plan §12).
+
+The `misc` plugin step differs per platform:
+
+- **Linux** — `scripts/build_misc_plugin.sh` (canonical; compiles the pinned source into the venv).
+- **Windows** — `scripts\build_misc_plugin.bat` (faithful mirror: same commit/tag pins, same URLs, same `core.misc` verification). It finds `g++` (MinGW-W64, e.g. WinLibs or MSYS2 — 64-bit) or falls back to `cl.exe` (requires a Visual Studio Developer prompt). If neither compiler exists, it prints both recovery options; option (б) is the manual fallback: take `misc.dll` from an official VapourSynth installer **R80 or older** and copy it into `%APPDATA%\VapourSynth\plugins64\`.
 
 ## 🧪 Development
 
