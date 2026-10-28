@@ -177,3 +177,26 @@ class TestResolveRun:
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             run.stages = ("encode",)  # type: ignore[misc]
+
+
+class TestNetworkSection:
+    def test_default_strict_tls_false(self) -> None:
+        cfg = _load_default()
+        assert cfg.network.strict_tls is False
+
+    def test_strict_tls_true_parsed(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[network]\nstrict_tls = true\n", encoding="utf-8")
+        assert load_config(cfg_file).network.strict_tls is True
+
+    def test_unknown_network_key_is_hard_error(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[network]\nnope = 1\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="nope"):
+            load_config(cfg_file)
+
+    def test_non_bool_strict_tls_is_hard_error(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('[network]\nstrict_tls = "yes"\n', encoding="utf-8")
+        with pytest.raises(ConfigError, match="strict_tls"):
+            load_config(cfg_file)

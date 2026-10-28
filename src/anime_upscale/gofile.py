@@ -15,8 +15,10 @@ headers/params, retry rules).
 import hashlib
 import os
 import re
+import sys
 import time
 import tomllib
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,7 @@ from urllib.parse import urlparse
 
 import requests
 import urllib3.connection
+import urllib3.exceptions
 import urllib3.util.connection
 from requests.adapters import HTTPAdapter
 
@@ -66,6 +69,80 @@ _MAX_FOLDER_DEPTH = 10
 
 class GofileError(Exception):
     """Loud gofile/DoH failure (Russian message)."""
+
+
+# ── Interception-adaptive TLS (live Windows-server feedback, 2026-10-28) ────────────────
+#
+# The owner's server network TLS-intercepts gofile-family hosts (api.gofile.io and
+# store hosts answer with self-signed chains — the same selective DPI that hits
+# dns.google). DoH stays STRICTLY verified (the anti-spoofing anchor: it proves the
+# DESTINATION); only the last-mile certificate check of gofile/fetch requests is
+# adaptive. On a certificate-verification failure specifically, the request is
+# retried ONCE with verify=False, preceded by a loud one-time Russian banner. The
+# owner accepts provider visibility of his gofile traffic; the kill-switch is
+# [network] strict_tls = true.
+
+INTERCEPT_WARNING = (
+    "⚠ Перехват TLS на сети (self-signed цепочка) — соединение продолжено "
+    "без проверки сертификата. Назначение подтверждено DoH-пиннингом; "
+    "провайдер видит трафик. Отключить: [network] strict_tls = true"
+)
+
+_intercept_warning_shown = False
+
+
+def _warn_intercepted_tls() -> None:
+    """Print the interception banner once per process (module-level dedup flag)."""
+    global _intercept_warning_shown  # noqa: PLW0603 - one-shot banner dedup is process-global by design
+    if _intercept_warning_shown:
+        return
+    _intercept_warning_shown = True
+    sys.stderr.write(INTERCEPT_WARNING + "\n")
+    sys.stderr.flush()
+
+
+def is_certificate_verify_failure(exc: requests.exceptions.SSLError) -> bool:
+    """Report whether this SSL error is specifically a certificate-verification failure."""
+    text = str(exc)
+    return "CERTIFICATE_VERIFY_FAILED" in text or "self-signed" in text
+
+
+def _strict_tls_diagnosis(exc: requests.exceptions.SSLError) -> str:
+    return (
+        f"{exc}. Диагноз: сеть перехватывает TLS-трафик (self-signed цепочка сертификата). "
+        "Проверка сертификата не отключена: работает [network] strict_tls = true. "
+        "Разрешить продолжение соединения на перехватывающей сети: "
+        "[network] strict_tls = false (по умолчанию) в config.toml."
+    )
+
+
+def adaptive_tls_request(
+    sender: Callable[..., requests.Response],
+    *,
+    strict_tls: bool = False,
+    **kwargs: Any,  # noqa: ANN401 - mirrors the requests call surface
+) -> requests.Response:
+    """
+    ONE shared seam for every gofile-family/fetch HTTP request.
+
+    Calls ``sender(**kwargs)`` (a bound requests session verb); on a certificate-
+    verification SSL failure specifically: strict mode re-raises the same SSL
+    error enriched with the interception diagnosis and the config flag name
+    (no retry), otherwise prints the one-time banner and retries ONCE with
+    ``verify=False``. Non-SSL errors and non-verification SSL errors pass
+    through untouched, on both paths.
+    """
+    try:
+        return sender(**kwargs)
+    except requests.exceptions.SSLError as exc:
+        if not is_certificate_verify_failure(exc):
+            raise
+        if strict_tls:
+            raise requests.exceptions.SSLError(_strict_tls_diagnosis(exc)) from exc
+        _warn_intercepted_tls()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+            return sender(**{**kwargs, "verify": False})
 
 
 # ── Strict DoH resolve ladder + pin (plan §10.1) ─────────────────────────────────────────
@@ -327,19 +404,22 @@ class ResolvedChild:
 class GofileClient:
     """gofile API client consumed by fetch_input.py (downloads) and upload.py (uploads)."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - config-derived constructor bundle, mirrors config sections 1:1
         self,
         account_token: str = "",
         user_agent: str = DEFAULT_USER_AGENT,
         language: str = DEFAULT_LANGUAGE,
         wt_salt: str = DEFAULT_WT_SALT,
         state_path: Path | None = None,
+        *,
+        strict_tls: bool = False,
     ) -> None:
         """Wire the client to config-derived constants and a pinned session."""
         self.user_agent = user_agent
         self.language = language
         self.wt_salt = wt_salt
         self.state_path = state_path
+        self.strict_tls = strict_tls
         self.session = PinnedSession()
         self._account_token = account_token
         self.token = account_token
@@ -355,8 +435,10 @@ class GofileClient:
             return self.token
         self.session.pin("api.gofile.io")
         try:
-            response = self.session.post(
-                "https://api.gofile.io/accounts",
+            response = adaptive_tls_request(
+                self.session.post,
+                url="https://api.gofile.io/accounts",
+                strict_tls=self.strict_tls,
                 headers={"User-Agent": self.user_agent, "Origin": "https://gofile.io"},
                 timeout=30,
             )
@@ -387,8 +469,10 @@ class GofileClient:
         for attempt in range(max_attempts):
             window_offset = -1 if attempt >= 1 else 0  # current window, then −1 once
             try:
-                response = self.session.get(
-                    url,
+                response = adaptive_tls_request(
+                    self.session.get,
+                    url=url,
+                    strict_tls=self.strict_tls,
                     headers=content_headers(
                         self.token,
                         user_agent=self.user_agent,
@@ -551,8 +635,10 @@ class GofileClient:
         self.session.pin(host)
         temp = destination.with_name(destination.name + ".part")
         try:
-            with self.session.get(
-                link,
+            with adaptive_tls_request(
+                self.session.get,
+                url=link,
+                strict_tls=self.strict_tls,
                 headers={
                     "Cookie": f"accountToken={self.token}",
                     "User-Agent": self.user_agent,

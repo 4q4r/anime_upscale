@@ -150,12 +150,15 @@ One file: `config.toml`. No environment variables at any layer. Unknown keys are
 | `[stages.descale/deband/upscale/interpolate/encode]` | all stage parameters (see the file for per-flag rationale) |
 | `[stages.encode.x265_params]` | pass-through x265 sheet; `keyint/min-keyint` computed unless overridden |
 | `[models]` | models dir + manifest path |
+| `[network]` | transport policy: `strict_tls` (default `false`) — adaptive TLS retry on TLS-intercepting networks, loud warning every run; `true` = fail loudly instead |
 | `[upload.gofile]` | optional premium token (also used for downloads) |
 | `[fetch.gofile]` | wt-scheme overrides (`wt_salt`, `user_agent`, `language`) |
 | `[tools]` | explicit ffmpeg/ffprobe paths (empty = PATH lookup) |
 | `[profiles.*]` | named subsets + per-stage deep overrides (`[profiles.X.overrides.Y]`) |
 
 The gofile guest token is runtime state, not configuration: it lives in `$XDG_STATE_HOME/anime_upscale/gofile_guest.toml` (Windows: `%LOCALAPPDATA%\anime_upscale\state\…`) and is created once, then reused.
+
+TLS policy (`[network]`): DNS resolution stays STRICTLY verified — the DoH ladder (dns.google → 8.8.8.8 → 1.1.1.1) never downgrades and remains the anti-spoofing anchor for destination authenticity. On networks that TLS-intercept the gofile hosts themselves (self-signed chains from selective DPI), gofile/fetch requests retry **once** without the last-mile certificate check (`strict_tls = false`, default), printing a loud Russian warning every run — the provider can see the traffic, the destination is still DoH-pinned. Set `strict_tls = true` to disable the adaptation: a certificate-verification failure then fails loudly with the interception diagnosis.
 
 ## 📦 Batch & remote input
 
