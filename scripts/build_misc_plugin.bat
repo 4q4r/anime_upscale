@@ -166,6 +166,7 @@ goto :no_compiler
 
 :pacman_fail
 echo [ОШИБКА] pacman завершился с ошибкой.
+set "MSYS2_NOTE=pacman не смог установить mingw-w64-x86_64-gcc"
 echo Диагноз: если выше массовая ошибка "self-signed certificate in certificate chain" —
 echo все зеркала отдают self-signed цепочку — признак перехвата TLS на сети сервера;
 echo используйте bundled DLL или проксируйте сеть.
@@ -221,21 +222,30 @@ goto :fail
 :use_prebuilt
 echo [ЭТАП] Найден предсобранный DLL — проверяю sha256…
 set "DLL_HASH="
-certutil -hashfile "%PREBUILT_DLL%" SHA256 > "%WORK%\dllhash.txt" 2>nul
+certutil -hashfile "%PREBUILT_DLL%" SHA256 > "%WORK%\dllhash.txt"
 for /f "usebackq skip=1 delims=" %%H in ("%WORK%\dllhash.txt") do if not defined DLL_HASH set "DLL_HASH=%%H"
 if not defined DLL_HASH goto :prebuilt_fail
 if /i not "%DLL_HASH%"=="%PREBUILT_SHA256%" goto :prebuilt_fail
 echo [ЭТАП] sha256 совпадает — копирую в %PLUGIN_DIR%\misc.dll
-if not exist "%PLUGIN_DIR%" mkdir "%PLUGIN_DIR%"
-copy /y "%PREBUILT_DLL%" "%PLUGIN_DIR%\misc.dll" >nul || goto :prebuilt_fail
+if not exist "%PLUGIN_DIR%" mkdir "%PLUGIN_DIR%" || goto :copy_fail
+copy /y "%PREBUILT_DLL%" "%PLUGIN_DIR%\misc.dll" >nul || goto :copy_fail
 goto :built
+
+:copy_fail
+echo [ОШИБКА] Не удалось скопировать предсобранный DLL в %PLUGIN_DIR%\misc.dll.
+echo Подсказка: закройте процессы, использующие плагин (загруженный misc.dll
+echo удерживается python/VapourSynth), проверьте свободное место и антивирус,
+echo затем перезапустите скрипт. Причина ОС — в сообщении Windows выше.
+goto :fail
 
 :prebuilt_fail
 echo [ОШИБКА] Проверка предсобранного DLL не прошла (защита цепочки поставки).
 echo Ожидался sha256: %PREBUILT_SHA256%
 if defined DLL_HASH echo Фактический:    %DLL_HASH%
 echo Подсказка: scripts\prebuilt\misc-win-x64.dll повреждён или подменён —
-echo восстановите его из репозитория либо соберите компилятором (пути ниже).
+echo восстановите его из репозитория либо соберите компилятором —
+echo g++ ищется в: %LOCALAPPDATA%\Microsoft\WinGet\Links и рекурсивно в
+echo %LOCALAPPDATA%\Microsoft\WinGet\Packages, а также в текущем PATH.
 goto :fail
 
 :built
