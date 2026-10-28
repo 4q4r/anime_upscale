@@ -31,6 +31,7 @@ if not exist "%PY%" (
     goto :fail
 )
 
+set "PYTHONUTF8=1"
 for /f "delims=" %%P in ('"%PY%" -c "import vapoursynth, os; print(os.path.dirname(vapoursynth.__file__))"') do set "VS_PKG_DIR=%%P"
 if not defined VS_PKG_DIR (
     echo [ОШИБКА] Пакет vapoursynth не импортируется из окружения проекта.
@@ -51,7 +52,7 @@ curl.exe -fsSL "%BASE%/vapoursynth/%VS_TAG%/include/VapourSynth4.h" -o "%WORK%\V
 if not exist "%PLUGIN_DIR%" mkdir "%PLUGIN_DIR%"
 
 where g++ >nul 2>nul || goto :try_cl
-g++ -std=c++17 -O2 -shared -I"%WORK%" -o "%PLUGIN_DIR%\misc.dll" "%WORK%\miscfilters.cpp" || goto :gxx_fail
+g++ -std=c++17 -O2 -shared -static-libgcc -static-libstdc++ -I"%WORK%" -o "%PLUGIN_DIR%\misc.dll" "%WORK%\miscfilters.cpp" || goto :gxx_fail
 goto :built
 
 :try_cl
@@ -100,7 +101,7 @@ exit /b 0
 :verify_fail
 echo [ОШИБКА] Проверка не прошла: vapoursynth загрузился, но namespace core.misc не виден.
 echo Подсказка: скорее всего misc.dll собран не под 64-битный Python (проверьте разрядность
-echo компилятора) либо DLL не экспортирует VapourSynthPlugin2Init; логи компилятора выше.
+echo компилятора) либо DLL не экспортирует VapourSynthPluginInit2; логи компилятора выше.
 goto :fail
 
 :fail
