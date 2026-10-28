@@ -198,6 +198,9 @@ class TestSanitizeRemoteFilename:
             ".hidden.mkv",
             ".",
             "",
+            "C:evil.mkv",  # item 2: Windows drive-letter form
+            "C:\\path",
+            "\\\\server\\share",  # UNC — covered by the backslash rule
         ],
     )
     def test_hostile_names_rejected_with_source(self, bad: str) -> None:
@@ -206,7 +209,13 @@ class TestSanitizeRemoteFilename:
 
     @pytest.mark.parametrize(
         "good",
-        ["эпизод 01.mkv", "файл (2).mp4", "Воскрешение [1080p].mkv", "normal_name-mixed.ts"],
+        [
+            "эпизод 01.mkv",
+            "файл (2).mp4",
+            "Воскрешение [1080p].mkv",
+            "normal_name-mixed.ts",
+            "серия 01 — полное описание эпизода (2026).mkv",  # benign unicode item 2 control
+        ],
     )
     def test_benign_unicode_spaces_pass(self, good: str) -> None:
         assert sanitize_remote_filename(good, "последний сегмент пути URL") == good
@@ -219,6 +228,71 @@ class TestSanitizeRemoteFilename:
     def test_derive_filename_url_segment_traversal_rejected(self) -> None:
         with pytest.raises(EntryError, match="URL"):
             derive_filename({}, "https://host/download/..%2F..%2Fwin")
+
+    def test_remote_name_hostile_cd_is_terminal_not_swallowed(self, monkeypatch) -> None:
+        """Item 1: a rejected Content-Disposition name must NOT fall through to the
+        raw URL segment — the old `except EntryError: pass` bypassed the gate."""
+        from anime_upscale import fetch_input as fi
+
+        class _FakeSession:
+            def pin(self, host: str) -> str:
+                return "203.0.113.10"
+
+            def head(self, url: str, timeout: int = 30, allow_redirects: bool = True):
+                final_url = url
+
+                class _Resp:
+                    status_code = 200
+                    headers = {"Content-Disposition": 'attachment; filename="../x.mkv"'}
+                    url = final_url
+
+                return _Resp()
+
+        monkeypatch.setattr(fi, "PinnedSession", _FakeSession)
+        with pytest.raises(EntryError, match=r"\.\./x\.mkv"):
+            fi._remote_name("https://host/get/file")
+
+    def test_remote_name_absent_cd_benign_segment_used(self, monkeypatch) -> None:
+        """Item 1: absence-only fall-through — no header, benign URL segment wins."""
+        from anime_upscale import fetch_input as fi
+
+        class _FakeSession:
+            def pin(self, host: str) -> str:
+                return "203.0.113.10"
+
+            def head(self, url: str, timeout: int = 30, allow_redirects: bool = True):
+                final_url = url
+
+                class _Resp:
+                    status_code = 200
+                    headers: dict = {}
+                    url = final_url
+
+                return _Resp()
+
+        monkeypatch.setattr(fi, "PinnedSession", _FakeSession)
+        assert fi._remote_name("https://host/get/ok%20file.mkv") == "ok file.mkv"
+
+    def test_remote_name_hostile_segment_no_header_is_loud(self, monkeypatch) -> None:
+        from anime_upscale import fetch_input as fi
+
+        class _FakeSession:
+            def pin(self, host: str) -> str:
+                return "203.0.113.10"
+
+            def head(self, url: str, timeout: int = 30, allow_redirects: bool = True):
+                final_url = url
+
+                class _Resp:
+                    status_code = 200
+                    headers: dict = {}
+                    url = final_url
+
+                return _Resp()
+
+        monkeypatch.setattr(fi, "PinnedSession", _FakeSession)
+        with pytest.raises(EntryError, match=r"a/b\.mkv"):
+            fi._remote_name("https://host/get/a%2Fb.mkv")  # percent-decodes to a/b.mkv
 
     def test_gofile_hostile_child_name_rejected_in_queue(self) -> None:
         reporter = _MuteReporter()

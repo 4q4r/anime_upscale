@@ -99,6 +99,14 @@ def sanitize_remote_filename(name: str, source: str) -> str:
             "(без разделителей путей)."
         )
         raise EntryError(msg)
+    if ":" in name:
+        # Windows drive-letter forms ("C:evil.mkv", "C:\path") escape input/ on
+        # Windows; a colon is never valid in a flat cross-platform filename.
+        msg = (
+            f"Отказано в имени файла «{name}» из {source}: "
+            "символ «:» недопустим в имени файла (формы дисков Windows)."
+        )
+        raise EntryError(msg)
     if name in {".", ".."} or name.startswith(".."):
         msg = (
             f"Отказано в имени файла «{name}» из {source}: "
@@ -114,26 +122,43 @@ def sanitize_remote_filename(name: str, source: str) -> str:
     return name
 
 
+def _cd_candidate(headers: CaseInsensitiveDict[str]) -> tuple[str, str] | None:
+    """(raw name, source label) when a Content-Disposition name is present."""
+    disposition = headers.get("Content-Disposition", "")
+    if disposition:
+        star = _rfc5987_filename(disposition)
+        if star:
+            return star, "заголовок Content-Disposition (filename*)"
+        plain = _plain_filename(disposition)
+        if plain:
+            return plain, "заголовок Content-Disposition (filename)"
+    return None
+
+
+def _url_segment_candidate(url: str) -> tuple[str, str] | None:
+    """(raw name, source label) from the last URL path segment, if derivable."""
+    path = urlparse(url).path.rstrip("/")
+    segment = unquote(path.rsplit("/", 1)[-1]) if path else ""
+    if segment:
+        return segment, "последний сегмент пути URL"
+    return None
+
+
 def derive_filename(response_headers: CaseInsensitiveDict[str], url: str) -> str:
     """
     Content-Disposition (filename* → filename) → last URL path segment → loud error.
 
-    Every derived name passes the remote-name sanitization gate (F2).
+    Fix-round-2 contract: fall through from the header to the URL segment ONLY on
+    ABSENCE of a header name; a sanitizer rejection of a present candidate is
+    terminal (never swallowed into the next candidate). Every candidate is
+    sanitized individually.
     """
-    disposition = response_headers.get("Content-Disposition", "")
-    if disposition:
-        star = _rfc5987_filename(disposition)
-        if star:
-            return sanitize_remote_filename(star, "заголовок Content-Disposition (filename*)")
-        plain = _plain_filename(disposition)
-        if plain:
-            return sanitize_remote_filename(plain, "заголовок Content-Disposition (filename)")
-    path = urlparse(url).path.rstrip("/")
-    segment = unquote(path.rsplit("/", 1)[-1]) if path else ""
-    if segment:
-        return sanitize_remote_filename(segment, "последний сегмент пути URL")
-    msg = f"Невозможно определить имя файла для {url}: нет Content-Disposition и пустой путь."
-    raise EntryError(msg)
+    candidate = _cd_candidate(response_headers) or _url_segment_candidate(url)
+    if candidate is None:
+        msg = f"Невозможно определить имя файла для {url}: нет Content-Disposition и пустой путь."
+        raise EntryError(msg)
+    name, source = candidate
+    return sanitize_remote_filename(name, source)
 
 
 def _rfc5987_filename(disposition: str) -> str:
@@ -263,16 +288,17 @@ def _remote_name(url: str) -> str:
         msg = f"Недоступна прямая ссылка {url}: {exc}"
         raise EntryError(msg) from exc
     if response.status_code == _HTTP_OK:
-        try:
-            return derive_filename(response.headers, response.url or url)
-        except EntryError:
-            pass  # fall through to the URL-segment fallback below
-    path = urlparse(url).path.rstrip("/")
-    segment = unquote(path.rsplit("/", 1)[-1]) if path else ""
-    if segment:
-        return segment
-    msg = f"Невозможно определить имя файла для {url}."
-    raise EntryError(msg)
+        # A sanitizer rejection inside derive_filename is TERMINAL — it must
+        # never fall through to the raw URL segment (fix-round-2, item 1).
+        return derive_filename(response.headers, response.url or url)
+    # Headers absent (non-200 probe): the URL segment is the only candidate —
+    # sanitized through the same gate.
+    candidate = _url_segment_candidate(url)
+    if candidate is None:
+        msg = f"Невозможно определить имя файла для {url}."
+        raise EntryError(msg)
+    name, source = candidate
+    return sanitize_remote_filename(name, source)
 
 
 def ensure_local(name: str, input_dir: Path) -> Path:
