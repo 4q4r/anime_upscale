@@ -35,6 +35,9 @@ def _tmp_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "crf = 16\n"
         "[profiles.enc]\n"
         'stages = ["encode"]\n'
+        "[profiles.upl]\n"
+        'stages = ["encode"]\n'
+        "upload = true\n"
     )
     (tmp_path / "config.toml").write_text(config, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
@@ -119,3 +122,59 @@ def test_preflight_network_failure_is_loud_exit_1(
     assert exit_code == 1
     assert "✗ Ошибка" in out
     assert "Connection reset by peer" in out
+
+
+def test_upload_failure_gets_dedicated_exit_3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M10/§10: pipeline ok + upload failed = the dedicated exit code 3, the
+    summary marks the entry as upload-failed, and the pipeline result stays ok."""
+    from anime_upscale.upload import UploadError
+
+    _tmp_project(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "anime_upscale.pipeline.run_pipeline",
+        lambda ctx, s, o, ffmpeg_path, progress_update=None: (60, 1),
+    )
+
+    def fake_upload(path: object, client: object, reporter: object, progress: object = None) -> str:
+        raise UploadError("gofile upload вернул «error-serverError»")
+
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+    exit_code = cli.main(["--profile", "upl", "-i", "a.mkv", "--config", "config.toml"])
+    out = capsys.readouterr().out
+    assert exit_code == cli.EXIT_UPLOAD == 3
+    assert "загрузка не удалась" in out
+    assert "Итог: 0/1 успешно, 1 с ошибкой" in out
+
+
+def test_pipeline_failure_outranks_upload_failure_on_mixed_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M10/§11.5: a batch with both a pipeline failure and an upload failure
+    exits 1 (pipeline rank first), not 3."""
+    from anime_upscale.pipeline import PipelineError
+    from anime_upscale.upload import UploadError
+
+    _tmp_project(tmp_path, monkeypatch)
+
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None):
+        if source.name == "b.mkv":
+            raise PipelineError("батч-фейк: декодер умер")
+        return (60, 1)
+
+    def fake_upload(path: object, client: object, reporter: object, progress: object = None) -> str:
+        raise UploadError("upload dead")
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+    exit_code = cli.main(
+        ["--profile", "upl", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "upload dead" in out and "батч-фейк" in out

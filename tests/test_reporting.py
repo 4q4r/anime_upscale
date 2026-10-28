@@ -1,6 +1,51 @@
-"""ProgressThrottle tests (F3): ≤10%-interval lines, per §10.4 extended to the pipeline."""
+"""ProgressThrottle tests (F3) + resolve_mode policy matrix (M10, §10.4)."""
 
-from anime_upscale.reporting import ProgressThrottle, Reporter, resolve_mode
+import pytest
+
+from anime_upscale.reporting import OutputMode, ProgressThrottle, Reporter, resolve_mode
+
+
+class _FakeStream:
+    def __init__(self, tty: bool) -> None:
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+class TestResolveModeMatrix:
+    """M10: the --no-color / --no-tty / NO_COLOR policy matrix (§10.4)."""
+
+    def test_real_tty_color_and_tty_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert resolve_mode(stream=_FakeStream(True)) == OutputMode(color=True, tty=True)
+
+    def test_no_color_flag_keeps_tty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        mode = resolve_mode(no_color=True, stream=_FakeStream(True))
+        assert mode == OutputMode(color=False, tty=True)
+
+    def test_no_tty_flag_disables_both(self) -> None:
+        mode = resolve_mode(no_tty=True, stream=_FakeStream(True))
+        assert mode == OutputMode(color=False, tty=False)
+
+    def test_no_color_env_disables_color_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NO_COLOR", "1")
+        mode = resolve_mode(stream=_FakeStream(True))
+        assert mode == OutputMode(color=False, tty=True)
+
+    def test_plain_pipe_disables_both(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        mode = resolve_mode(stream=_FakeStream(False))
+        assert mode == OutputMode(color=False, tty=False)
+
+    def test_both_flags_disable_both(self) -> None:
+        mode = resolve_mode(no_color=True, no_tty=True, stream=_FakeStream(True))
+        assert mode == OutputMode(color=False, tty=False)
+
+    def test_cli_flags_win_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert resolve_mode(no_tty=True, stream=_FakeStream(True)).tty is False
 
 
 class _CollectingReporter(Reporter):

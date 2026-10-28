@@ -80,6 +80,15 @@ class TestGrammar:
         assert classify_entry("https://www.gofile.io/d/x1?x=2") == GofileLink("x1")
         assert classify_entry("https://gofile.io/d/AbCdEf#frag") == GofileLink("AbCdEf")
 
+    def test_entry_grammar_matrix(self) -> None:
+        """M10/§11.1: the full four-way grammar — bare name / direct URL /
+        gofile share link / store-host rejection."""
+        assert classify_entry("ep01.mkv") == BareName("ep01.mkv")
+        assert classify_entry("https://example.com/x.mkv") == DirectUrl("https://example.com/x.mkv")
+        assert classify_entry("https://gofile.io/d/abc123") == GofileLink("abc123")
+        with pytest.raises(EntryError, match=r"gofile\.io/d"):
+            classify_entry("https://store.gofile.io/download/x/ep.mkv")
+
     @pytest.mark.parametrize(
         "bad",
         [
@@ -208,6 +217,72 @@ class TestFetchQueueItem:
     def test_ensure_local_rejects_traversal(self, tmp_path: Path) -> None:
         with pytest.raises(EntryError):
             ensure_local("../secret", tmp_path)
+
+    def test_gofile_kind_existing_file_skips_without_client(self, tmp_path: Path) -> None:
+        """M10: the idempotent skip precedes any client work for gofile entries."""
+        from anime_upscale.fetch_input import QueueItem
+
+        reporter = _MuteReporter()
+        existing = tmp_path / "ep.mkv"
+        existing.write_bytes(b"x")
+        item = QueueItem(
+            source="https://gofile.io/d/f1",
+            origin="gofile папка f1 → файл",
+            name="ep.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/download/x/ep.mkv",
+        )
+        result = fetch_queue_item(item, tmp_path, _client_factory_fake, reporter)
+        assert result == existing
+        assert any("загрузка пропущена" in n for n in reporter.notes)
+
+    def test_url_kind_existing_file_skips_without_client(self, tmp_path: Path) -> None:
+        from anime_upscale.fetch_input import QueueItem
+
+        reporter = _MuteReporter()
+        existing = tmp_path / "e.mkv"
+        existing.write_bytes(b"x")
+        item = QueueItem(
+            source="https://x/e.mkv",
+            origin="прямая ссылка",
+            name="e.mkv",
+            kind="url",
+            url="https://x/e.mkv",
+        )
+        result = fetch_queue_item(item, tmp_path, _client_factory_fake, reporter)
+        assert result == existing
+        assert any("загрузка пропущена" in n for n in reporter.notes)
+
+    def test_gofile_kind_missing_file_downloads_via_client(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M10: a gofile entry with no local file goes through client.download_file."""
+        from anime_upscale.fetch_input import QueueItem
+
+        reporter = _MuteReporter()
+        (tmp_path / "input").mkdir()
+        item = QueueItem(
+            source="https://gofile.io/d/f1",
+            origin="gofile папка f1 → файл",
+            name="ep.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/download/x/ep.mkv",
+        )
+        calls: list[tuple[str, Path]] = []
+
+        class _FakeClient:
+            def download_file(self, url: str, destination: Path, progress: object = None) -> None:
+                calls.append((url, destination))
+                destination.write_bytes(b"data")
+
+        result = fetch_queue_item(
+            item,
+            tmp_path / "input",
+            _FakeClient,  # type: ignore[arg-type,return-value]
+            reporter,
+        )
+        assert result == tmp_path / "input" / "ep.mkv"
+        assert calls and calls[0][0] == "https://store.gofile.io/download/x/ep.mkv"
 
 
 class TestSanitizeRemoteFilename:
