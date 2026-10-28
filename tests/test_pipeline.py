@@ -113,3 +113,147 @@ class TestGraphAssembly:
                 ),
                 clip,
             )
+
+
+class _RecordingReporter:
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    def warn(self, text: str) -> None:
+        self.warnings.append(text)
+
+
+def _teardown_ctx(reporter: object | None = None) -> "object":
+    """Minimal StageContext for run_pipeline teardown tests (encode-only run)."""
+    from anime_upscale.config import EncodeConfig, RunConfig
+    from anime_upscale.hardware import HardwareProfile
+    from anime_upscale.reporting import Reporter, resolve_mode
+    from anime_upscale.stages import StageContext
+
+    return StageContext(
+        run=RunConfig(
+            stages=("encode",),
+            descale=object(),  # type: ignore[arg-type]
+            deband=object(),  # type: ignore[arg-type]
+            upscale=object(),  # type: ignore[arg-type]
+            interpolate=object(),  # type: ignore[arg-type]
+            encode=EncodeConfig(),
+            descale_height=None,
+            upload=False,
+        ),
+        hardware=HardwareProfile(
+            gpus=(),
+            gpu_count=0,
+            cpu_logical_cores=4,
+            num_streams_per_gpu=0,
+            encode_threads=2,
+            precision="none",
+        ),
+        project_root=None,  # type: ignore[arg-type]
+        reporter=reporter or Reporter(resolve_mode(no_color=True, no_tty=True)),
+    )
+
+
+class TestEncoderTeardown:
+    """M2: no exception path may orphan the ffmpeg child (wait() + drain join)."""
+
+    @staticmethod
+    def _wire(monkeypatch: pytest.MonkeyPatch, output_exc: Exception) -> list:
+        import anime_upscale.pipeline as pl
+
+        waits: list[bool] = []
+
+        class _FakeStdin:
+            closed = True
+
+        class _FakeProcess:
+            stdin = _FakeStdin()
+            returncode = 0
+            tail_shared = True
+
+            def wait(self) -> int:
+                waits.append(True)
+                return self.returncode
+
+        class _FakeEncoder:
+            process = _FakeProcess()
+            tail: list[bytes] = []
+            stdin = _FakeStdin()
+
+        class _FakeGraph:
+            fps = Fraction(60000, 1001)
+
+            def output(self, stream: object, **_kw: object) -> None:
+                raise output_exc
+
+        class _FakeClip:
+            fps = Fraction(24000, 1001)
+
+        class _FakeBs:
+            @staticmethod
+            def VideoSource(path: str) -> _FakeClip:
+                return _FakeClip()
+
+        monkeypatch.setattr(pl.vs, "core", type("_FakeCore", (), {"bs": _FakeBs})())
+        monkeypatch.setattr(pl, "build_graph", lambda ctx, clip: _FakeGraph())
+        monkeypatch.setattr(pl, "spawn_encoder", lambda args: _FakeEncoder())
+        return waits
+
+    def test_non_oserror_reaps_encoder_and_reraises_original(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M2: a VS-internal RuntimeError must not leave ffmpeg running, and the
+        ORIGINAL exception — not a teardown error — is the loud failure."""
+        from anime_upscale.pipeline import run_pipeline
+
+        boom = RuntimeError("vs internal boom")
+        waits = self._wire(monkeypatch, boom)
+        with pytest.raises(RuntimeError, match="vs internal boom"):
+            run_pipeline(
+                _teardown_ctx(),  # type: ignore[arg-type]
+                input_path="fake.mkv",  # type: ignore[arg-type]
+                output_path="out.mkv",  # type: ignore[arg-type]
+                ffmpeg_path="/usr/bin/ffmpeg",
+            )
+        assert waits == [True]  # the child was reaped on the failure path
+
+    def test_dead_encoder_during_vs_failure_reports_tail_but_keeps_original(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M2: if ffmpeg ALSO died, its tail is reported as a warning while the
+        original VS exception still wins (no masking)."""
+        import anime_upscale.pipeline as pl
+        from anime_upscale.pipeline import run_pipeline
+
+        reporter = _RecordingReporter()
+        waits = self._wire(monkeypatch, RuntimeError("vs internal boom"))
+
+        # Make finish_encoder's loud branch fire on the teardown path.
+        def _finish_fail(encoder: object) -> None:
+            encoder.process.wait()  # type: ignore[attr-defined]
+            raise RuntimeError("ffmpeg завершился с ошибкой (код 1). stderr-tail")
+
+        monkeypatch.setattr(pl, "finish_encoder", _finish_fail)
+        with pytest.raises(RuntimeError, match="vs internal boom"):
+            run_pipeline(
+                _teardown_ctx(reporter),  # type: ignore[arg-type]
+                input_path="fake.mkv",  # type: ignore[arg-type]
+                output_path="out.mkv",  # type: ignore[arg-type]
+                ffmpeg_path="/usr/bin/ffmpeg",
+            )
+        assert waits == [True]
+        assert any("ffmpeg" in w for w in reporter.warnings)
+
+    def test_keyboard_interrupt_reaps_encoder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """M2: even a BaseException interruption reaps the child."""
+        from anime_upscale.pipeline import run_pipeline
+
+        waits = self._wire(monkeypatch, KeyboardInterrupt())
+        with pytest.raises(KeyboardInterrupt):
+            run_pipeline(
+                _teardown_ctx(),  # type: ignore[arg-type]
+                input_path="fake.mkv",  # type: ignore[arg-type]
+                output_path="out.mkv",  # type: ignore[arg-type]
+                ffmpeg_path="/usr/bin/ffmpeg",
+            )
+        assert waits == [True]

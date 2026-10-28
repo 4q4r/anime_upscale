@@ -65,6 +65,7 @@ ignore = [
     "S101", "ANN", "D", "ARG", "PLC0415", "SLF001", "PLR2004", "TRY003",
     "EM101", "EM102", "FBT", "S314", "S310", "PT018", "INP001", "N999",
     "A002", "ANN401", "PLR0913", "TRY300", "TRY301", "PERF401", "RET504",
+    "N802",  # fakes mirror upstream API names (e.g. VS core.bs.VideoSource)
     "S105", "S106", "S107",  # fake tokens/credentials in mocked HTTP tests
     "B017", "B018",  # frozen-dataclass probes and placeholder attribute checks
     "RUF012",  # mutable class attrs only hold per-class fakes in test doubles

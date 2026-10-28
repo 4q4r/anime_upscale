@@ -111,6 +111,16 @@ def run_pipeline(
             finish_encoder(encoder)
             msg = f"Поток в ffmpeg оборвался во время кодирования: {exc}"
             raise PipelineError(msg) from exc
+        except BaseException:
+            # M2: ANY other escape (VS-internal failure, KeyboardInterrupt) must reap
+            # the child — ffmpeg never outlives this call — while the ORIGINAL
+            # exception stays the loud failure. If ffmpeg died too, its tail is
+            # reported without masking the cause.
+            try:
+                finish_encoder(encoder)
+            except Exception as teardown_exc:  # noqa: BLE001 - teardown must not mask the cause
+                ctx.reporter.warn(f"ffmpeg не завершился чисто после сбоя графа: {teardown_exc}")
+            raise
     finally:
         if encoder.stdin is not None and not encoder.stdin.closed:
             encoder.stdin.close()
