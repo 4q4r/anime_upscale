@@ -35,7 +35,7 @@
 - **Arbitrary stage subsets** — `--profile full | upscale-only | interp-only` or any `--stages` list; canonical order is fixed, order decisions live in one registry.
 - **One graph, one process** — the VapourSynth graph is assembled in Python (no `.vpy`/`vspipe`); frames flow y4m straight into the ffmpeg encode/mux subprocess.
 - **Exact rational fps** — `--target-fps 60000/1001` (or `23.976` → `24000/1001`); scene changes pass through untouched.
-- **Sequential batch** — repeatable `-i`, per-file banners (`◈ Файл 2/5`), continue-and-summarize with a Russian end summary and honest exit codes.
+- **Sequential batch** — repeatable `-i`, per-file banners (`◈ Файл 2/5`), a loud `✗ …` at the point of any per-entry failure plus a `✓ … — готово` terminator per finished file, continue-and-summarize with a Russian end summary and honest exit codes.
 - **Remote ingestion** — direct URLs and gofile links (folders expand in place, video whitelist) download into `input/` via strict Google-DoH-pinned connections (no system-resolver fallback, ever).
 - **gofile upload post-step** — `--upload` publishes the finished output and prints the link; token optional, failure never touches the file.
 - **Self-configuring hardware** — torch probes the GPU, a VRAM budget formula derives inference streams, `nvidia-smi` is diagnostics only; zero-GPU + NN-stage is a loud error.
