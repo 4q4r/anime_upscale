@@ -223,9 +223,14 @@ class TestFetchContents:
 
 
 def _folder_payload(children: list[dict], *, password_status: str = "passwordOk") -> dict:
+    """Fixture in the REAL live API shape: children is a DICT keyed by child id
+    (verified live 2026-10-28, commit e7bb5d1 + the smoke round-trip). Building
+    the dict here forces every expansion test through _children_list in the
+    production path — list-shaped fixtures masked the F1 bug."""
+    children_dict = {child.get("id", f"child-{i}"): child for i, child in enumerate(children)}
     return {
         "status": "ok",
-        "data": {"type": "folder", "children": children, "passwordStatus": password_status},
+        "data": {"type": "folder", "children": children_dict, "passwordStatus": password_status},
     }
 
 
@@ -296,6 +301,91 @@ class TestFolderExpansion:
         client = _client(fake, state_path=tmp_path / "g.toml")
         with pytest.raises(GofileError, match="парол"):
             client.expand_entries("x")
+
+    def test_nested_real_payload_shape(self, tmp_path: Path) -> None:
+        """F1 fix-sensitivity guard: the EXACT live payload shape from the smoke
+        (children dict keyed by UUID ids, full field set) walked two levels deep.
+        Fails against the pre-fix implementation (strict list check on the
+        subfolder branch) — revert-check documented in the report."""
+        save_guest("g", tmp_path / "g.toml")
+        root_children = {
+            "e0ad0fde-1111-4ba8-8beb-000000000001": {
+                "canAccess": True,
+                "id": "e0ad0fde-1111-4ba8-8beb-000000000001",
+                "parentFolder": "e0ad0fde-1111-4ba8-8beb-root",
+                "type": "folder",
+                "name": "season_01",
+                "createTime": 1793143713,
+                "modTime": 1793143713,
+                "code": "AbCdE12",
+                "public": True,
+                "totalSize": 65562,
+                "childrenCount": 1,
+            },
+            "e0ad0fde-2222-4ba8-8beb-000000000002": {
+                "canAccess": True,
+                "id": "e0ad0fde-2222-4ba8-8beb-000000000002",
+                "parentFolder": "e0ad0fde-1111-4ba8-8beb-root",
+                "type": "file",
+                "name": "top.mkv",
+                "createTime": 1793143713,
+                "modTime": 1793143713,
+                "code": "Zz9Yy8X",
+                "size": 65562,
+                "md5": "e410f6d44af0969c2f758594ac9aa63e",
+                "mimetype": "video/x-matroska",
+                "servers": ["store-eu-par-5"],
+                "serverSelected": "store-eu-par-5",
+                "link": "https://store-eu-par-5.gofile.io/download/web/topid/top.mkv",
+            },
+        }
+        sub_children = {
+            "e0ad0fde-3333-4ba8-8beb-000000000003": {
+                "canAccess": True,
+                "id": "e0ad0fde-3333-4ba8-8beb-000000000003",
+                "parentFolder": "e0ad0fde-1111-4ba8-8beb-000000000001",
+                "type": "file",
+                "name": "nested.mkv",
+                "createTime": 1793143713,
+                "modTime": 1793143713,
+                "code": "Qq1Ww2Ee",
+                "size": 65562,
+                "md5": "e410f6d44af0969c2f758594ac9aa63e",
+                "mimetype": "video/x-matroska",
+                "servers": ["store-eu-par-5"],
+                "serverSelected": "store-eu-par-5",
+                "link": "https://store-eu-par-5.gofile.io/download/web/nestedid/nested.mkv",
+            },
+        }
+        fake = _FakeSession()
+        fake._queue(
+            "contents/rootid",
+            {
+                "status": "ok",
+                "data": {
+                    "type": "folder",
+                    "name": "rootid",
+                    "children": root_children,
+                    "passwordStatus": "passwordOk",
+                },
+            },
+        )
+        fake._queue(
+            "contents/e0ad0fde-1111-4ba8-8beb-000000000001",
+            {
+                "status": "ok",
+                "data": {
+                    "type": "folder",
+                    "name": "season_01",
+                    "children": sub_children,
+                    "passwordStatus": "passwordOk",
+                },
+            },
+        )
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        children = client.expand_entries("rootid")
+        assert [c.name for c in children] == ["nested.mkv", "top.mkv"]
+        assert next(c.link for c in children).endswith("nested.mkv")
 
     def test_nested_dict_children_real_shape(self, tmp_path: Path) -> None:
         """F1 regression: subfolder children use the SAME dict normalizer as the
