@@ -8,6 +8,8 @@ from anime_upscale import cli
 from anime_upscale.hardware import GPUInfo, HardwareProfile
 from anime_upscale.reporting import Reporter, resolve_mode
 
+pytestmark = pytest.mark.vapoursynth  # patches the pipeline module seam (VS/torch stack)
+
 
 def _fake_hw() -> HardwareProfile:
     return HardwareProfile(
@@ -46,12 +48,16 @@ def test_batch_continues_after_failure_and_exits_nonzero(
     calls: list[str] = []
 
     def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None):
+        from anime_upscale.pipeline import PipelineError
+
         calls.append(source.name)
         if source.name == "b.mkv":
-            raise cli.PipelineError("батч-фейк: декодер умер")
+            raise PipelineError("батч-фейк: декодер умер")
         return (60, 1)
 
-    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    # M7: cli resolves run_pipeline as anime_upscale.pipeline.<attr> at call
+    # time — the production seam is patched here, not a cli-level alias.
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run_pipeline)
     monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
     monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
     exit_code = cli.main(
@@ -74,7 +80,8 @@ def test_batch_all_ok_exits_zero(
 ) -> None:
     _tmp_project(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        cli, "run_pipeline", lambda ctx, s, o, ffmpeg_path, progress_update=None: (60, 1)
+        "anime_upscale.pipeline.run_pipeline",
+        lambda ctx, s, o, ffmpeg_path, progress_update=None: (60, 1),
     )
     monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
     monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")

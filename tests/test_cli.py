@@ -87,6 +87,25 @@ def _mute():
     return Reporter.__new__(Reporter)  # never emits in these tests
 
 
+class TestLazyImports:
+    def test_cli_import_does_not_load_vs_or_torch(self) -> None:
+        """M7: importing the CLI (the `models verify` entry) must not load the
+        VS/torch stacks — pipeline/stages are pulled only by the batch path."""
+        import subprocess
+        import sys
+
+        code = (
+            "import sys; import anime_upscale.cli; "
+            "assert 'vapoursynth' not in sys.modules, 'vapoursynth loaded'; "
+            "assert 'torch' not in sys.modules, 'torch loaded'; "
+            "assert 'anime_upscale.pipeline' not in sys.modules, 'pipeline loaded'"
+        )
+        result = subprocess.run(  # noqa: S603 - fixed argv: venv python + inline assert code
+            [sys.executable, "-c", code], capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 0, result.stderr
+
+
 class TestTools:
     def test_override_missing_file_is_loud_naming_key(self, tmp_path: Path) -> None:
         with pytest.raises(ToolError, match=r"\[tools\] ffmpeg"):

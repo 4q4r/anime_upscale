@@ -70,10 +70,12 @@ ignore = [
     "B017", "B018",  # frozen-dataclass probes and placeholder attribute checks
     "RUF012",  # mutable class attrs only hold per-class fakes in test doubles
 ]
-# Stage builders import VS/torch/vsrife lazily: keeps CLI startup light and lets
-# encode-only runs avoid loading GPU stacks entirely.
+# Stage builders resolve their heavy backends (vsdeband, vsrife, spandrel)
+# inside the builder body; the registry module itself is VS-free
+# (vapoursynth is TYPE_CHECKING-only there).
 "src/anime_upscale/stages/*" = ["PLC0415"]
-# The CLI driver keeps heavy imports (VS-backed stage registry, model fetch) lazy.
+# The CLI driver imports the VS/torch-touching modules (pipeline, stages)
+# lazily — `models fetch/verify` and usage errors never load the GPU stacks.
 "src/anime_upscale/cli.py" = ["PLC0415"]
 # Standalone scripts are not packages (INP001); benchmark.py imports the venv package.
 "scripts/*" = ["INP001"]
