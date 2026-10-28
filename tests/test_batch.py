@@ -90,3 +90,25 @@ def test_batch_summary_output_shapes() -> None:
     reporter = Reporter(resolve_mode(no_color=True, no_tty=True))
     reporter.batch_summary([("ok.mkv", True, ""), ("bad.mkv", False, "причина")])
     # captured implicitly; smoke for the summary math path
+
+
+def test_preflight_network_failure_is_loud_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M1: a pre-flight network failure (DoH/reset) must print the loud Russian
+    error and exit 1 — never surface as a raw traceback."""
+    import requests
+
+    _tmp_project(tmp_path, monkeypatch)
+
+    def boom(entries: list[str], client_factory: object, reporter: Reporter) -> list:
+        raise requests.ConnectionError("Connection reset by peer")
+
+    monkeypatch.setattr(cli, "build_queue", boom)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+    exit_code = cli.main(["--profile", "enc", "-i", "a.mkv", "--config", "config.toml"])
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "✗ Ошибка" in out
+    assert "Connection reset by peer" in out

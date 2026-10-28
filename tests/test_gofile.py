@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Self
 
 import pytest
+import requests
 
 from anime_upscale import gofile
 from anime_upscale.gofile import (
@@ -178,6 +179,26 @@ class TestTokenLifecycle:
         with pytest.raises(GofileError, match="гостевой токен"):
             client.ensure_token()
 
+    def test_guest_creation_data_null_is_loud_not_attribute_error(self, tmp_path: Path) -> None:
+        """M1: `"data": null` (explicit key, null value) must hit the loud branch."""
+        fake = _FakeSession()
+        fake._queue("accounts", _FakeResponse({"status": "ok", "data": None}))
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        with pytest.raises(GofileError, match="гостевой токен"):
+            client.ensure_token()
+
+    def test_guest_creation_connection_error_is_gofile_error(self, tmp_path: Path) -> None:
+        """M1: pre-flight network failure = loud GofileError, never a raw traceback."""
+        fake = _FakeSession()
+
+        def boom(url: str, **_kw: object) -> object:
+            raise requests.ConnectionError("Connection reset by peer")
+
+        fake.post = boom  # type: ignore[method-assign]
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        with pytest.raises(GofileError, match="Connection reset by peer"):
+            client.ensure_token()
+
 
 class TestFetchContents:
     def test_ok(self, tmp_path: Path) -> None:
@@ -220,6 +241,28 @@ class TestFetchContents:
         with pytest.raises(GofileError, match="wt_salt"):
             client.fetch_contents("abc")
         assert len(fake.calls) == 2
+
+    def test_connection_error_is_gofile_error(self, tmp_path: Path) -> None:
+        """M1: §11.3 — connection reset = loud error quoting that diagnosis."""
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+
+        def boom(url: str, **_kw: object) -> object:
+            raise requests.ConnectionError("Connection reset by peer")
+
+        fake.get = boom  # type: ignore[method-assign]
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        with pytest.raises(GofileError, match="Connection reset by peer"):
+            client.fetch_contents("abc")
+
+    def test_data_null_is_loud_not_attribute_error(self, tmp_path: Path) -> None:
+        """M1: `"data": null` payload must reach the loud children error."""
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue("contents", _FakeResponse({"status": "ok", "data": None}))
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        with pytest.raises(GofileError, match="children"):
+            client.expand_entries("abc")
 
 
 def _folder_payload(children: list[dict], *, password_status: str = "passwordOk") -> dict:
@@ -459,6 +502,26 @@ class TestFolderExpansion:
         client = _client(fake, state_path=tmp_path / "g.toml")
         with pytest.raises(GofileError, match=r"нет ссылки link"):
             client.expand_entries("x")
+
+    def test_subfolder_data_null_skipped_as_empty(self, tmp_path: Path) -> None:
+        """M1: subfolder payload with `"data": null` = empty folder, not AttributeError."""
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue(
+            "contents/root",
+            _folder_payload(
+                [
+                    _file("real.mkv"),
+                    {"type": "folder", "name": "ghost", "id": "ghostid", "children": None},
+                ]
+            ),
+        )
+        fake._queue("contents/ghostid", {"status": "ok", "data": None})
+        reporter = _FakeReporter()
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        children = client.expand_entries("root", reporter)
+        assert [c.name for c in children] == ["real.mkv"]
+        assert "Пропуск (пустая папка): ghost" in reporter.notes
 
 
 class TestDoH:

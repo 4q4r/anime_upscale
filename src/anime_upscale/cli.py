@@ -106,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:  # stage-level loud failures
         reporter.error(str(exc))
         return EXIT_FAILURE
+    except OSError as exc:
+        # Safety net for pre-flight I/O that escaped specific wrapping
+        # (requests.RequestException is an OSError subclass): the loud-error
+        # contract forbids raw tracebacks on any documented failure path.
+        reporter.error(str(exc))
+        return EXIT_FAILURE
     except KeyboardInterrupt:
         reporter.warn("Прервано пользователем.")
         return 130

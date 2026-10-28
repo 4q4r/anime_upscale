@@ -31,7 +31,7 @@ def pick_server(client: GofileClient) -> str:
         msg = f"gofile /servers: HTTP {response.status_code}."
         raise UploadError(msg)
     payload = response.json()
-    servers = payload.get("data", {}).get("servers", [])
+    servers = (payload.get("data") or {}).get("servers", [])  # "data": null tolerated
     if payload.get("status") != "ok" or not servers:
         msg = f"gofile /servers вернул «{payload.get('status')}» без серверов."
         raise UploadError(msg)
@@ -104,7 +104,7 @@ def upload_file(
             f"({str(payload.get('data'))[:200]}). Файл не изменён."
         )
         raise UploadError(msg)
-    download_page = payload.get("data", {}).get("downloadPage")
+    download_page = (payload.get("data") or {}).get("downloadPage")  # "data": null tolerated
     if not download_page:
         msg = f"gofile upload не вернул downloadPage: {str(payload)[:200]}"
         raise UploadError(msg)
