@@ -1,11 +1,15 @@
 """
 Shared gofile.io API client (plan §10.1/§10.2 + §11.2–§11.4; addendum 1: folder expansion).
 
-Every remote host is resolved STRICTLY via Google DoH and pinned for the
-session (connect-by-IP, SNI/Host/TLS-verify by hostname) — no system-resolver
-fallback, ever (plan §10.1). The wt (X-Website-Token) scheme is ported
-VERIFIED-FROM-SOURCE from the owner's gofile-dl tool (run.py; formula, 4-hour
-window, contents headers/params, retry rules).
+Every remote host is resolved STRICTLY via DoH and pinned for the session
+(connect-by-IP, SNI/Host/TLS-verify by hostname) — no system-resolver
+fallback, ever (plan §10.1). DoH itself uses a resolver ladder of verified
+JSON-API endpoints (dns.google domain → Google by bare IP → Cloudflare by
+bare IP): networks that TLS-intercept the dns.google DOMAIN cannot touch the
+bare-IP endpoints (their certificates carry IP SANs, verified natively).
+The wt (X-Website-Token) scheme is ported VERIFIED-FROM-SOURCE from the
+owner's gofile-dl tool (run.py; formula, 4-hour window, contents
+headers/params, retry rules).
 """
 
 import hashlib
@@ -51,7 +55,11 @@ GOFILE_SHARE_RE = re.compile(r"^/d/([^/?#]+?)/?$", re.IGNORECASE)
 # Video whitelist (spec addendum 1): only these extensions are queued from folders.
 VIDEO_EXTENSIONS = frozenset({".mkv", ".mp4", ".avi", ".webm", ".mov", ".m4v", ".ts", ".m2ts"})
 
-DOH_ENDPOINT = "https://dns.google/resolve"
+DOH_ENDPOINTS: tuple[str, ...] = (
+    "https://dns.google/resolve",  # canonical Google DoH JSON API (domain form)
+    "https://8.8.8.8/resolve",  # Google DoH by bare IP — cert carries an IP SAN
+    "https://1.1.1.1/dns-query",  # Cloudflare DoH by bare IP — same cert property
+)
 _HTTP_OK = 200
 _MAX_FOLDER_DEPTH = 10
 
@@ -60,36 +68,57 @@ class GofileError(Exception):
     """Loud gofile/DoH failure (Russian message)."""
 
 
-# ── Strict Google DoH resolve + pin (plan §10.1) ─────────────────────────────────────────
+# ── Strict DoH resolve ladder + pin (plan §10.1) ─────────────────────────────────────────
 
 
 def resolve_doh(hostname: str, timeout: float = 15.0) -> list[str]:
-    """Resolve via Google DoH JSON API; loud Russian errors, no fallback."""
-    try:
-        response = requests.get(
-            DOH_ENDPOINT,
-            params={"name": hostname, "type": "A"},
-            timeout=timeout,
-            headers={"accept": "application/dns-json"},
-        )
-    except requests.RequestException as exc:
-        msg = f"DoH-запрос к {DOH_ENDPOINT} для «{hostname}» не удался: {exc}"
-        raise GofileError(msg) from exc
-    if response.status_code != _HTTP_OK:
-        msg = (
-            f"DoH вернул HTTP {response.status_code} для «{hostname}» — "
-            "системный резолвер не используется."
-        )
-        raise GofileError(msg)
-    payload = response.json()
-    if payload.get("Status") != 0:
-        msg = f"DoH вернул Status={payload.get('Status')} для «{hostname}» — хост не разрешён."
-        raise GofileError(msg)
-    answers = [a for a in payload.get("Answer", []) if a.get("type") == 1]
-    if not answers:
-        msg = f"DoH не вернул A-записей для «{hostname}»."
-        raise GofileError(msg)
-    return [str(a["data"]) for a in answers]
+    """
+    Resolve via the DoH ladder (first-success-wins); loud Russian errors, no fallback.
+
+    Success per endpoint = HTTP 200 + Status==0 + non-empty A records. The ladder
+    advances ONLY on transport errors (connection/SSL/timeout — any
+    requests.RequestException, unparseable bodies included); a received answer is
+    final: non-200, Status!=0 and empty-A behave exactly as the single-endpoint
+    implementation. Timeout, headers and proxy handling are identical for every
+    endpoint. Bare-IP endpoints never touch the system resolver: requests
+    verifies their certificates natively via the IP SANs.
+    """
+    failures: list[str] = []
+    for endpoint in DOH_ENDPOINTS:
+        try:
+            response = requests.get(
+                endpoint,
+                params={"name": hostname, "type": "A"},
+                timeout=timeout,
+                headers={"accept": "application/dns-json"},
+            )
+            payload = response.json()
+        except requests.RequestException as exc:
+            failures.append(f"{endpoint} — {exc}")
+            continue
+        if response.status_code != _HTTP_OK:
+            msg = (
+                f"DoH вернул HTTP {response.status_code} для «{hostname}» — "
+                "системный резолвер не используется."
+            )
+            raise GofileError(msg)
+        if payload.get("Status") != 0:
+            msg = f"DoH вернул Status={payload.get('Status')} для «{hostname}» — хост не разрешён."
+            raise GofileError(msg)
+        answers = [a for a in payload.get("Answer", []) if a.get("type") == 1]
+        if not answers:
+            msg = f"DoH не вернул A-записей для «{hostname}»."
+            raise GofileError(msg)
+        return [str(a["data"]) for a in answers]
+    details = "\n".join(f"  • {failure}" for failure in failures)
+    msg = (
+        f"DoH-разрешение «{hostname}» не удалось ни на одном из {len(DOH_ENDPOINTS)} "
+        f"резолверов:\n{details}\n"
+        "Ошибки сертификатов (self-signed) на всех резолверах означают перехват "
+        "TLS-трафика вашей сетью (DPI/MITM). Системный резолвер не используется — "
+        "защита от подмены (§10.1)."
+    )
+    raise GofileError(msg)
 
 
 class _PinnedConnectionBase(urllib3.connection.HTTPSConnection):
