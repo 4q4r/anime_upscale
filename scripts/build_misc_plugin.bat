@@ -13,8 +13,11 @@ REM
 REM Supply-chain pins (identical to the .sh): miscfilters.cpp is fetched by
 REM COMMIT; the VS headers come from the R81 release tag. The plugin directory
 REM is derived from the RUNNING project interpreter -- no hardcoded python
-REM version. Requires curl.exe and tar-free tooling only (both ship with
-REM Windows 10 1803+; tar is not needed here). CRLF line endings.
+REM version. Requires curl.exe (ships with Windows 10 1803+). If no C++
+REM compiler is present, the script bootstraps one itself, unattended, via
+REM winget (installs winget from the official winget-cli release first if
+REM needed): WinLibs portable g++ (BrechtSanders.WinLibs.POSIX.UCRT), then
+REM MSYS2 + pacman mingw-w64-x86_64-gcc as the fallback. CRLF line endings.
 REM ===========================================================================
 chcp 65001 >nul
 setlocal
@@ -61,20 +64,76 @@ g++ -std=c++17 -O2 -shared -static-libgcc -static-libstdc++ -I"%WORK%" -o "%PLUG
 goto :built
 
 :try_cl
-where cl >nul 2>nul || goto :no_compiler
+where cl >nul 2>nul || goto :bootstrap_compiler
 pushd "%WORK%"
 cl /nologo /std:c++17 /O2 /LD /I"%WORK%" miscfilters.cpp /Fe:"%PLUGIN_DIR%\misc.dll" || goto :cl_fail
 popd
 goto :built
 
 :no_compiler
-echo [ОШИБКА] Не найден компилятор C++: нет ни g++, ни cl.exe в PATH.
-echo Варианты исправления:
-echo   (а) установить MinGW-W64 g++ — standalone WinLibs (https://winlibs.com) или MSYS2
-echo       (пакет mingw-w64-x86_64-gcc, ОБЯЗАТЕЛЬНО 64-битный) — и перезапустить этот скрипт;
-echo   (б) вручную: взять misc.dll из официального установщика VapourSynth версии R80 или
+echo [ОШИБКА] Автоустановка компилятора не удалась. Было попробовано:
+echo   1) winget install BrechtSanders.WinLibs.POSIX.UCRT (portable g++);
+echo   2) winget install MSYS2.MSYS2 + pacman mingw-w64-x86_64-gcc.
+echo Вывод winget/pacman — выше по тексту.
+echo Последний резерв вручную (если автоматизация недоступна):
+echo   (а) скачать и распаковать 64-битный WinLibs (https://winlibs.com) и добавить
+echo       его mingw64\bin в PATH, затем перезапустить этот скрипт;
+echo   (б) взять misc.dll из официального установщика VapourSynth версии R80 или
 echo       старее и скопировать его в %APPDATA%\VapourSynth\plugins64\
 goto :fail
+
+:bootstrap_compiler
+echo [ЭТАП] Компилятор не найден — устанавливаю через winget…
+winget --version >nul 2>nul || goto :install_winget
+goto :have_winget
+
+:install_winget
+echo [ЭТАП] winget не найден — устанавливаю App Installer с официального релиза winget-cli…
+set "WINGET_URL="
+powershell -NoProfile -Command "(Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest').assets | Where-Object { $_.name -eq 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle' } | Select-Object -First 1 -ExpandProperty browser_download_url" > "%WORK%\winget_url.txt" 2>nul
+set /p WINGET_URL=<"%WORK%\winget_url.txt"
+if not defined WINGET_URL goto :winget_fail
+curl.exe -fsSL -o "%WORK%\winget.msixbundle" "%WINGET_URL%" || goto :winget_fail
+powershell -NoProfile -Command "Add-AppxPackage -Path '%WORK%\winget.msixbundle'" || goto :winget_fail
+winget --version >nul 2>nul || goto :winget_fail
+
+:have_winget
+echo [ЭТАП] winget доступен — устанавливаю WinLibs g++ (portable, 64-битный)…
+winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity || goto :msys2_route
+REM Portable manifest behavior (InstallerType: zip, NestedInstallerType: portable):
+REM binaries land under %LOCALAPPDATA%\Microsoft\WinGet\Packages\ and winget
+REM exposes the Commands through %LOCALAPPDATA%\Microsoft\WinGet\Links\; the
+REM session PATH is NOT refreshed, so locate and prepend manually. The registry
+REM user PATH points at the same Links dir, so a registry re-read adds nothing.
+set "GXX_BIN="
+if exist "%LOCALAPPDATA%\Microsoft\WinGet\Links\g++.exe" set "GXX_BIN=%LOCALAPPDATA%\Microsoft\WinGet\Links"
+if defined GXX_BIN goto :have_gxx
+set "GXX_ANY="
+for /r "%LOCALAPPDATA%\Microsoft\WinGet\Packages" %%G in (g++.exe) do if not defined GXX_ANY set "GXX_ANY=%%~dpG"
+set "GXX_BIN=%GXX_ANY%"
+if not defined GXX_BIN goto :msys2_route
+
+:have_gxx
+set "PATH=%GXX_BIN%;%PATH%"
+where g++ >nul 2>nul || goto :msys2_route
+echo [ЭТАП] g++ доступен: %GXX_BIN%
+goto :compile_gxx
+
+:msys2_route
+echo [ЭТАП] WinLibs через winget недоступен — пробую MSYS2…
+winget install --id MSYS2.MSYS2 -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity || goto :no_compiler
+if not exist "C:\msys64\usr\bin\bash.exe" goto :no_compiler
+echo [ЭТАП] Устанавливаю mingw-w64-x86_64-gcc через pacman…
+"C:\msys64\usr\bin\bash.exe" -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-gcc" || goto :no_compiler
+if not exist "C:\msys64\mingw64\bin\g++.exe" goto :no_compiler
+set "GXX_BIN=C:\msys64\mingw64\bin"
+set "PATH=%GXX_BIN%;%PATH%"
+echo [ЭТАП] g++ доступен: %GXX_BIN%
+
+:compile_gxx
+echo [ЭТАП] Собираю misc.dll…
+g++ -std=c++17 -O2 -shared -static-libgcc -static-libstdc++ -I"%WORK%" -o "%PLUGIN_DIR%\misc.dll" "%WORK%\miscfilters.cpp" || goto :gxx_fail
+goto :built
 
 :gxx_fail
 echo [ОШИБКА] g++ завершился с ошибкой при сборке misc.dll.
@@ -94,6 +153,18 @@ goto :fail
 echo [ОШИБКА] Не удалось скачать закреплённые исходники с raw.githubusercontent.com.
 echo Подсказка: curl.exe встроен в Windows 10 начиная с версии 1803; проверьте сеть
 echo и доступность https://raw.githubusercontent.com
+goto :fail
+
+:winget_fail
+echo [ОШИБКА] Не удалось установить winget (App Installer) автоматически.
+echo Подсказка: на Windows Server без предпосылок App Installer (VCLibs, UI.Xaml)
+echo установка msixbundle может завершаться ошибкой — инструкция по ручной установке:
+echo https://learn.microsoft.com/windows/package-manager/winget/
+echo Последний резерв вручную:
+echo   (а) скачать и распаковать 64-битный WinLibs (https://winlibs.com) и добавить
+echo       его mingw64\bin в PATH, затем перезапустить этот скрипт;
+echo   (б) взять misc.dll из официального установщика VapourSynth версии R80 или
+echo       старее и скопировать его в %APPDATA%\VapourSynth\plugins64\
 goto :fail
 
 :vs_fail
