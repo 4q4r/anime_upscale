@@ -568,32 +568,113 @@ class TestFolderExpansion:
         assert "Пропуск (пустая папка): ghost" in reporter.notes
 
 
+def _doh_script(script: list[object]) -> tuple[object, list[str]]:
+    """
+    Build a requests.get fake serving `script` items in call order.
+
+    Items are payload dicts (HTTP 200) or exceptions (transport failures);
+    the fake logs every requested endpoint URL for ladder-order assertions.
+    """
+    calls: list[str] = []
+
+    def fake_get(url: str, *a: object, **kw: object) -> object:
+        calls.append(url)
+        step = script[len(calls) - 1]
+        if isinstance(step, Exception):
+            raise step
+        return _FakeResponse(step)
+
+    return fake_get, calls
+
+
 class TestDoH:
     def test_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            gofile.requests,
-            "get",
-            lambda *a, **kw: _FakeResponse(
+        fake_get, calls = _doh_script(
+            [
                 {
                     "Status": 0,
                     "Answer": [{"type": 1, "data": "203.0.113.1"}, {"type": 28, "data": "::1"}],
                 }
-            ),
+            ]
         )
+        monkeypatch.setattr(gofile.requests, "get", fake_get)
         assert resolve_doh("api.gofile.io") == ["203.0.113.1"]
+        # First endpoint answered — the ladder never advances.
+        assert calls == [gofile.DOH_ENDPOINTS[0]]
 
     def test_status_not_zero_loud(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(gofile.requests, "get", lambda *a, **kw: _FakeResponse({"Status": 3}))
+        """A valid answer with Status!=0 is final — no ladder advance (protocol answer)."""
+        fake_get, calls = _doh_script([{"Status": 3}])
+        monkeypatch.setattr(gofile.requests, "get", fake_get)
         with pytest.raises(GofileError, match="Status=3"):
             resolve_doh("nope.example")
+        assert calls == [gofile.DOH_ENDPOINTS[0]]
 
-    def test_no_fallback_on_network_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def boom(*a: object, **kw: object) -> object:
-            raise gofile.requests.ConnectionError("dead")
+    def test_ladder_ssl_on_domain_then_google_ip_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1 (dns.google domain) dies on SSL → #2 (Google by bare IP) wins; #3 not called."""
+        fake_get, calls = _doh_script(
+            [
+                requests.exceptions.SSLError("self-signed certificate in certificate chain"),
+                {"Status": 0, "Answer": [{"type": 1, "data": "203.0.113.1"}]},
+            ]
+        )
+        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        assert resolve_doh("api.gofile.io") == ["203.0.113.1"]
+        assert calls == [gofile.DOH_ENDPOINTS[0], gofile.DOH_ENDPOINTS[1]]
 
-        monkeypatch.setattr(gofile.requests, "get", boom)
-        with pytest.raises(GofileError, match="DoH"):
+    def test_ladder_cloudflare_ip_endpoint_final_resort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1/#2 transport-dead → #3 (Cloudflare by bare IP, application/dns-json) wins."""
+        fake_get, calls = _doh_script(
+            [
+                requests.exceptions.ConnectionError("connection refused"),
+                requests.exceptions.Timeout("timed out"),
+                {"Status": 0, "Answer": [{"type": 1, "data": "198.51.100.9"}]},
+            ]
+        )
+        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        assert resolve_doh("api.gofile.io") == ["198.51.100.9"]
+        assert calls == list(gofile.DOH_ENDPOINTS)
+
+    def test_ladder_all_fail_names_every_endpoint_and_reason(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """All three dead → loud Russian error: each endpoint WITH its own failure reason."""
+        fake_get, _ = _doh_script(
+            [
+                requests.exceptions.SSLError("self-signed certificate in certificate chain"),
+                requests.exceptions.ConnectionError("connection refused"),
+                requests.exceptions.Timeout("timed out"),
+            ]
+        )
+        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        with pytest.raises(GofileError) as excinfo:
             resolve_doh("api.gofile.io")
+        text = str(excinfo.value)
+        for endpoint, reason in (
+            (gofile.DOH_ENDPOINTS[0], "self-signed certificate in certificate chain"),
+            (gofile.DOH_ENDPOINTS[1], "connection refused"),
+            (gofile.DOH_ENDPOINTS[2], "timed out"),
+        ):
+            assert endpoint in text, text
+            assert reason in text, text
+        assert "перехват" in text, text  # MITM diagnosis line
+        assert "Системный резолвер не используется" in text, text
+
+    def test_status_not_zero_after_transport_fail_never_advances(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1 transport-dead, #2 answers Status=3 → final answer, #3 never contacted."""
+        fake_get, calls = _doh_script(
+            [requests.exceptions.SSLError("handshake failed"), {"Status": 3}]
+        )
+        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        with pytest.raises(GofileError, match="Status=3"):
+            resolve_doh("api.gofile.io")
+        assert calls == [gofile.DOH_ENDPOINTS[0], gofile.DOH_ENDPOINTS[1]]
 
 
 class TestDownloadFile:
