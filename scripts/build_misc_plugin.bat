@@ -13,11 +13,25 @@ REM
 REM Supply-chain pins (identical to the .sh): miscfilters.cpp is fetched by
 REM COMMIT; the VS headers come from the R81 release tag. The plugin directory
 REM is derived from the RUNNING project interpreter -- no hardcoded python
-REM version. Requires curl.exe (ships with Windows 10 1803+). If no C++
-REM compiler is present, the script bootstraps one itself, unattended, via
-REM winget (installs winget from the official winget-cli release first if
-REM needed): WinLibs portable g++ (BrechtSanders.WinLibs.POSIX.UCRT), then
-REM MSYS2 + pacman mingw-w64-x86_64-gcc as the fallback. CRLF line endings.
+REM version. Requires curl.exe (ships with Windows 10 1803+).
+REM
+REM DEPLOY PATH (step zero): a prebuilt Windows x64 DLL ships at
+REM scripts\prebuilt\misc-win-x64.dll. The script sha256-pins it (certutil)
+REM and, on match, just copies it into the venv plugin dir -- no compiler,
+REM winget or pacman needed. Build provenance: cross-compiled on Linux with
+REM x86_64-w64-mingw32-g++ (GCC) 16.2.0, flags: -std=c++17 -O2 -shared
+REM -static -static-libgcc -static-libstdc++, from the SAME pinned sources
+REM as the .sh (miscfilters.cpp @ 07e0589a381f7deb3bf533bb459a94482bccc5c7,
+REM VS headers @ R81). Source: vapoursynth/vs-miscfilters-obsolete,
+REM LGPL-2.1 -- binary distribution with the pinned source reference in this
+REM repo; compliant for this personal-use deployment. Rebuild by re-running
+REM the same command; refresh the PREBUILT_SHA256 pin below on any change.
+REM
+REM FALLBACK (bundled DLL absent): if no C++ compiler is present, the script
+REM bootstraps one itself, unattended, via winget (installs winget from the
+REM official winget-cli release first if needed): WinLibs portable g++
+REM (BrechtSanders.WinLibs.POSIX.UCRT), then MSYS2 + pacman
+REM mingw-w64-x86_64-gcc as the last fallback. CRLF line endings.
 REM ===========================================================================
 chcp 65001 >nul
 setlocal
@@ -50,7 +64,15 @@ set /p VS_PKG_DIR=<"%WORK%\vsdir.txt"
 if not defined VS_PKG_DIR goto :vs_fail
 if not exist "%VS_PKG_DIR%" goto :vs_missing
 set "PLUGIN_DIR=%VS_PKG_DIR%\plugins\misc"
+set "PREBUILT_DLL=%REPO_ROOT%\scripts\prebuilt\misc-win-x64.dll"
+set "PREBUILT_SHA256=d4fe376bda6eaba2518400d0644e376e47fbda147c24e2132f36c3ef8a4e1405"
 
+REM ---- Step zero: bundled prebuilt DLL (no compiler needed) ----
+if exist "%PREBUILT_DLL%" goto :use_prebuilt
+echo [ЭТАП] Предсобранный DLL не найден: %PREBUILT_DLL%
+echo [ЭТАП] Перехожу к сборке из закреплённых исходников…
+
+:need_compile
 set "BASE=https://raw.githubusercontent.com/vapoursynth"
 curl.exe -fsSL --connect-timeout 15 --max-time 120 "%BASE%/vs-miscfilters-obsolete/%MISC_PIN%/src/miscfilters.cpp" -o "%WORK%\miscfilters.cpp" || goto :dl_fail
 curl.exe -fsSL --connect-timeout 15 --max-time 120 "%BASE%/vapoursynth/%VS_TAG%/include/VSHelper4.h" -o "%WORK%\VSHelper4.h" || goto :dl_fail
@@ -75,6 +97,8 @@ echo [ОШИБКА] Автоустановка компилятора не уд�
 echo Итог попыток:
 echo   1) WinLibs (portable g++) через winget — установлена, но g++ не найден;
 echo   2) MSYS2: %MSYS2_NOTE%
+echo Искали g++ в: %LOCALAPPDATA%\Microsoft\WinGet\Links и рекурсивно в
+echo %LOCALAPPDATA%\Microsoft\WinGet\Packages, а также в текущем PATH.
 echo Вывод winget/pacman — выше по тексту.
 echo Последний резерв вручную (если автоматизация недоступна):
 echo   (а) скачать и распаковать 64-битный WinLibs (https://winlibs.com) и добавить
@@ -126,7 +150,7 @@ echo [ЭТАП] MSYS2 g++ не найден — устанавливаю MSYS2 �
 winget install --id MSYS2.MSYS2 -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
 if not exist "C:\msys64\usr\bin\bash.exe" goto :no_compiler
 echo [ЭТАП] Устанавливаю mingw-w64-x86_64-gcc через pacman…
-"C:\msys64\usr\bin\bash.exe" -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-gcc" || goto :no_compiler
+"C:\msys64\usr\bin\bash.exe" -lc "pacman --noconfirm --needed -S mingw-w64-x86_64-gcc" || goto :pacman_fail
 if not exist "C:\msys64\mingw64\bin\g++.exe" goto :no_compiler
 
 :have_msys2_gxx
@@ -138,6 +162,14 @@ goto :compile_gxx
 :msys2_no_elevation
 echo [ОШИБКА] MSYS2 требует прав администратора (UAC) — пропущен в неинтерактивном режиме.
 set "MSYS2_NOTE=пропущен: требует прав администратора (UAC)"
+goto :no_compiler
+
+:pacman_fail
+echo [ОШИБКА] pacman завершился с ошибкой.
+set "MSYS2_NOTE=pacman не смог установить mingw-w64-x86_64-gcc"
+echo Диагноз: если выше массовая ошибка "self-signed certificate in certificate chain" —
+echo все зеркала отдают self-signed цепочку — признак перехвата TLS на сети сервера;
+echo используйте bundled DLL или проксируйте сеть.
 goto :no_compiler
 
 :compile_gxx
@@ -187,6 +219,35 @@ echo [ОШИБКА] Каталог пакета vapoursynth не найден: %
 echo Сначала uv sync
 goto :fail
 
+:use_prebuilt
+echo [ЭТАП] Найден предсобранный DLL — проверяю sha256…
+set "DLL_HASH="
+certutil -hashfile "%PREBUILT_DLL%" SHA256 > "%WORK%\dllhash.txt"
+for /f "usebackq skip=1 delims=" %%H in ("%WORK%\dllhash.txt") do if not defined DLL_HASH set "DLL_HASH=%%H"
+if not defined DLL_HASH goto :prebuilt_fail
+if /i not "%DLL_HASH%"=="%PREBUILT_SHA256%" goto :prebuilt_fail
+echo [ЭТАП] sha256 совпадает — копирую в %PLUGIN_DIR%\misc.dll
+if not exist "%PLUGIN_DIR%" mkdir "%PLUGIN_DIR%" || goto :copy_fail
+copy /y "%PREBUILT_DLL%" "%PLUGIN_DIR%\misc.dll" >nul || goto :copy_fail
+goto :built
+
+:copy_fail
+echo [ОШИБКА] Не удалось скопировать предсобранный DLL в %PLUGIN_DIR%\misc.dll.
+echo Подсказка: закройте процессы, использующие плагин (загруженный misc.dll
+echo удерживается python/VapourSynth), проверьте свободное место и антивирус,
+echo затем перезапустите скрипт. Причина ОС — в сообщении Windows выше.
+goto :fail
+
+:prebuilt_fail
+echo [ОШИБКА] Проверка предсобранного DLL не прошла (защита цепочки поставки).
+echo Ожидался sha256: %PREBUILT_SHA256%
+if defined DLL_HASH echo Фактический:    %DLL_HASH%
+echo Подсказка: scripts\prebuilt\misc-win-x64.dll повреждён или подменён —
+echo восстановите его из репозитория либо соберите компилятором —
+echo g++ ищется в: %LOCALAPPDATA%\Microsoft\WinGet\Links и рекурсивно в
+echo %LOCALAPPDATA%\Microsoft\WinGet\Packages, а также в текущем PATH.
+goto :fail
+
 :built
 echo [ГОТОВО] Собран: %PLUGIN_DIR%\misc.dll
 "%PY%" -c "import vapoursynth as vs; assert hasattr(vs.core, 'misc'), 'misc namespace not visible after build'; print('verified: core.misc is available')" || goto :verify_fail
@@ -205,14 +266,22 @@ goto :fail
 REM WinLibs manifest: InstallerType zip + NestedInstallerType portable +
 REM ArchiveBinariesDependOnPath true -> per the winget installer schema the
 REM install location is added directly to the (registry) PATH. The session
-REM PATH is NOT refreshed either way, so locate and prepend manually:
-REM Links shims first, then a Packages walk as belt-and-suspenders.
+REM PATH is NOT refreshed either way, so: prepend the Links dir to the
+REM session PATH (winget shims live there for new processes), then fall
+REM back to a full recursive walk of Packages as belt-and-suspenders.
 set "GXX_BIN="
-if exist "%LOCALAPPDATA%\Microsoft\WinGet\Links\g++.exe" set "GXX_BIN=%LOCALAPPDATA%\Microsoft\WinGet\Links"
-if defined GXX_BIN exit /b 0
+set "PATH=%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
+where g++ >nul 2>nul
+if not errorlevel 1 (
+    set "GXX_BIN=%LOCALAPPDATA%\Microsoft\WinGet\Links"
+    exit /b 0
+)
+set "GXX_WALK=%TEMP%\gxx_walk_%RANDOM%.txt"
+dir /s /b "%LOCALAPPDATA%\Microsoft\WinGet\Packages\g++.exe" > "%GXX_WALK%" 2>nul
 set "GXX_ANY="
-for /r "%LOCALAPPDATA%\Microsoft\WinGet\Packages" %%G in (g++.exe) do if not defined GXX_ANY set "GXX_ANY=%%~dpG"
+for /f "usebackq delims=" %%G in ("%GXX_WALK%") do if not defined GXX_ANY set "GXX_ANY=%%~dpG"
 set "GXX_BIN=%GXX_ANY%"
+del /q "%GXX_WALK%" >nul 2>&1
 exit /b 0
 
 :fail
