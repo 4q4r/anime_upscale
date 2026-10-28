@@ -22,8 +22,13 @@ setlocal
 set "MISC_PIN=07e0589a381f7deb3bf533bb459a94482bccc5c7"
 set "VS_TAG=R81"
 
-for %%I in ("%~dp0..") do set "REPO_ROOT=%%~fI"
+set "REPO_ROOT=%~dp0.."
+pushd "%REPO_ROOT%"
+set "REPO_ROOT=%CD%"
 set "PY=%REPO_ROOT%\.venv\Scripts\python.exe"
+
+echo [СКРИПТ] Каталог проекта: %REPO_ROOT%
+echo [СКРИПТ] Интерпретатор: %PY%
 
 if not exist "%PY%" (
     echo [ОШИБКА] Не найден интерпретатор проекта: %PY%
@@ -31,17 +36,17 @@ if not exist "%PY%" (
     goto :fail
 )
 
-set "PYTHONUTF8=1"
-for /f "delims=" %%P in ('"%PY%" -c "import vapoursynth, os; print(os.path.dirname(vapoursynth.__file__))"') do set "VS_PKG_DIR=%%P"
-if not defined VS_PKG_DIR (
-    echo [ОШИБКА] Пакет vapoursynth не импортируется из окружения проекта.
-    echo Сначала uv sync
-    goto :fail
-)
-set "PLUGIN_DIR=%VS_PKG_DIR%\plugins\misc"
-
 set "WORK=%TEMP%\misc_build_%RANDOM%"
 mkdir "%WORK%"
+
+set "PYTHONUTF8=1"
+set "VS_PKG_DIR="
+"%PY%" -c "import vapoursynth, os; print(os.path.dirname(vapoursynth.__file__))" > "%WORK%\vsdir.txt" 2>nul
+if errorlevel 1 goto :vs_fail
+set /p VS_PKG_DIR=<"%WORK%\vsdir.txt"
+if not defined VS_PKG_DIR goto :vs_fail
+if not exist "%VS_PKG_DIR%" goto :vs_missing
+set "PLUGIN_DIR=%VS_PKG_DIR%\plugins\misc"
 
 set "BASE=https://raw.githubusercontent.com/vapoursynth"
 curl.exe -fsSL "%BASE%/vs-miscfilters-obsolete/%MISC_PIN%/src/miscfilters.cpp" -o "%WORK%\miscfilters.cpp" || goto :dl_fail
@@ -91,11 +96,22 @@ echo Подсказка: curl.exe встроен в Windows 10 начиная с
 echo и доступность https://raw.githubusercontent.com
 goto :fail
 
+:vs_fail
+echo [ОШИБКА] Пакет vapoursynth не импортируется из окружения проекта.
+echo Сначала uv sync
+goto :fail
+
+:vs_missing
+echo [ОШИБКА] Каталог пакета vapoursynth не найден: %VS_PKG_DIR%
+echo Сначала uv sync
+goto :fail
+
 :built
 echo [ГОТОВО] Собран: %PLUGIN_DIR%\misc.dll
 "%PY%" -c "import vapoursynth as vs; assert hasattr(vs.core, 'misc'), 'misc namespace not visible after build'; print('verified: core.misc is available')" || goto :verify_fail
 echo [ПРОВЕРЕНО] core.misc доступен — плагин misc работает.
 rd /s /q "%WORK%"
+popd
 exit /b 0
 
 :verify_fail
@@ -105,6 +121,6 @@ echo компилятора) либо DLL не экспортирует VapourSy
 goto :fail
 
 :fail
-cd /d "%REPO_ROOT%" >nul 2>nul
+popd
 if exist "%WORK%" rd /s /q "%WORK%"
 exit /b 1
