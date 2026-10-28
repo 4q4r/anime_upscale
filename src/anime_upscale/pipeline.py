@@ -14,7 +14,7 @@ from pathlib import Path
 import vapoursynth as vs
 
 from anime_upscale.ffmpeg import build_mux_args, finish_encoder, spawn_encoder
-from anime_upscale.stages import (  # noqa: F401 (registry import)  # noqa: F401
+from anime_upscale.stages import (  # noqa: F401 - descale/deband/interpolate/upscale register via import
     STAGE_BUILDERS,
     StageContext,
     deband,
