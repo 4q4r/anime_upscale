@@ -89,7 +89,5 @@ error-on-warning = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-q", "--strict-markers"]
-markers = [
-    "gpu: requires a CUDA device (deselected automatically without one)",
-    "vapoursynth: requires importable VapourSynth (skipped gracefully otherwise)",
-]
+# gpu/vapoursynth markers are registered in tests/conftest.py (M8): the same
+# module owns deselection-without-CUDA and VS-less collection-ignores.
