@@ -201,9 +201,10 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
             user_agent=config.fetch.gofile.user_agent,
             language=config.fetch.gofile.language,
             wt_salt=config.fetch.gofile.wt_salt,
+            strict_tls=config.network.strict_tls,
         )
 
-    queue = build_queue(entries, client_factory, reporter)
+    queue = build_queue(entries, client_factory, reporter, strict_tls=config.network.strict_tls)
     if "upscale" in run.stages:
         verify_all(root / config.models.manifest, root / config.models.dir)
     output_override = _resolve_output_override(args.output, len(queue))

@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlparse
 import requests
 from requests.structures import CaseInsensitiveDict
 
+from anime_upscale import gofile
 from anime_upscale.gofile import GOFILE_SHARE_RE, GofileClient, PinnedSession
 from anime_upscale.reporting import Reporter
 
@@ -222,14 +223,17 @@ def build_queue(
     client_factory: Callable[[], GofileClient],
     reporter: Reporter,
     name_prober: Callable[[str], str] | None = None,
+    *,
+    strict_tls: bool = False,
 ) -> list[QueueItem]:
     """
     Resolve all entries into a sequential queue (pre-flight metadata only).
 
     No file downloads here — those happen per-entry at each file's turn.
-    `name_prober` is a test seam (default: live header probe).
+    `name_prober` is a test seam (default: live header probe, threaded
+    ``strict_tls`` for interception-adaptive TLS).
     """
-    prober = name_prober or _remote_name
+    prober = name_prober or (lambda url: _remote_name(url, strict_tls=strict_tls))
     queue: list[QueueItem] = []
     taken: set[str] = set()
     seen_entries: set[str] = set()
@@ -283,7 +287,7 @@ _HTTP_OK = 200
 _PERCENT = 100
 
 
-def _remote_name(url: str) -> str:
+def _remote_name(url: str, *, strict_tls: bool = False) -> str:
     """Probe download headers for the filename; fall back to the URL path segment."""
     if urlparse(url).hostname == "gofile.io":
         msg = f"Ссылка gofile вне обработчика: {url}"
@@ -291,7 +295,13 @@ def _remote_name(url: str) -> str:
     session = PinnedSession()
     session.pin(urlparse(url).hostname or "")
     try:
-        response = session.head(url, timeout=30, allow_redirects=True)
+        response = gofile.adaptive_tls_request(
+            session.head,
+            url=url,
+            strict_tls=strict_tls,
+            timeout=30,
+            allow_redirects=True,
+        )
     except requests.RequestException as exc:
         msg = f"Недоступна прямая ссылка {url}: {exc}"
         raise EntryError(msg) from exc

@@ -111,7 +111,9 @@ def test_preflight_network_failure_is_loud_exit_1(
 
     _tmp_project(tmp_path, monkeypatch)
 
-    def boom(entries: list[str], client_factory: object, reporter: Reporter) -> list:
+    def boom(
+        entries: list[str], client_factory: object, reporter: Reporter, strict_tls: bool = False
+    ) -> list:
         raise requests.ConnectionError("Connection reset by peer")
 
     monkeypatch.setattr(cli, "build_queue", boom)
@@ -228,6 +230,7 @@ def test_upload_time_network_error_gets_dedicated_exit_3(
     class DeadClient:
         def __init__(self, *a: object, **kw: object) -> None:
             self.session = DeadSession()
+            self.strict_tls = False
 
     _tmp_project(tmp_path, monkeypatch)
     # The real upload runs: the (faked) pipeline's output must exist so

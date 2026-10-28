@@ -140,6 +140,13 @@ class FetchConfig:
 
 
 @dataclass(frozen=True)
+class NetworkConfig:
+    """[network] — сетевые политики транспорта (gofile/fetch request layer)."""
+
+    strict_tls: bool = False
+
+
+@dataclass(frozen=True)
 class ToolsConfig:
     """External tool overrides (plan §12.3); None = PATH lookup."""
 
@@ -173,6 +180,7 @@ class Config:
     hardware: HardwareOverrides = field(default_factory=HardwareOverrides)
     stages: StagesConfig = field(default_factory=StagesConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
     upload: UploadConfig = field(default_factory=UploadConfig)
     fetch: FetchConfig = field(default_factory=FetchConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
@@ -369,6 +377,16 @@ def _x265_value(value: Any) -> str:  # noqa: ANN401
     raise ConfigError(msg)
 
 
+def _validate_network(table: dict[str, Any]) -> NetworkConfig:
+    """[network] — transport policy section (adaptive TLS kill-switch)."""
+    _reject_unknown(table, {"strict_tls"}, "network")
+    strict_tls = table.get("strict_tls", False)
+    if not isinstance(strict_tls, bool):
+        msg = "[network]: strict_tls должен быть булевым значением (true/false)."
+        raise ConfigError(msg)
+    return NetworkConfig(strict_tls=strict_tls)
+
+
 def load_config(path: Path) -> Config:
     """Load and validate config.toml into ONE frozen Config object."""
     if not path.is_file():
@@ -386,6 +404,7 @@ def load_config(path: Path) -> Config:
         "hardware",
         "stages",
         "models",
+        "network",
         "upload",
         "fetch",
         "tools",
@@ -424,6 +443,8 @@ def load_config(path: Path) -> Config:
         manifest=Path(models_raw.get("manifest", "models/manifest.toml")),
     )
 
+    network = _validate_network(raw.get("network", {}))
+
     upload_raw = raw.get("upload", {})
     _reject_unknown(upload_raw, {"gofile"}, "upload")
     gofile_upload_raw = upload_raw.get("gofile", {})
@@ -459,6 +480,7 @@ def load_config(path: Path) -> Config:
         hardware=hardware,
         stages=_validate_stages(raw.get("stages", {})),
         models=models,
+        network=network,
         upload=upload,
         fetch=fetch,
         tools=tools,

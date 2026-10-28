@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import requests
 
-from anime_upscale.gofile import GofileClient, GofileError
+from anime_upscale.gofile import GofileClient, GofileError, adaptive_tls_request
 
 if TYPE_CHECKING:
     from anime_upscale.reporting import Reporter
@@ -26,7 +26,12 @@ class UploadError(Exception):
 def pick_server(client: GofileClient) -> str:
     """GET https://api.gofile.io/servers (live-verified 2026-10-27) → first store host."""
     client.session.pin("api.gofile.io")
-    response = client.session.get("https://api.gofile.io/servers", timeout=30)
+    response = adaptive_tls_request(
+        client.session.get,
+        url="https://api.gofile.io/servers",
+        strict_tls=client.strict_tls,
+        timeout=30,
+    )
     if response.status_code != _HTTP_OK:
         msg = f"gofile /servers: HTTP {response.status_code}."
         raise UploadError(msg)
@@ -88,8 +93,10 @@ def upload_file(
     # requests requires a file-like (reads via .read()); the reader keeps the
     # chunked-multipart contract and the progress callback.
     files_dict = {"file": (path.name, _ChunkReader(file_stream()))}
-    response = client.session.post(
-        f"https://{host}/uploadfile",
+    response = adaptive_tls_request(
+        client.session.post,
+        url=f"https://{host}/uploadfile",
+        strict_tls=client.strict_tls,
         files=files_dict,
         cookies={"accountToken": token} if token else {},
         timeout=(10, 3600),
