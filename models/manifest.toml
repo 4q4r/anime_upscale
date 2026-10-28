@@ -7,10 +7,15 @@ member = "2x_AnimeJaNai_HD_V3_ModelsOnly/2x_AnimeJaNai_HD_V3_Compact.pth"   # и
 sha256 = "af7307eee19e5982a8014dd0e4650d3bde2e25aa78d2105a4bdfd947636e4c8f"
 license = "CC-BY-NC-SA-4.0"
 
-# Документационная запись: веса интерполяции управляются обёрткой vsrife.
-# Модель 4.25 скачивается самой обёрткой (vsrife auto-download) из релизов
-# HolyWu/vs-rife при первом запуске стадии interpolate; кэш TensorRT-движков —
-# в каталоге [stages.interpolate] trt_cache_dir. Локально НЕ закрепляется.
-[models.rife_4_25]
-source = "vsrife 5.7.0 wrapper release (auto-download); NOT locally pinned"
+# Веса интерполяции RIFE 4.25 — предзаполнение кэша обёртки vsrife.
+# Обёртка ожидает файл <site-packages>/vsrife/models/flownet_v4.25.pkl
+# (vsrife/__init__.py: model_dir = .../vsrife/models; колесо кладёт туда
+# 0-байтовые заглушки) и при запуске стадии interpolate качает его САМА
+# с github.com — на сетях с перехватом TLS это ненадёжно (живой инцидент
+# 2026-10-29: TLS MITM self-signed). `anime-pipeline models fetch` кладёт
+# файл заранее и проверяет sha256; батч без предзаполнения падает громко.
+[models.rife_v4_25]
+url = "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.25.pkl"
+sha256 = "6615790efd627772917205db291f51cd392528a157ecbb2ecaeec3bff8eb6de2"
+vsrife_seed = true
 license = "MIT"

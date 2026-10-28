@@ -1,6 +1,7 @@
 """models/manifest.toml parsing + sha256 verification (plan §6)."""
 
 import hashlib
+import importlib.util
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ class ModelEntry:
     sha256: str = ""
     license: str = ""
     source_note: str = ""
+    vsrife_seed: bool = False
 
 
 def load_manifest(manifest_path: Path) -> dict[str, ModelEntry]:
@@ -41,8 +43,37 @@ def load_manifest(manifest_path: Path) -> dict[str, ModelEntry]:
             sha256=str(table.get("sha256", "")).lower(),
             license=str(table.get("license", "")),
             source_note=str(table.get("source", "")),
+            vsrife_seed=bool(table.get("vsrife_seed", False)),
         )
     return entries
+
+
+def _vsrife_package_dir() -> Path:
+    """
+    Directory of the installed vsrife package (no import: find_spec only resolves).
+
+    Platform-aware by construction — site-packages differs between Linux
+    (.venv/lib/pythonX.Y/site-packages) and Windows (.venv/Lib/site-packages),
+    and find_spec follows the ACTUAL environment.
+    """
+    spec = importlib.util.find_spec("vsrife")
+    if spec is None or not spec.origin:
+        msg = "Пакет vsrife не найден в окружении — кэш моделей RIFE недоступен."
+        raise ManifestError(msg)
+    return Path(spec.origin).resolve().parent
+
+
+def _seed_filename(entry: ModelEntry) -> str:
+    """Return the cache filename vsrife itself derives from the URL (basename)."""
+    if not entry.url:
+        msg = f"Модель-предзаполнение «{entry.name}» не имеет url в манифесте."
+        raise ManifestError(msg)
+    return entry.url.rsplit("/", 1)[-1]
+
+
+def vsrife_seed_path(entry: ModelEntry) -> Path:
+    """Exact file vsrife expects: <package>/models/<url-basename>."""
+    return _vsrife_package_dir() / "models" / _seed_filename(entry)
 
 
 def expected_model_path(models_dir: Path, entry: ModelEntry) -> Path:
@@ -50,8 +81,11 @@ def expected_model_path(models_dir: Path, entry: ModelEntry) -> Path:
     Flat models/upscale/<member-basename> layout (plan §2/§6).
 
     The manifest's `member` carries the full path INSIDE the release zip
-    (folder prefix); the local artifact layout stays flat.
+    (folder prefix); the local artifact layout stays flat. vsrife-seed entries
+    resolve into the vsrife package cache instead.
     """
+    if entry.vsrife_seed:
+        return vsrife_seed_path(entry)
     filename = Path(entry.member).name if entry.member else f"{entry.name}.pth"
     return models_dir / "upscale" / filename
 

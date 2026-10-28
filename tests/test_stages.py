@@ -158,3 +158,60 @@ class TestUpscaleFramePull:
             if "models fetch" in str(exc) or "не найдена" in str(exc):
                 pytest.skip(f"model not fetched: {exc}")
             raise
+
+
+class _NotesReporter:
+    """Duck-typed reporter collecting note() lines (guard decision assertions)."""
+
+    def __init__(self) -> None:
+        self.notes: list[str] = []
+
+    def note(self, text: str) -> None:
+        self.notes.append(text)
+
+
+class TestEvenAlignApply:
+    """VS application of the mod-2 guard (pipeline calls it before the final convert)."""
+
+    def _apply(self, clip: "vs.VideoNode") -> tuple["vs.VideoNode", _NotesReporter]:
+        from anime_upscale.stages.dimensions import apply_even_align
+
+        reporter = _NotesReporter()
+        return apply_even_align(clip, reporter), reporter  # ty: ignore[arg-type]
+
+    def test_rgb_odd_clip_crops_one_pixel(self) -> None:
+        core = vs.core
+        clip = core.std.BlankClip(format=vs.RGBH, width=321, height=241, length=2)
+        out, reporter = self._apply(clip)
+        assert out.width == 320 and out.height == 241 - 1
+        assert reporter.notes and "320x240" in reporter.notes[0]
+        assert "обрезка" in reporter.notes[0]
+
+    def test_subsampled_format_routes_crop_plan_to_scale(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An odd-dimension YUV420 clip cannot even be constructed in VS (formats
+        # enforce evenness), so the routing for "crop plan over a subsampled
+        # format" is exercised with a synthetic plan on a real even clip: the
+        # routing must resize (1px crop is not expressible on 420), never crop.
+        import anime_upscale.stages.dimensions as dims
+
+        monkeypatch.setattr(
+            dims,
+            "decide_even_align",
+            lambda w, h: dims.EvenAlign(
+                action="crop", width=w - 2, height=h - 2, crop_right=1, crop_bottom=1
+            ),
+        )
+        core = vs.core
+        clip = core.std.BlankClip(format=vs.YUV420P10, width=320, height=240, length=2)
+        out, reporter = self._apply(clip)
+        assert out.width == 318 and out.height == 238
+        assert reporter.notes and "масштабирование" in reporter.notes[0]
+
+    def test_even_clip_untouched_no_note(self) -> None:
+        core = vs.core
+        clip = core.std.BlankClip(format=vs.RGBH, width=320, height=240, length=2)
+        out, reporter = self._apply(clip)
+        assert out is clip
+        assert reporter.notes == []

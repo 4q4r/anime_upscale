@@ -7,6 +7,7 @@ once before RIFE (no RGB round-trips). Scene detection runs inside vsrife
 (sc=True + sc_threshold) on a GRAY8 side-branch — requires the misc plugin.
 """
 
+import contextlib
 from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
@@ -24,6 +25,7 @@ from anime_upscale.stages import (  # noqa: F401 - descale/deband/interpolate/up
     interpolate,
     upscale,
 )
+from anime_upscale.stages.dimensions import apply_even_align
 from anime_upscale.stages.encode import build_video_args
 
 
@@ -43,6 +45,11 @@ def build_graph(ctx: StageContext, clip: vs.VideoNode) -> vs.VideoNode:
         if name == "upscale" or (name == "interpolate" and "upscale" not in ctx.run.stages):
             clip = _to_rgbh(clip)
         clip = get_builder(name)(ctx, clip)
+    # Mod-2 guard BEFORE the final convert: on non-subsampled formats the 1px
+    # crop is exact; on subsampled YUV the chroma granularity forces the scale
+    # branch (handled inside). x265 yuv420 refuses odd sizes with a misleading
+    # parameter error.
+    clip = apply_even_align(clip, ctx.reporter)
     if clip.format.color_family == vs.RGB:
         # RGB → YUV needs the matrix; YUV → YUV depth conversion must NOT pass one
         # (zimg has no same-family path with a matrix — live-verified in benchmark).
@@ -107,8 +114,15 @@ def run_pipeline(
                 progress_update=progress_update,
             )
         except OSError as exc:
-            # A dead ffmpeg surfaces as EPIPE on the VS side; re-raise with the tail.
-            finish_encoder(encoder)
+            # A dead ffmpeg surfaces as EPIPE (Linux) / EINVAL (Windows) on the
+            # VS-side write. finish_encoder raises with ffmpeg's ACTUAL exit
+            # code + stderr tail (and the libx265 capability diagnosis when the
+            # encoder failed to open) — that is the real cause; the bare errno
+            # only says the pipe broke (live E05/E06/E10/E11 class).
+            try:
+                finish_encoder(encoder)
+            except RuntimeError as enc_exc:
+                raise PipelineError(str(enc_exc)) from exc
             msg = f"Поток в ffmpeg оборвался во время кодирования: {exc}"
             raise PipelineError(msg) from exc
         except BaseException:
@@ -123,6 +137,9 @@ def run_pipeline(
             raise
     finally:
         if encoder.stdin is not None and not encoder.stdin.closed:
-            encoder.stdin.close()
+            # Already-broken pipe (dead ffmpeg): the failure above is the real
+            # outcome — never let a close-time EINVAL mask it.
+            with contextlib.suppress(OSError):
+                encoder.stdin.close()
     finish_encoder(encoder)
     return (output_fps.numerator, output_fps.denominator)

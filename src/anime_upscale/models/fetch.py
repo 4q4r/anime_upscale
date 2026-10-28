@@ -16,6 +16,7 @@ from anime_upscale.models.manifest import (
     expected_model_path,
     load_manifest,
     sha256_of,
+    verify_model,
 )
 from anime_upscale.reporting import Reporter
 
@@ -75,6 +76,55 @@ def _extract_and_verify(archive_path: Path, entry: ModelEntry, target: Path) -> 
     member_tmp.rename(target)  # atomic: verified bytes only reach the final path
 
 
+def _fetch_seed_file(
+    entry: ModelEntry,
+    reporter: Reporter | None,
+) -> Path:
+    """
+    Pre-seed a vsrife-managed weight file (plain download, no zip).
+
+    The vsrife wheel ships 0-byte stubs at <package>/models/<file>; a real
+    download replaces the stub. On a failed refetch a 0-byte stub is restored:
+    vsrife probes os.path.getsize, which RAISES on an absent file.
+    """
+    target = expected_model_path(Path(), entry)  # models_dir unused for seeds
+    if _reconcile_existing(target, entry, reporter):
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    seed_tmp = target.parent / f".{entry.name}.part"
+
+    def _restore_stub() -> None:
+        # Never leave the cache path ABSENT: vsrife's getsize probe would raise
+        # a raw FileNotFoundError instead of its own loud missing-model error.
+        if not target.exists():
+            target.write_bytes(b"")
+
+    try:
+        if reporter is not None:
+            reporter.line(f"Скачивание: {entry.url}")
+        _download(entry.url, seed_tmp)
+        actual = sha256_of(seed_tmp)
+    except Exception:
+        _restore_stub()
+        seed_tmp.unlink(missing_ok=True)
+        raise
+    if actual != entry.sha256:
+        seed_tmp.unlink(missing_ok=True)
+        _restore_stub()
+        msg = (
+            f"Контрольная сумма модели «{entry.name}» не совпадает:\n"
+            f"  ожидалось: {entry.sha256}\n  фактически: {actual}\n"
+            f"Файл скачан с {entry.url}. Повторите `anime-pipeline models fetch` — "
+            "при повторном сбое проверьте сеть (перехват TLS)."
+        )
+        raise FetchError(msg)
+    seed_tmp.replace(target)  # atomic overwrite of the wheel's stub
+    if reporter is not None:
+        reporter.success(f"Модель «{entry.name}» загружена и верифицирована: {target}")
+    return target
+
+
 def fetch_model(
     entry: ModelEntry,
     manifest_path: Path,  # noqa: ARG001 - kept for CLI-call-site symmetry with verify_all
@@ -82,6 +132,8 @@ def fetch_model(
     reporter: Reporter | None = None,
 ) -> Path:
     """Download + verify one manifest entry; returns the final verified path."""
+    if entry.vsrife_seed:
+        return _fetch_seed_file(entry, reporter)
     if not entry.url or not entry.sha256:
         msg = (
             f"Модель «{entry.name}» не имеет url/sha256 в манифесте "
@@ -145,3 +197,28 @@ def verify_all(manifest_path: Path, models_dir: Path) -> dict[str, Path]:
             msg = f"Контрольная сумма модели «{name}» не совпадает: {actual} ≠ {entry.sha256}"
             raise ManifestError(msg)
     return verified
+
+
+def ensure_vsrife_seed(manifest_path: Path) -> Path:
+    """
+    Batch pre-flight: the RIFE seed weights must already sit in the vsrife cache.
+
+    Runs BEFORE any batch with the interpolate stage: vsrife's own auto-download
+    hits github.com at run time, which is unreliable under TLS interception
+    (live incident 2026-10-29). Missing/corrupt seed = loud error naming the fix.
+    """
+    entries = load_manifest(manifest_path)
+    seeds = [entry for entry in entries.values() if entry.vsrife_seed]
+    if not seeds:
+        msg = (
+            f"В {manifest_path} нет записи предзаполнения RIFE (vsrife_seed = true) — "
+            "обновите манифест."
+        )
+        raise ManifestError(msg)
+    seed_path: Path | None = None
+    for entry in seeds:
+        seed_path = verify_model(Path(), entry)  # models_dir unused for seeds
+    if seed_path is None:  # pragma: no cover - guarded by the non-empty check above
+        msg = f"В {manifest_path} нет записей предзаполнения RIFE для проверки."
+        raise ManifestError(msg)
+    return seed_path

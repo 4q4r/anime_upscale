@@ -480,3 +480,90 @@ def test_upload_time_network_error_gets_dedicated_exit_3(
     assert exit_code == cli.EXIT_UPLOAD == 3
     assert "Connection reset by peer" in out
     assert "загрузка не удалась" in out
+
+
+INTERPOLATE_CONFIG = (
+    "[pipeline]\n"
+    'order = ["descale", "deband", "upscale", "interpolate", "encode"]\n'
+    "[stages.encode]\n"
+    "crf = 16\n"
+    "[profiles.itp]\n"
+    'stages = ["interpolate", "encode"]\n'
+)
+
+
+def _itp_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Project whose profile selects interpolate (drives the seed pre-flight)."""
+    (tmp_path / "input").mkdir()
+    (tmp_path / "output").mkdir()
+    (tmp_path / "input" / "a.mkv").write_bytes(b"a")
+    (tmp_path / "config.toml").write_text(INTERPOLATE_CONFIG, encoding="utf-8")
+    # A manifest carrying the real rife_v4_25 seed entry (same pin as the repo).
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "manifest.toml").write_text(
+        "[models.rife_v4_25]\n"
+        'url = "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.25.pkl"\n'
+        'sha256 = "6615790efd627772917205db291f51cd392528a157ecbb2ecaeec3bff8eb6de2"\n'
+        "vsrife_seed = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_batch_without_seed_loud_before_any_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """E01/E02 recurrence guard: an interpolate batch without the pre-seeded
+    RIFE weights must fail LOUDLY before downloading/pipeline work starts."""
+    import anime_upscale.models.manifest as manifest_mod
+
+    _itp_project(tmp_path, monkeypatch)
+    pkg = tmp_path / "fakepkg" / "vsrife"
+    monkeypatch.setattr(manifest_mod, "_vsrife_package_dir", lambda: pkg)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    exit_code = cli.main(["--profile", "itp", "-i", "a.mkv", "--config", "config.toml"])
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert "models fetch" in out
+    assert "rife_v4_25" in out
+
+
+def test_batch_with_seed_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import hashlib
+
+    import anime_upscale.models.manifest as manifest_mod
+
+    _itp_project(tmp_path, monkeypatch)
+    pkg = tmp_path / "fakepkg" / "vsrife"
+    target = pkg / "models" / "flownet_v4.25.pkl"
+    target.parent.mkdir(parents=True)
+    payload = b"SEEDWEIGHTS"
+    target.write_bytes(payload)
+    # The manifest pin in the tmp project is the real asset sha; pin the fake
+    # file to the SAME bytes by patching the entry loader is overkill — instead
+    # rewrite the tmp manifest to the fake payload's sha.
+
+    manifest_path = tmp_path / "models" / "manifest.toml"
+    manifest_path.write_text(
+        "[models.rife_v4_25]\n"
+        'url = "https://github.com/HolyWu/vs-rife/releases/download/model/flownet_v4.25.pkl"\n'
+        f'sha256 = "{hashlib.sha256(payload).hexdigest()}"\n'
+        "vsrife_seed = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(manifest_mod, "_vsrife_package_dir", lambda: pkg)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+
+    ran: list[str] = []
+
+    def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None):
+        ran.append(source.name)
+        return (60, 1)
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run_pipeline)
+    exit_code = cli.main(["--profile", "itp", "-i", "a.mkv", "--config", "config.toml"])
+    assert exit_code == 0
+    assert ran == ["a.mkv"]
