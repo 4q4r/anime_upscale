@@ -225,10 +225,21 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
             upload_enabled=run.upload,
         )
         if outcome is None:
+            # Per-entry phase terminator (live-bug fix 2026-10-29): the ✓ line
+            # closes the file's download→processing→upload block so the next
+            # banner can never read as if it stole the console mid-file.
+            reporter.success(f"{item.name} — готово")
             results.append((item.name, True, ""))
             continue
         kind, detail = outcome
         failures[kind] = True
+        # Live-bug fix 2026-10-29: report the failure AT THE POINT of failure,
+        # not only in the end summary — a deferred-only ✗ made a dead entry
+        # indistinguishable from a running one (the next banner + «Загрузка»
+        # lines looked like the downloader fighting the interpolation). The
+        # continue-and-summarize ruling is untouched: the batch goes on and
+        # the summary still names every entry.
+        reporter.error(f"{item.name}: {detail}")
         results.append((item.name, False, detail))
     reporter.batch_summary(results)
     if failures["pipeline"]:
