@@ -46,9 +46,21 @@ class GofileLink:
 
 
 def classify_entry(entry: str) -> BareName | DirectUrl | GofileLink:
-    """§11.1 entry grammar; other gofile URL shapes are loud errors."""
+    """
+    §11.1 entry grammar; other gofile URL shapes are loud errors.
+
+    Plain http:// entries are rejected: ingestion is https-only — the DoH
+    pinning stance (§10.1) cannot protect an unencrypted channel from
+    content substitution.
+    """
     text = entry.strip()
-    if text.startswith(("http://", "https://")):
+    if text.startswith("http://"):
+        msg = (
+            f"Отказано: прямые ссылки только по HTTPS («{entry}»). "
+            "HTTP-загрузка обходит DoH-пиннинг и защиту от подмены содержимого (§10.1)."
+        )
+        raise EntryError(msg)
+    if text.startswith(("https://",)):
         host = (urlparse(text).hostname or "").removeprefix("www.")
         if host == "gofile.io":
             match = GOFILE_SHARE_RE.search(text)
@@ -69,20 +81,57 @@ def classify_entry(entry: str) -> BareName | DirectUrl | GofileLink:
     return BareName(value=text)
 
 
+def sanitize_remote_filename(name: str, source: str) -> str:
+    """
+    One gate for EVERY remote-derived file name (addendum-grade security).
+
+    Remote names must be flat filenames: path separators, `..` shapes, absolute
+    forms and dotfile tricks are rejected with a loud Russian error naming the
+    offending name and where it came from. Benign unicode/spaces pass through.
+    """
+    if not name:
+        msg = f"Пустое имя файла из удалённого источника ({source})."
+        raise EntryError(msg)
+    if "/" in name or "\\" in name:
+        msg = (
+            f"Отказано в имени файла «{name}» из {source}: "
+            "имена из удалённых источников должны быть простыми именами файлов "
+            "(без разделителей путей)."
+        )
+        raise EntryError(msg)
+    if name in {".", ".."} or name.startswith(".."):
+        msg = (
+            f"Отказано в имени файла «{name}» из {source}: "
+            "имена вида «..» допускают выход за пределы input/."
+        )
+        raise EntryError(msg)
+    if name.startswith("."):
+        msg = (
+            f"Отказано в имени файла «{name}» из {source}: "
+            "скрытые (начинающиеся с точки) имена от удалённых серверов не принимаются."
+        )
+        raise EntryError(msg)
+    return name
+
+
 def derive_filename(response_headers: CaseInsensitiveDict[str], url: str) -> str:
-    """Content-Disposition (filename* → filename) → last URL path segment → loud error."""
+    """
+    Content-Disposition (filename* → filename) → last URL path segment → loud error.
+
+    Every derived name passes the remote-name sanitization gate (F2).
+    """
     disposition = response_headers.get("Content-Disposition", "")
     if disposition:
         star = _rfc5987_filename(disposition)
         if star:
-            return star
+            return sanitize_remote_filename(star, "заголовок Content-Disposition (filename*)")
         plain = _plain_filename(disposition)
         if plain:
-            return plain
+            return sanitize_remote_filename(plain, "заголовок Content-Disposition (filename)")
     path = urlparse(url).path.rstrip("/")
     segment = unquote(path.rsplit("/", 1)[-1]) if path else ""
     if segment:
-        return segment
+        return sanitize_remote_filename(segment, "последний сегмент пути URL")
     msg = f"Невозможно определить имя файла для {url}: нет Content-Disposition и пустой путь."
     raise EntryError(msg)
 
@@ -180,7 +229,10 @@ def build_queue(
                 client = client_factory()
                 children = client.expand_entries(content_id, reporter)
                 for child in children:
-                    name = disambiguate(child.name, taken, reporter)
+                    safe_name = sanitize_remote_filename(
+                        child.name, f"gofile дочерний элемент (папка {content_id})"
+                    )
+                    name = disambiguate(safe_name, taken, reporter)
                     taken.add(name)
                     queue.append(
                         QueueItem(

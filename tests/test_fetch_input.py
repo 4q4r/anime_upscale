@@ -15,6 +15,7 @@ from anime_upscale.fetch_input import (
     disambiguate,
     ensure_local,
     fetch_queue_item,
+    sanitize_remote_filename,
 )
 from anime_upscale.gofile import GofileClient
 from anime_upscale.reporting import Reporter, resolve_mode
@@ -42,7 +43,14 @@ class TestGrammar:
 
     def test_gofile_share_link(self) -> None:
         assert classify_entry("https://gofile.io/d/AbCdEf") == GofileLink("AbCdEf")
-        assert classify_entry("http://www.gofile.io/d/x1?x=2") == GofileLink("x1")
+        assert classify_entry("https://www.gofile.io/d/x1?x=2") == GofileLink("x1")
+
+    def test_plain_http_entry_rejected_https_only(self) -> None:
+        """F4: plain-HTTP ingestion bypasses DoH pinning — loud https-only error."""
+        with pytest.raises(EntryError, match="HTTPS"):
+            classify_entry("http://example.com/x.mkv")
+        with pytest.raises(EntryError, match="HTTPS"):
+            classify_entry("http://gofile.io/d/AbCdEf")
 
     @pytest.mark.parametrize(
         "bad",
@@ -172,3 +180,58 @@ class TestFetchQueueItem:
     def test_ensure_local_rejects_traversal(self, tmp_path: Path) -> None:
         with pytest.raises(EntryError):
             ensure_local("../secret", tmp_path)
+
+
+class TestSanitizeRemoteFilename:
+    """F2: one gate for every remote-derived name — hostile shapes are loud errors."""
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "../etc/passwd",
+            "..\\..\\win",
+            "/absolute" + "/path/x.mkv",
+            "a/b.mkv",
+            "a\\b.mkv",
+            "..mkv",
+            "..",
+            ".hidden.mkv",
+            ".",
+            "",
+        ],
+    )
+    def test_hostile_names_rejected_with_source(self, bad: str) -> None:
+        with pytest.raises(EntryError, match=r"Content-Disposition|gofile|URL|имя"):
+            sanitize_remote_filename(bad, "заголовок Content-Disposition (filename)")
+
+    @pytest.mark.parametrize(
+        "good",
+        ["эпизод 01.mkv", "файл (2).mp4", "Воскрешение [1080p].mkv", "normal_name-mixed.ts"],
+    )
+    def test_benign_unicode_spaces_pass(self, good: str) -> None:
+        assert sanitize_remote_filename(good, "последний сегмент пути URL") == good
+
+    def test_derive_filename_rejects_traversal_naming_header(self) -> None:
+        headers = {"Content-Disposition": 'attachment; filename="../etc/passwd"'}
+        with pytest.raises(EntryError, match=r"passwd.*(Content-Disposition|filename)"):
+            derive_filename(headers, "https://host/x")
+
+    def test_derive_filename_url_segment_traversal_rejected(self) -> None:
+        with pytest.raises(EntryError, match="URL"):
+            derive_filename({}, "https://host/download/..%2F..%2Fwin")
+
+    def test_gofile_hostile_child_name_rejected_in_queue(self) -> None:
+        reporter = _MuteReporter()
+
+        class _FakeClient:
+            def expand_entries(self, content_id: str, reporter: object) -> list:
+                from anime_upscale.gofile import ResolvedChild
+
+                return [ResolvedChild(name="a/b.mkv", link="https://s/1")]
+
+        with pytest.raises(EntryError, match=r"a/b\.mkv"):
+            build_queue(
+                ["https://gofile.io/d/folder1"],
+                _FakeClient,  # type: ignore[arg-type,return-value]
+                reporter,
+            )
