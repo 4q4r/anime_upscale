@@ -1,0 +1,230 @@
+# =============================================================================
+# Headscale v0.29.6 — конфигурация координационного сервера tailnet.
+#
+# Структура и состав ключей = полный config-example.yaml из тега v0.29.6
+# (https://github.com/juanfont/headscale/blob/v0.29.6/config-example.yaml),
+# ни один секционный ключ не удалён — валидность гарантируется `headscale
+# configtest`. Комментарии на русском устанавливают только там, где решение
+# принималось; остальные значения = дефолты примера.
+#
+# ПРОВЕРЕННЫЕ ФАКТЫ (primary sources, 2026-10-30):
+#   - актуальный релиз: v0.29.6 (2026-10-24) — GitHub API releases/latest;
+#   - «The Headscale server_url ... MUST be using https, DERP requires TLS» —
+#     комментарий config-example.yaml: DERP работает только при HTTPS server_url;
+#   - «For HTTP-01, headscale must be reachable on port 80 for the Let's Encrypt
+#     automated validation, in addition to whatever port is configured in
+#     listen_addr» — https://headscale.net/stable/ref/tls/
+#     (TLS headscale терминирует сам на listen_addr; порт 80 нужен только
+#     для валидации HTTP-01).
+# =============================================================================
+
+# --- ГЛАВНЫЙ АДРЕС -----------------------------------------------------------
+# Адрес, по которому клиенты (Windows-машина и Linux-агент) находят сервер.
+# ЗАМЕНИ hs.example.com на свой поддомен (A/AAAA-запись -> публичный IPv4 VPS).
+# Обязателен https: без TLS встроенный DERP не включится (см. факт выше).
+server_url: https://hs.example.com
+
+# Адрес, который headscale слушает внутри контейнера.
+# TLS терминируется самим headscale на этом же адресе (ACME ниже),
+# поэтому слушаем 443 сразу.
+listen_addr: 0.0.0.0:443
+
+# Метрики (/metrics, /debug). Наружу не публикуется (см. docker-compose.yml).
+# Пустое значение отключает слушатель целиком.
+metrics_listen_addr: 127.0.0.1:9090
+
+# gRPC-интерфейс удалённого управления. Не используем — CLI запускается
+# внутри контейнера через unix-сокет (см. unix_socket в конце файла).
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+
+# CIDR-список доверенных обратных прокси (X-Forwarded-For и т.п.).
+# У нас headscale стоит без реверс-прокси перед ним — оставляем пустым,
+# иначе клиенты смогут подделывать свой IP в журналах.
+trusted_proxies: []
+
+# --- КЛЮЧИ ПРОТОКОЛА ----------------------------------------------------------
+# TS2021 Noise: ключ шифрования канала «клиент <-> сервер».
+# Отсутствующий ключ генерируется автоматически при первом старте.
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+# --- АДРЕСА УЗЛОВ TAILNET -----------------------------------------------------
+# Диапазоны адресов 100.x.y.z для участников сети. Дефолт = стандартные
+# диапазоны Tailscale (CGNAT/ULA); менять НЕЛЬЗЯ наружу этих границ —
+# клиент жёстко рассчитывает на них.
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  # sequential = выдавать следующий свободный адрес; random = криптослучайно.
+  allocation: sequential
+
+# --- ВСТРОЕННЫЙ DERP-РЕЛЕЙ ----------------------------------------------------
+# DERP — TLS-релей на случай, когда прямое WireGuard-UDP соединение
+# (оба наших узла в РФ — прямое обычно работает) не устанавливается.
+# Оба порта релея уже открыты в docker-compose.yml: 443/tcp + 3478/udp.
+derp:
+  server:
+    # Встроенный DERP-сервер. Требует https server_url (факт выше).
+    enabled: true
+
+    # Идентификаторы региона в DERP-карте — дефолт headscale, не трогаем.
+    region_id: 999
+    region_code: "headscale"
+    region_name: "Headscale Embedded DERP"
+
+    # Релеять могут ТОЛЬКО зарегистрированные клиенты этого сервера.
+    # Не отключать: открытый публичный релей = бесплатный транзит чужого трафика.
+    verify_clients: true
+
+    # STUN-слушатель для NAT-traversal; при включенном сервере обязателен.
+    stun_listen_addr: "0.0.0.0:3478"
+
+    # Ключ DERP-трафика; генерируется автоматически при первом старте.
+    private_key_path: /var/lib/headscale/derp_server_private.key
+
+    # Регион встроенного DERP добавляется в DERP-карту автоматически.
+    automatically_add_embedded_derp_region: true
+
+    # Публичные адреса VPS, вшиваемые в DERP-карту (улучшает стабильность).
+    # ЗАМЕНИ на публичный IPv4 своего VPS. IPv6: раскомментируй, если есть.
+    ipv4: 203.0.113.10
+    # ipv6: 2001:db8::1
+
+  # Сторонние DERP-карты. Дефолт оставляет публичные релеи Tailscale как
+  # запасные. ПОСЛЕ проверки живого релея
+  # (`tailscale debug derp-map` + `tailscale netcheck` с клиента)
+  # можно оставить только свой: список -> []
+  # (еда за thought: пустой список = единственная точка отказа — наш VPS).
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+
+  # Локальные DERP-карты (файлы YAML) — не используем.
+  paths: []
+
+  # Автообновление сторонних DERP-карт (актуально, пока список urls не пуст).
+  auto_update_enabled: true
+  update_frequency: 3h
+
+# Проверка новых версий headscale при старте — оставить включенной.
+disable_check_updates: false
+
+# --- ЖИЗНЕННЫЙ ЦИКЛ УЗЛОВ -----------------------------------------------------
+node:
+  # 0 = узлы не истекают сами (отзыв только вручную: headscale nodes expire).
+  # Для личного tailnet из 2-3 машин это удобно.
+  expiry: 0
+  ephemeral:
+    # Через сколько неактивности удаляются ephemeral-узлы (мы их не используем).
+    inactivity_timeout: 30m
+  routes:
+    ha:
+      # Health-probe HA-подсетевых маршрутизаторов; у нас их нет — дефолт.
+      probe_interval: 10s
+      probe_timeout: 5s
+
+# --- БАЗА ---------------------------------------------------------------------
+database:
+  # SQLite официально рекомендован (Postgres — legacy, не используем).
+  type: sqlite
+  debug: false
+  gorm:
+    prepare_stmt: true
+    parameterized_queries: true
+    skip_err_record_not_found: true
+    slow_threshold: 1000
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    # WAL — рекомендация для продакшена, оставляем.
+    write_ahead_log: true
+    wal_autocheckpoint: 1000
+
+# --- TLS / ACME (Let's Encrypt) ----------------------------------------------
+# ВЫБОР СХЕМЫ TLS: сертификат получает сам headscale (ACME), без реверс-прокси
+# перед ним — на одну движущуюся часть меньше (владельческое правило
+# «один источник истины»). Обязательное условие: порты 80 и 443/tcp на VPS
+# свободны и заняты только этим контейнером. Если на том же VPS уже живёт
+# nginx/caddy с 443 — см. альтернативу в README-vps.md (раздел «TLS»).
+#
+# ACME-каталог Let's Encrypt (продакшен).
+acme_url: https://acme-v02.api.letsencrypt.org/directory
+
+# Почта для регистрации в ACME — ЗАМЕНИ на свою (уведомления LE о сроках).
+acme_email: ""
+
+# Домен сертификата — тот же поддомен, что в server_url. Пусто = ACME выключен.
+tls_letsencrypt_hostname: hs.example.com
+
+# Кэш сертификатов и ACME-аккаунта (живёт в volume ./lib — бэкапится вместе с ним).
+tls_letsencrypt_cache_dir: /var/lib/headscale/cache
+
+# Тип challenge: HTTP-01 (нужен открытый 80/tcp) или TLS-ALPN-01 (тогда
+# валидация идёт на 443, а порт 80 можно закрыть). Оставляем HTTP-01.
+tls_letsencrypt_challenge_type: HTTP-01
+# Адрес слушателя валидации HTTP-01 внутри контейнера (:http = порт 80).
+tls_letsencrypt_listen: ":http"
+
+# Готовые сертификаты (если когда-нибудь перейдёшь на реверс-прокси/свой CA).
+tls_cert_path: ""
+tls_key_path: ""
+
+# --- ЖУРНАЛ -------------------------------------------------------------------
+log:
+  # panic|fatal|error|warn|info|debug|trace
+  level: info
+  format: text
+
+# --- ПОЛИТИКИ ДОСТУПА (ACL) ---------------------------------------------------
+# Не используем: tailnet из 2-3 своих машин, доступ и так один-к-одному.
+policy:
+  mode: file
+  path: ""
+
+# --- DNS TAILNET --------------------------------------------------------------
+dns:
+  # MagicDNS (имена вида winbox.tailnet.example) не нужен — ходим по 100.x IP
+  # из ssh-конфига агента. Включишь при желании позже.
+  magic_dns: false
+  # Базовый домен MagicDNS; ОБЯЗАН отличаться от домена server_url.
+  # Оставляем плейсхолдер — headscale требует непустой FQDN.
+  base_domain: tailnet.example.com
+  # Не навязывать DNS-настройки клиентам (на Windows-машине ничего не меняем).
+  override_local_dns: false
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8
+    split: {}
+  search_domains: []
+  extra_records: []
+
+# --- CLI-СОКЕТ ----------------------------------------------------------------
+# Через него работает CLI внутри контейнера:
+#   docker compose exec headscale headscale <команда>
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+
+# --- OpenID Connect -----------------------------------------------------------
+# Вход по внешнему IdP — не используем (регистрация по preauth-ключам).
+# oidc:
+#   issuer: "https://your-oidc-issuer/path"
+#   client_id: "..."
+#   client_secret: "..."
+
+# --- ТЕЛЕМЕТРИЯ ---------------------------------------------------------------
+# logtail = журналирование активности клиентов на серверы Tailscale Inc.
+# Выключено по умолчанию — для приватного канала это и нужно, не включать.
+logtail:
+  enabled: false
+
+# --- ПРОЧЕЕ -------------------------------------------------------------------
+# Taildrop (передача файлов между узлами) — включен, не мешает.
+taildrop:
+  enabled: true
+
+# Автообновление клиентов по умолчанию — выключено (обновления только руками).
+auto_update:
+  enabled: false
+
+# tuning — тонкие параметры производительности, оставлены закомментированными
+# в примере; дефолты подобраны разработчиками.

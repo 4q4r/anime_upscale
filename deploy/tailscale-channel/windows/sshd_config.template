@@ -1,0 +1,60 @@
+# =============================================================================
+# Шаблон sshd_config переносимого sshd (Win32-OpenSSH 10.4.0.0p1-Preview).
+# Заполняется скриптом 1-install.ps1: плейсхолдеры __TSNET__ (путь к портативному
+# корню, прямые слэши) и __PORT__ заменяются на реальные значения; готовый файл
+# кладётся в <корень>\ssh\sshd_config.
+#
+# ПРОВЕРЕННЫЕ ФАКТЫ (primary sources, 2026-10-29/30):
+#  - Абсолютный путь в AuthorizedKeysFile возвращается «как есть», без
+#    приклейки к профилю: ветка WINDOWS в expand_authorized_keys() —
+#    «Return if the path is absolute. If not, prepend the '%h\'» —
+#    https://github.com/PowerShell/openssh-portable/blob/latestw_all/auth.c
+#    => путь в портативном каталоге легален, .ssh в профиле не нужен.
+#  - sshd без службы и без прав администратора — официально поддержанный
+#    режим: «sshd.exe -d ... will run sshd in interactive mode under currently
+#    logged on user ... you can only login as the 'currently logged on user'
+#    and only using 'key based auth'» —
+#    https://github.com/PowerShell/Win32-OpenSSH/wiki/Troubleshooting-Steps
+#  - SSHD обращается к своим вспомогательным бинарникам из СОБСТВЕННОГО
+#    каталога — каталог ssh/ переносить/переименовывать после установки нельзя.
+#
+# Сеть: sshd слушает ТОЛЬКО 127.0.0.1 — наружу порт не торчит, файрвол
+# не спрашивается. До tailnet-пиров порт доставляет tailscaled в userspace-режиме:
+# входящее подключение на 100.x:2222 tailscaled пересылает на 127.0.0.1:2222
+# (wgengine/netstack/netstack.go, acceptTCP: dial 127.0.0.1:<локальный порт>).
+# =============================================================================
+
+# Порт: 2222 — умышленно не 22 (на этой машине может стоять штатный sshd).
+Port __PORT__
+
+# Слушаем только loopback: портативный sshd не должен быть доступен из
+# локальной сети машины — только через tailnet (см. схему выше).
+ListenAddress 127.0.0.1
+
+# Хост-ключ сервера (генерируется 1-install.ps1, лежит в портативном каталоге).
+# Абсолютный путь, прямые слэши; в кавычках — на случай пробелов в профиле.
+HostKey "__TSNET__/ssh/ssh_host_ed25519_key"
+
+# --- АУТЕНТИФИКАЦИЯ: только публичные ключи, только текущий пользователь ------
+PubkeyAuthentication yes
+# Файл с публичными ключами агента — абсолютный путь в портативном каталоге
+# (легальность абсолютного пути: auth.c, см. шапку).
+AuthorizedKeysFile "__TSNET__/ssh/authorized_keys"
+# Пароли и интерактивные методы выключены принудительно.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+# root на Windows не существует, но запрет явный — от перестраховки.
+PermitRootLogin no
+# Строгая проверка прав на authorized_keys/хост-ключ (владелец = текущий
+# пользователь, запись чужим запрещена). Права выставляет 1-install.ps1 (icacls).
+StrictModes yes
+
+# --- ПРОЧЕЕ -------------------------------------------------------------------
+# Не тратить время на обратный DNS (у клиентских 100.x адресов его всё равно нет).
+UseDNS no
+# Писать в stdout минимум (журнал всё равно собирает супервизор в logs/sshd.log).
+LogLevel INFO
+
+# SFTP-подсистема: путь к sftp-server.exe из того же каталога (прямой слэш,
+# в кавычках — на случай пробелов в профиле).
+Subsystem sftp "__TSNET__/ssh/sftp-server.exe"
