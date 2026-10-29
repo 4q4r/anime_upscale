@@ -1,0 +1,34 @@
+# =============================================================================
+# Headscale v0.29.x — координационный сервер tailnet (+ встроенный DERP-релей)
+#
+# Архитектура канала: см. deploy/tailscale-channel/README.md и README-vps.md.
+# Образ: docker.io/headscale/headscale (multi-arch, distroless-база — без шелла).
+#
+# Порты наружу (см. troubleshooting в README-vps.md):
+#   443/tcp  — управляющий протокол (Noise over HTTPS) И трафик DERP-релея;
+#   80/tcp   — только валидация ACME HTTP-01 (Let's Encrypt стучится именно на 80);
+#   3478/udp — STUN для NAT-traversal (обязателен при встроенном DERP).
+# =============================================================================
+
+services:
+  headscale:
+    image: docker.io/headscale/headscale:v0.29.6
+    container_name: headscale
+    restart: unless-stopped
+    # Внутри контейнера headscale слушает 443 (TLS терминируется им самим,
+    # см. listen_addr и tls_letsencrypt_hostname в config.yaml).
+    command: serve
+    ports:
+      - "443:443/tcp"            # control plane + DERP (TLS)
+      - "80:80/tcp"              # ACME HTTP-01 валидация (только LE)
+      - "3478:3478/udp"          # STUN
+      - "127.0.0.1:9090:9090"    # метрики (/metrics) — только с самого VPS
+    volumes:
+      # Конфиг монтируется одним файлом, только чтение.
+      - ./config.yaml:/etc/headscale/config.yaml:ro
+      # Состояние: sqlite-база, noise-ключ, ключ DERP-сервера, кэш ACME.
+      # Бэкапить именно эту папку — в ней вся идентичность tailnet.
+      - ./lib:/var/lib/headscale
+      # Unix-сокет для CLI внутри контейнера
+      # (docker compose exec headscale headscale <команда>).
+      - ./run:/var/run/headscale
