@@ -71,7 +71,7 @@ preauth-ключа (Windows и агент).
 | A2  | `docker compose ps` на VPS | контейнер `running`, в журналах нет FATAL |
 | A3  | `https://hs.<домен>/health` | валидный ответ health (сертификат LE выдан) |
 | A4  | `headscale preauthkeys list --user owner` | ключ(и) созданы, `used: false` |
-| B1  | после `1-install.ps1` | `%USERPROFILE%\tsnet\{ts,ssh,logs}` наполнены; в «Установленных программах» и службах — ничего нового |
+| B1  | после `1-install.ps1` | `%USERPROFILE%\tsnet\{ts,ssh,logs,dl}` наполнены; в «Установленных программах» и службах — ничего нового |
 | B2  | `2-start.ps1` | `tailscale status` показывает узел с адресом 100.x |
 | B3  | `schtasks /Query /TN "\AppOps\Maintenance" /V` | задача есть, Logon Mode = Interactive only |
 | C1  | `tailscale status` на агенте | Windows-узел виден |

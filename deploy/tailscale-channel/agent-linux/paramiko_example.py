@@ -76,6 +76,9 @@ def run_command(client: paramiko.SSHClient, command: str) -> int:
     """Execute ``command`` on the Windows node and stream its output."""
     stdin, stdout, stderr = client.exec_command(command)
     stdin.close()
+    # NOTE: recv_exit_status() before draining stdout can deadlock on output
+    # larger than the channel window — fine for the probe below; if this
+    # sketch is reused for chatty commands, read stdout/stderr first.
     exit_code = stdout.channel.recv_exit_status()
     logger.info("exec %r -> exit %s", command, exit_code)
     out, err = stdout.read().decode(errors="replace"), stderr.read().decode(errors="replace")

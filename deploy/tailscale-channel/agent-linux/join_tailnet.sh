@@ -71,11 +71,11 @@ if [ -n "$WIN_HOST" ]; then
     if [ "$MODE" = "tun" ]; then
         ssh -o BatchMode=yes -p "$WIN_PORT" "$WIN_HOST" true \
             && echo 'Канал SSH поднят (tun: прямое подключение).' \
-            || echo 'SSH не прошел — смотри Troubleshooting в README-agent.md'
+            || echo 'SSH не прошел — смотри Troubleshooting в README-agent.md (имя пользователя Windows может отличаться — задай его: ssh user@...)'
     else
         ssh -o BatchMode=yes -o "ProxyCommand=nc -x ${SOCKS_ADDR} %h %p" \
             -p "$WIN_PORT" "$WIN_HOST" true \
             && echo 'Канал SSH поднят (userspace: через SOCKS5).' \
-            || echo 'SSH не прошел — смотри Troubleshooting в README-agent.md'
+            || echo 'SSH не прошел — смотри Troubleshooting в README-agent.md (имя пользователя Windows может отличаться — задай его: ssh user@...)'
     fi
 fi

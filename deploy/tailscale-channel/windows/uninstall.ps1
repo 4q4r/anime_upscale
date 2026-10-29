@@ -36,8 +36,9 @@ Write-Host '[2/4] Останавливаю процессы портативно
 # cmd-супервизор — по командной строке (у cmd.exe путь системный, путь к
 # каталогу виден только в аргументах).
 $victims = Get-CimInstance Win32_Process | Where-Object {
-    ($_.ExecutablePath -ne $null -and $_.ExecutablePath -like "$Root*") -or
-    ($_.CommandLine -ne $null -and $_.CommandLine -like "*$Root*")
+    ($_.ProcessId -ne $PID) -and
+    (($_.ExecutablePath -ne $null -and $_.ExecutablePath -like "$Root*") -or
+     ($_.CommandLine -ne $null -and $_.CommandLine -like "*$Root*"))
 }
 foreach ($p in $victims) {
     Write-Host ("  PID {0}: {1}" -f $p.ProcessId, $p.Name)
@@ -53,8 +54,9 @@ if (Test-Path $Root) { Remove-Item -LiteralPath $Root -Recurse -Force }
 Write-Host '[4/4] Проверка'
 $leftTask = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
 $leftProc = Get-CimInstance Win32_Process | Where-Object {
-    ($_.ExecutablePath -ne $null -and $_.ExecutablePath -like "$Root*") -or
-    ($_.CommandLine -ne $null -and $_.CommandLine -like "*$Root*")
+    ($_.ProcessId -ne $PID) -and
+    (($_.ExecutablePath -ne $null -and $_.ExecutablePath -like "$Root*") -or
+     ($_.CommandLine -ne $null -and $_.CommandLine -like "*$Root*"))
 }
 if (-not (Test-Path $Root) -and -not $leftTask -and -not $leftProc) {
     Write-Host 'Удалено полностью: задачи нет, процессов нет, файлов нет.'

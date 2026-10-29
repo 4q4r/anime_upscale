@@ -30,6 +30,9 @@ $AuthKey = 'ВСТАВЬ_КЛЮЧ_ЗДЕСЬ'
 $Root = Join-Path $env:USERPROFILE 'tsnet'
 # ===================== /НАСТРОЙКИ ============================================
 
+if ([string]::IsNullOrWhiteSpace($LoginServer) -or $LoginServer -match 'example\.com') {
+    throw 'Не заполнен $LoginServer — впиши адрес своего Headscale-сервера в блоке НАСТРОЙКИ.'
+}
 if ($AuthKey -match 'ВСТАВЬ|CHANGE' -or [string]::IsNullOrWhiteSpace($AuthKey)) {
     throw 'Не заполнен $AuthKey — создай preauth-ключ на VPS и впиши его в блок НАСТРОЙКИ.'
 }
@@ -80,5 +83,6 @@ if ($sshdRunning) {
 
 Write-Host ''
 Write-Host 'Канал поднят. 100.x-адрес узла — в статусе выше.'
+Write-Host 'Ключ одноразовый: после успешной регистрации сотри его из этого скрипта (в файле он больше не нужен).'
 Write-Host 'Проверка с Linux-агента: ssh -p 2222 <пользователь>@<100.x-адрес>'
 Write-Host 'Автозапуск при входе: install-task.ps1'

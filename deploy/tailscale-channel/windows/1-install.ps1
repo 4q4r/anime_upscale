@@ -26,6 +26,8 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # Invoke-WebRequest без полосы прогресса (в разы быстрее)
+# Пояс TLS для старых хостов (Server 2016-): гарантируем TLS 1.2 для Invoke-WebRequest.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
 
 # ======================= НАСТРОЙКИ (заполнить!) ==============================
 # Адрес координатора (Headscale на VPS) — тот же, что server_url на сервере.
@@ -76,7 +78,10 @@ if (-not (Test-Path $msiPath)) {
 # регистрируется: ни записи в реестре установок, ни служб, ни драйверов.
 $msiExtract = Join-Path $dirDl 'msi-extract'
 if (Test-Path $msiExtract) { Remove-Item $msiExtract -Recurse -Force }
-Start-Process -FilePath 'msiexec.exe' -ArgumentList "/a `"$msiPath`" /qn TARGETDIR=`"$msiExtract`"" -Wait
+$msiProc = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/a `"$msiPath`" /qn TARGETDIR=`"$msiExtract`"" -Wait -PassThru
+if ($msiProc.ExitCode -ne 0) {
+    throw "msiexec /a (шаг 2: распаковка MSI Tailscale) завершился с кодом $($msiProc.ExitCode) — файлы не извлечены."
+}
 
 # Извлечённые бинарники ищем в глубине распаковки (раскладка MSI зависит от версии).
 $tscaledExe = Get-ChildItem -Path $msiExtract -Recurse -Filter 'tailscaled.exe' | Select-Object -First 1
@@ -138,7 +143,13 @@ if (-not (Test-Path $authKeys)) {
 # Администраторы/SYSTEM и запись только им; наследуемые ACL обычно проходят,
 # icacls делает это детерминированным.
 icacls $authKeys /inheritance:r /grant:r "$($env:USERNAME):F" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "icacls (шаг 6: права на authorized_keys) завершился с кодом $LASTEXITCODE — sshd может отклонить ключ по StrictModes."
+}
 icacls $hostKey /inheritance:r /grant:r "$($env:USERNAME):F" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "icacls (шаг 6: права на хост-ключ) завершился с кодом $LASTEXITCODE — sshd откажет стартовать по StrictModes."
+}
 Write-Host "[6/7] authorized_keys: $authKeys — ВСТАВЬ публичный ключ агента одной строкой!"
 
 # --- 7. Лаунчеры в корень портативного каталога --------------------------------
