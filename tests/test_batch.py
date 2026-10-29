@@ -50,7 +50,7 @@ def test_batch_continues_after_failure_and_exits_nonzero(
     _tmp_project(tmp_path, monkeypatch)
     calls: list[str] = []
 
-    def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None):
+    def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
         from anime_upscale.pipeline import PipelineError
 
         calls.append(source.name)
@@ -84,7 +84,7 @@ def test_batch_all_ok_exits_zero(
     _tmp_project(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "anime_upscale.pipeline.run_pipeline",
-        lambda ctx, s, o, ffmpeg_path, progress_update=None: (60, 1),
+        lambda ctx, s, o, ffmpeg_path, progress_update=None, **_kw: (60, 1),
     )
     monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
     monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
@@ -136,7 +136,7 @@ def test_upload_failure_gets_dedicated_exit_3(
     _tmp_project(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "anime_upscale.pipeline.run_pipeline",
-        lambda ctx, s, o, ffmpeg_path, progress_update=None: (60, 1),
+        lambda ctx, s, o, ffmpeg_path, progress_update=None, **_kw: (60, 1),
     )
 
     def fake_upload(path: object, client: object, reporter: object, progress: object = None) -> str:
@@ -162,7 +162,7 @@ def test_pipeline_failure_outranks_upload_failure_on_mixed_batch(
 
     _tmp_project(tmp_path, monkeypatch)
 
-    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None):
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
         if source.name == "b.mkv":
             raise PipelineError("батч-фейк: декодер умер")
         return (60, 1)
@@ -249,7 +249,7 @@ def _patch_batch_harness(
             reporter.progress_bytes("Загрузка", percent, 100)
         return input_dir / name
 
-    def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None):
+    def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
         events.append(f"pipeline:{source.name}")
         if fail_pipeline_for and source.name in fail_pipeline_for:
             from anime_upscale.pipeline import PipelineError
@@ -470,7 +470,7 @@ def test_upload_time_network_error_gets_dedicated_exit_3(
     (tmp_path / "output" / "a.mkv").write_bytes(b"x")
     monkeypatch.setattr(
         "anime_upscale.pipeline.run_pipeline",
-        lambda ctx, s, o, ffmpeg_path, progress_update=None: (60, 1),
+        lambda ctx, s, o, ffmpeg_path, progress_update=None, **_kw: (60, 1),
     )
     monkeypatch.setattr(cli, "GofileClient", DeadClient)
     monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
@@ -559,7 +559,7 @@ def test_batch_with_seed_proceeds(
 
     ran: list[str] = []
 
-    def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None):
+    def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
         ran.append(source.name)
         return (60, 1)
 

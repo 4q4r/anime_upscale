@@ -228,6 +228,7 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
             ffmpeg_path,
             output_override=output_override,
             upload_enabled=run.upload,
+            auto_repair=not bool(config.tools.ffmpeg),
         )
         if outcome is None:
             # Per-entry phase terminator (live-bug fix 2026-10-29): the ✓ line
@@ -280,6 +281,7 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     *,
     output_override: str | None = None,
     upload_enabled: bool,
+    auto_repair: bool,
 ) -> tuple[str, str] | None:
     """
     Run one batch entry (fetch → pipeline → optional upload).
@@ -308,7 +310,12 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
         progress = ProgressThrottle(reporter, label=f"[{item.name}] Обработка").callback()
 
         pipeline_mod.run_pipeline(
-            ctx, source_path, output_path, ffmpeg_path=ffmpeg_path, progress_update=progress
+            ctx,
+            source_path,
+            output_path,
+            ffmpeg_path=ffmpeg_path,
+            progress_update=progress,
+            auto_repair=auto_repair,
         )
         if upload_enabled:
             upload_output(

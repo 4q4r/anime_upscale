@@ -155,6 +155,15 @@ def _list_x265_encoders(ffmpeg: str, runner: Any) -> list[str]:  # noqa: ANN401
     return [line for line in _decode(completed.stdout).splitlines() if "x265" in line]
 
 
+def probe_10bit(
+    ffmpeg: str,
+    runner: Any = None,  # noqa: ANN401 - subprocess.run-shaped callable
+) -> tuple[bool, str]:
+    """Public 10-bit capability probe (the repair ladder's re-verification step)."""
+    run = runner if runner is not None else subprocess.run
+    return _run_probe(ffmpeg, _PROBE_FMT_10BIT, run)
+
+
 def diagnose_encoder(
     ffmpeg: str,
     tail_text: str,
