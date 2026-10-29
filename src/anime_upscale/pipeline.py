@@ -14,7 +14,9 @@ from pathlib import Path
 
 import vapoursynth as vs
 
+from anime_upscale import ffmpeg_repair
 from anime_upscale.ffmpeg import build_mux_args, finish_encoder, spawn_encoder
+from anime_upscale.ffmpeg_repair import verdict_wants_reinstall
 from anime_upscale.stages import (  # noqa: F401 - descale/deband/interpolate/upscale register via import
     STAGE_BUILDERS,
     StageContext,
@@ -73,14 +75,50 @@ def check_target_fps(source_fps: Fraction, target_fps: tuple[int, int]) -> None:
         raise PipelineError(msg)
 
 
-def run_pipeline(
+def run_pipeline(  # noqa: PLR0913 - driver signature + repair-retry controls
+    ctx: StageContext,
+    input_path: Path,
+    output_path: Path,
+    ffmpeg_path: str,
+    progress_update: Callable[[int, int], None] | None = None,
+    *,
+    auto_repair: bool = True,
+    _repair_attempted: bool = False,
+) -> tuple[int, int]:
+    """
+    Run the full chain for ONE input file; returns the output fps as (num, den).
+
+    Zero-touch repair: a diagnosis verdict meaning «this build cannot encode»
+    (absent libx265 / no 10-bit / dead 8-bit) triggers the winget reinstall
+    ladder once and retries the entry with the new binary. «Причина в другом»
+    and second failures stay loud terminal errors (continue-and-summarize
+    untouched: the batch loop decides what a dead entry means).
+    """
+    try:
+        return _run_pipeline_once(ctx, input_path, output_path, ffmpeg_path, progress_update)
+    except (RuntimeError, PipelineError) as exc:
+        # PipelineError is the carrier a REAL dead build arrives in: the
+        # first-frame encoder-open failure breaks the y4m write (EPIPE/EINVAL)
+        # and the OSError handler converts the verdict-carrying RuntimeError
+        # into PipelineError (not a RuntimeError subclass — live-verified).
+        # RuntimeError covers the post-stream finish_encoder failures.
+        report = str(exc)
+        if _repair_attempted or not verdict_wants_reinstall(report):
+            raise
+        repaired = ffmpeg_repair.repair_ffmpeg_build(
+            report, ctx.reporter, override_pinned=not auto_repair
+        )
+        return _run_pipeline_once(ctx, input_path, output_path, str(repaired), progress_update)
+
+
+def _run_pipeline_once(
     ctx: StageContext,
     input_path: Path,
     output_path: Path,
     ffmpeg_path: str,
     progress_update: Callable[[int, int], None] | None = None,
 ) -> tuple[int, int]:
-    """Run the full chain for ONE input file; returns the output fps as (num, den)."""
+    """Run the pipeline body (decode → graph → encode); called directly or retried."""
     core = vs.core
     try:
         clip = core.bs.VideoSource(str(input_path))  # ty: ignore[unresolved-attribute]

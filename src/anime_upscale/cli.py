@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from anime_upscale import ffmpeg_repair
 from anime_upscale.config import (
     Config,
     ConfigError,
@@ -218,6 +219,12 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     results: list[tuple[str, bool, str]] = []
     failures = {"pipeline": False, "upload": False}
     for index, item in enumerate(queue, start=1):
+        # M1: an earlier entry's successful repair replaces the stale resolved
+        # path, so later entries start directly on the repaired binary instead
+        # of re-dying on the old build (one ladder per process).
+        repaired = ffmpeg_repair.repaired_ffmpeg()
+        if repaired is not None:
+            ffmpeg_path = str(repaired)
         reporter.file_banner(index, len(queue), item.name)
         outcome = _process_entry(
             ctx,
@@ -228,6 +235,7 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
             ffmpeg_path,
             output_override=output_override,
             upload_enabled=run.upload,
+            auto_repair=not bool(config.tools.ffmpeg),
         )
         if outcome is None:
             # Per-entry phase terminator (live-bug fix 2026-10-29): the ✓ line
@@ -280,6 +288,7 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     *,
     output_override: str | None = None,
     upload_enabled: bool,
+    auto_repair: bool,
 ) -> tuple[str, str] | None:
     """
     Run one batch entry (fetch → pipeline → optional upload).
@@ -308,7 +317,12 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
         progress = ProgressThrottle(reporter, label=f"[{item.name}] Обработка").callback()
 
         pipeline_mod.run_pipeline(
-            ctx, source_path, output_path, ffmpeg_path=ffmpeg_path, progress_update=progress
+            ctx,
+            source_path,
+            output_path,
+            ffmpeg_path=ffmpeg_path,
+            progress_update=progress,
+            auto_repair=auto_repair,
         )
         if upload_enabled:
             upload_output(
