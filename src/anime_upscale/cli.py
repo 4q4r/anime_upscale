@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from anime_upscale import ffmpeg_repair
 from anime_upscale.config import (
     Config,
     ConfigError,
@@ -218,6 +219,12 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     results: list[tuple[str, bool, str]] = []
     failures = {"pipeline": False, "upload": False}
     for index, item in enumerate(queue, start=1):
+        # M1: an earlier entry's successful repair replaces the stale resolved
+        # path, so later entries start directly on the repaired binary instead
+        # of re-dying on the old build (one ladder per process).
+        repaired = ffmpeg_repair.repaired_ffmpeg()
+        if repaired is not None:
+            ffmpeg_path = str(repaired)
         reporter.file_banner(index, len(queue), item.name)
         outcome = _process_entry(
             ctx,

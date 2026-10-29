@@ -1,7 +1,13 @@
 """Auto-reinstall ladder tests: verdict trigger matrix, winget uninstall/install,
-locator (Links-first + Packages walk), override interaction, retry-once flow."""
+locator (Links-first + Packages walk), override interaction, retry-once flow.
+
+The C1 real-path test drives run_pipeline through the ACTUAL production chain
+(decode → spawn → dead-encoder EPIPE → PipelineError conversion → real
+diagnose_encoder → repair) with only the subprocess/winget layer mocked."""
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +76,7 @@ class _WingetRunner:
         install_stderr: bytes = b"",
         probe_ok: bool = True,
         encoders_stdout: bytes = b"",
+        probe_rc_by_fmt: dict[str, int] | None = None,
     ) -> None:
         self.list_output = list_output
         self.list_rc = list_rc
@@ -77,6 +84,7 @@ class _WingetRunner:
         self.install_stderr = install_stderr
         self.probe_ok = probe_ok
         self.encoders_stdout = encoders_stdout
+        self.probe_rc_by_fmt = probe_rc_by_fmt or {}
         self.calls: list[list[str]] = []
 
     def __call__(self, args: list[str], **_kwargs: Any) -> Any:
@@ -99,8 +107,10 @@ class _WingetRunner:
                 stderr=self.install_stderr,
             )
         if "-pix_fmt" in args:  # 10-bit probe against the newly installed binary
+            pix_fmt = args[args.index("-pix_fmt") + 1]
+            returncode = self.probe_rc_by_fmt.get(pix_fmt, 0 if self.probe_ok else 1)
             return subprocess.CompletedProcess(
-                args=args, returncode=0 if self.probe_ok else 1, stdout=b"", stderr=b"probe stderr"
+                args=args, returncode=returncode, stdout=b"", stderr=b"probe stderr"
             )
         return subprocess.CompletedProcess(args=args, returncode=0, stdout=b"", stderr=b"")
 
@@ -112,6 +122,14 @@ _WINGET_LIST_WITH_FFMPEG = (
     "Broken Builds     Other.FFmpeg.old  1.0       winget\r\n"
     "Shim only         Microsoft.FFmpegOverloads   1.0  winget\r\n"
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_repair_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M1 cache isolation: every test starts with no repair state."""
+    import anime_upscale.ffmpeg_repair as repair_mod
+
+    monkeypatch.setattr(repair_mod, "_repair_state", {"repaired": None, "error": None})
 
 
 class TestVerdictWantsReinstall:
@@ -319,7 +337,11 @@ class TestRepairFfmpegBuild:
 
 
 class TestPipelineRetryOnce:
-    """The retry wiring: repair verdict → one automatic re-run with the new binary."""
+    """The retry wiring: repair verdict → one automatic re-run with the new binary.
+
+    The carrier here is PipelineError on purpose: a first-frame encoder-open
+    death reaches run_pipeline through the EPIPE handler's PipelineError
+    conversion (C1) — RuntimeError only carries the post-stream failures."""
 
     def _ctx(self) -> Any:
         from anime_upscale.reporting import Reporter, resolve_mode
@@ -335,6 +357,7 @@ class TestPipelineRetryOnce:
     ) -> None:
         import anime_upscale.ffmpeg_repair as repair_mod
         import anime_upscale.pipeline as pipeline_mod
+        from anime_upscale.pipeline import PipelineError
 
         new_binary = tmp_path / "new" / "ffmpeg.exe"
         calls: list[str] = []
@@ -342,7 +365,7 @@ class TestPipelineRetryOnce:
         def fake_once(ctx, input_path, output_path, ffmpeg_path, progress_update=None):
             calls.append(ffmpeg_path)
             if len(calls) == 1:
-                raise RuntimeError(_10BIT_VERDICT)
+                raise PipelineError(_10BIT_VERDICT)
             return (60, 1)
 
         def fake_repair(report, reporter, runner=None, override_pinned=False):
@@ -357,14 +380,41 @@ class TestPipelineRetryOnce:
         )
         assert calls == ["ffmpeg", str(new_binary)]
 
+    def test_runtime_error_carrier_also_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Post-stream finish_encoder failures keep the raw RuntimeError carrier —
+        the catch tuple must serve both."""
+        import anime_upscale.ffmpeg_repair as repair_mod
+        import anime_upscale.pipeline as pipeline_mod
+
+        new_binary = tmp_path / "new" / "ffmpeg.exe"
+        calls: list[str] = []
+
+        def fake_once(ctx, input_path, output_path, ffmpeg_path, progress_update=None):
+            calls.append(ffmpeg_path)
+            if len(calls) == 1:
+                raise RuntimeError(_10BIT_VERDICT)
+            return (60, 1)
+
+        monkeypatch.setattr(pipeline_mod, "_run_pipeline_once", fake_once)
+        monkeypatch.setattr(repair_mod, "repair_ffmpeg_build", lambda *a, **k: new_binary)
+        monkeypatch.setattr(pipeline_mod, "verdict_wants_reinstall", lambda _r: True)
+        assert pipeline_mod.run_pipeline(self._ctx(), Path("a.mkv"), Path("o.mkv"), "ffmpeg") == (
+            60,
+            1,
+        )
+        assert calls == ["ffmpeg", str(new_binary)]
+
     def test_other_cause_failure_does_not_repair(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import anime_upscale.ffmpeg_repair as repair_mod
         import anime_upscale.pipeline as pipeline_mod
+        from anime_upscale.pipeline import PipelineError
 
         def fake_once(ctx, input_path, output_path, ffmpeg_path, progress_update=None):
-            raise RuntimeError(_OTHER_VERDICT)
+            raise PipelineError(_OTHER_VERDICT)
 
         def no_repair(*a: Any, **k: Any) -> Path:
             msg = "repair must not be called"
@@ -373,7 +423,7 @@ class TestPipelineRetryOnce:
         monkeypatch.setattr(pipeline_mod, "_run_pipeline_once", fake_once)
         monkeypatch.setattr(repair_mod, "repair_ffmpeg_build", no_repair)
         monkeypatch.setattr(pipeline_mod, "verdict_wants_reinstall", lambda _r: False)
-        with pytest.raises(RuntimeError, match="причина в другом"):
+        with pytest.raises(PipelineError, match="причина в другом"):
             pipeline_mod.run_pipeline(self._ctx(), Path("a.mkv"), Path("o.mkv"), "ffmpeg")
 
     def test_second_failure_after_repair_is_terminal(
@@ -381,9 +431,10 @@ class TestPipelineRetryOnce:
     ) -> None:
         import anime_upscale.ffmpeg_repair as repair_mod
         import anime_upscale.pipeline as pipeline_mod
+        from anime_upscale.pipeline import PipelineError
 
         def fake_once(ctx, input_path, output_path, ffmpeg_path, progress_update=None):
-            raise RuntimeError(_ABSENT_VERDICT)
+            raise PipelineError(_ABSENT_VERDICT)
 
         monkeypatch.setattr(pipeline_mod, "_run_pipeline_once", fake_once)
         monkeypatch.setattr(
@@ -392,5 +443,202 @@ class TestPipelineRetryOnce:
             lambda *a, **k: tmp_path / "ffmpeg.exe",
         )
         monkeypatch.setattr(pipeline_mod, "verdict_wants_reinstall", lambda _r: True)
-        with pytest.raises(RuntimeError, match="ДИАГНОСТИКА"):
+        with pytest.raises(PipelineError, match="ДИАГНОСТИКА"):
             pipeline_mod.run_pipeline(self._ctx(), Path("a.mkv"), Path("o.mkv"), "ffmpeg")
+
+
+class TestRealDiagnosisVerdictPins:
+    """N1: all four verdicts pinned through the REAL diagnose_encoder."""
+
+    _LIBX265_LINE = b" V....D libx265              libx265 H.265 / HEVC\n"
+
+    def test_absent_verdict_triggers(self) -> None:
+        report = diagnose_encoder("ffmpeg", "Unknown encoder 'libx265'", runner=_WingetRunner())
+        assert "libx265 отсутствует в этой сборке ffmpeg" in report
+        assert verdict_wants_reinstall(report) is True
+
+    def test_ten_bit_unsupported_verdict_triggers(self) -> None:
+        runner = _WingetRunner(
+            encoders_stdout=self._LIBX265_LINE,
+            probe_rc_by_fmt={"yuv420p10le": 1, "yuv420p": 0},
+        )
+        report = diagnose_encoder("ffmpeg", "Cannot open libx265 encoder.", runner=runner)
+        assert "10-бит (Main10) не поддерживается" in report
+        assert verdict_wants_reinstall(report) is True
+
+    def test_eight_bit_dead_verdict_triggers(self) -> None:
+        runner = _WingetRunner(
+            encoders_stdout=self._LIBX265_LINE,
+            probe_rc_by_fmt={"yuv420p10le": 1, "yuv420p": 1},
+        )
+        report = diagnose_encoder("ffmpeg", "Cannot open libx265 encoder.", runner=runner)
+        assert "не работает даже 8-битное кодирование" in report
+        assert verdict_wants_reinstall(report) is True
+
+    def test_other_cause_verdict_does_not_trigger(self) -> None:
+        runner = _WingetRunner(encoders_stdout=self._LIBX265_LINE, probe_ok=True)
+        report = diagnose_encoder("ffmpeg", "Cannot open libx265 encoder.", runner=runner)
+        assert "10-бит работает — причина в другом" in report
+        assert verdict_wants_reinstall(report) is False
+
+
+class TestRepairCache:
+    """M1: the ladder runs ONCE per process; later entries reuse the result."""
+
+    def test_second_call_reuses_cached_path_without_winget(self) -> None:
+        links = Path("/fake-localappdata/Microsoft/WinGet/Links")
+        cached = links / "ffmpeg.exe"
+        import anime_upscale.ffmpeg_repair as repair_mod
+
+        repair_mod._repair_state["repaired"] = cached
+        runner = _WingetRunner(list_output=_WINGET_LIST_WITH_FFMPEG)
+        reporter = _NotesReporter()
+        assert repair_ffmpeg_build(_ABSENT_VERDICT, reporter, runner=runner) == cached
+        assert runner.calls == []  # no winget traffic for the second entry
+
+    def test_terminal_failure_is_cached_not_retried(self) -> None:
+        import anime_upscale.ffmpeg_repair as repair_mod
+
+        repair_mod._repair_state["error"] = "прежняя терминальная ошибка"
+        runner = _WingetRunner(list_output=_WINGET_LIST_WITH_FFMPEG)
+        with pytest.raises(RuntimeError, match="повтор не выполняется"):
+            repair_ffmpeg_build(_ABSENT_VERDICT, _NotesReporter(), runner=runner)
+        assert runner.calls == []
+
+
+class TestDeadBuildRealPath:
+    """C1: the ACTUAL production chain — decode → dead-encoder spawn → EPIPE →
+    PipelineError conversion → real diagnose_encoder → repair → real retry.
+    Only the subprocess/winget layer is mocked; the conversion itself is not."""
+
+    @pytest.fixture
+    def real_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Tiny real clip + fake dead ffmpeg + fake winget env with a shim that
+        symlinks to the REAL ffmpeg binary (the 'installed full build')."""
+        pytest.importorskip("vapoursynth")
+        real_ffmpeg = shutil.which("ffmpeg")
+        if real_ffmpeg is None:
+            pytest.skip("ffmpeg not on PATH")
+        src = tmp_path / "in.mkv"
+        subprocess.run(  # noqa: S603 - fixed argv, resolved binary
+            [
+                real_ffmpeg,
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=160x120:d=0.125",
+                "-frames:v",
+                "3",
+                "-c:v",
+                "ffv1",
+                str(src),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        fake = tmp_path / "fake-ffmpeg"
+        fake.write_text("#!/bin/sh\necho 'Cannot open libx265 encoder.' >&2\nexit 1\n")
+        fake.chmod(0o755)
+        links = tmp_path / "Microsoft" / "WinGet" / "Links"
+        links.mkdir(parents=True)
+        (links / "ffmpeg.exe").symlink_to(real_ffmpeg)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        import anime_upscale.ffmpeg_repair as repair_mod
+
+        monkeypatch.setattr(repair_mod, "_winget_bin", lambda: "winget")
+        return fake
+
+    def _ctx(self) -> Any:
+        from anime_upscale.config import (
+            DebandConfig,
+            DescaleConfig,
+            EncodeConfig,
+            InterpolateConfig,
+            RunConfig,
+            UpscaleConfig,
+        )
+        from anime_upscale.hardware import HardwareProfile
+        from anime_upscale.reporting import Reporter, resolve_mode
+        from anime_upscale.stages import StageContext
+
+        hw = HardwareProfile(
+            gpus=(),
+            gpu_count=0,
+            cpu_logical_cores=4,
+            num_streams_per_gpu=0,
+            encode_threads=2,
+            precision="none",
+        )
+        run = RunConfig(
+            stages=("encode",),
+            descale=DescaleConfig(),
+            deband=DebandConfig(),
+            upscale=UpscaleConfig(),
+            interpolate=InterpolateConfig(trt=False),
+            encode=EncodeConfig(),
+            descale_height=None,
+            upload=False,
+        )
+        return StageContext(
+            run=run,
+            hardware=hw,
+            project_root=None,
+            reporter=Reporter(resolve_mode(no_color=True, no_tty=True)),
+            models_dir=None,
+            models_manifest=None,
+        )  # type: ignore[arg-type]
+
+    def _dispatching_run(self, winget_calls: list[list[str]]):
+        real_run = subprocess.run
+
+        def dispatch(args: list[str], **kwargs: Any) -> Any:
+            if args[0] == "winget":
+                winget_calls.append(args)
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout=b"", stderr=b"")
+            return real_run(args, **kwargs)
+
+        return dispatch
+
+    def test_dead_build_runs_the_ladder_and_succeeds_on_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_env: Path
+    ) -> None:
+        import anime_upscale.ffmpeg_repair as repair_mod
+        import anime_upscale.pipeline as pipeline_mod
+
+        winget_calls: list[list[str]] = []
+        monkeypatch.setattr(repair_mod.subprocess, "run", self._dispatching_run(winget_calls))
+        out = tmp_path / "out.mkv"
+        result = pipeline_mod.run_pipeline(
+            self._ctx(), tmp_path / "in.mkv", out, ffmpeg_path=str(real_env)
+        )
+        assert result[0] > 0  # the retry actually encoded on the repaired binary
+        assert out.is_file()
+        installs = [c for c in winget_calls if "install" in c]
+        assert len(installs) == 1
+        assert "--id" in installs[0] and "Gyan.FFmpeg" in installs[0]
+
+    def test_two_dead_entries_install_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_env: Path
+    ) -> None:
+        """M1 end-to-end: two consecutive dead-build entries in one batch —
+        the winget install fires exactly once; the second entry reuses the
+        cached repaired binary."""
+        import anime_upscale.ffmpeg_repair as repair_mod
+        import anime_upscale.pipeline as pipeline_mod
+
+        second_src = tmp_path / "in2.mkv"
+        shutil.copy2(tmp_path / "in.mkv", second_src)
+        winget_calls: list[list[str]] = []
+        monkeypatch.setattr(repair_mod.subprocess, "run", self._dispatching_run(winget_calls))
+        for name in ("in.mkv", "in2.mkv"):
+            out = tmp_path / f"out-{name}.mkv"
+            result = pipeline_mod.run_pipeline(
+                self._ctx(), tmp_path / name, out, ffmpeg_path=str(real_env)
+            )
+            assert result[0] > 0
+            assert out.is_file()
+        installs = [c for c in winget_calls if "install" in c]
+        assert len(installs) == 1

@@ -96,7 +96,12 @@ def run_pipeline(  # noqa: PLR0913 - driver signature + repair-retry controls
     """
     try:
         return _run_pipeline_once(ctx, input_path, output_path, ffmpeg_path, progress_update)
-    except RuntimeError as exc:
+    except (RuntimeError, PipelineError) as exc:
+        # PipelineError is the carrier a REAL dead build arrives in: the
+        # first-frame encoder-open failure breaks the y4m write (EPIPE/EINVAL)
+        # and the OSError handler converts the verdict-carrying RuntimeError
+        # into PipelineError (not a RuntimeError subclass — live-verified).
+        # RuntimeError covers the post-stream finish_encoder failures.
         report = str(exc)
         if _repair_attempted or not verdict_wants_reinstall(report):
             raise

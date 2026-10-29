@@ -55,6 +55,20 @@ _MANUAL_LINKS = (
 
 _WINGET_DOC = "https://learn.microsoft.com/windows/package-manager/winget/"
 
+# Run-level repair state (M1): the ladder must run ONCE per process. A later
+# batch entry reuses the repaired binary directly instead of re-dying on the
+# stale resolved path and re-running uninstall+install (~30 min churn on an
+# 11-episode album). Terminal failures are cached the same way so a dead
+# environment fails fast on every following entry instead of re-rolling it.
+_repair_state: dict[str, Path | str | None] = {"repaired": None, "error": None}
+
+
+def repaired_ffmpeg() -> Path | None:
+    """Return the ffmpeg path a successful repair produced in this process."""
+    repaired = _repair_state["repaired"]
+    return repaired if isinstance(repaired, Path) else None
+
+
 _LIST_TIMEOUT_S = 120
 
 
@@ -200,12 +214,24 @@ def repair_ffmpeg_build(
             "(установленная полная сборка будет найдена в PATH)."
         )
         raise RuntimeError(msg)
+    if _repair_state["repaired"] is not None:
+        reporter.note(
+            f"ffmpeg уже переустановлен в этом запуске — используется: {_repair_state['repaired']}"
+        )
+        return repaired_ffmpeg()
+    if _repair_state["error"] is not None:
+        msg = (
+            f"{_repair_state['error']}\n"
+            "(переустановка уже завершалась ошибкой в этом запуске — повтор не выполняется.)"
+        )
+        raise RuntimeError(msg)
     if _winget_bin() is None:
         msg = (
             "winget не найден — автоматическая переустановка ffmpeg невозможна. "
             f"Установите winget: {_WINGET_DOC} "
             "либо установите полную сборку ffmpeg вручную:\n" + _MANUAL_LINKS
         )
+        _repair_state["error"] = msg
         raise RuntimeError(msg)
 
     run = runner if runner is not None else subprocess.run
@@ -221,6 +247,7 @@ def repair_ffmpeg_build(
             f"{_WINGET_TIMEOUT_S} с — установка не завершилась.\n"
             "Установите полную сборку ffmpeg вручную:\n" + _MANUAL_LINKS
         )
+        _repair_state["error"] = msg
         raise RuntimeError(msg) from exc
 
     located = locate_winget_ffmpeg()
@@ -233,6 +260,7 @@ def repair_ffmpeg_build(
             f"Хвост вывода winget:\n{tail_text}\n"
             "Установите полную сборку ffmpeg вручную:\n" + _MANUAL_LINKS
         )
+        _repair_state["error"] = msg
         raise RuntimeError(msg)
 
     reporter.line("[ЭТАП] Проверяю 10-битное кодирование…")
@@ -243,9 +271,11 @@ def repair_ffmpeg_build(
             f"Установленный {_WINGET_ID} не прошёл 10-битную пробу: {probe_error}\n"
             "Установите полную сборку ffmpeg вручную:\n" + _MANUAL_LINKS
         )
+        _repair_state["error"] = msg
         raise RuntimeError(msg)
 
     links_dir = located.parent
     os.environ["PATH"] = str(links_dir) + os.pathsep + os.environ.get("PATH", "")
     reporter.success(f"✓ ffmpeg готов: {located}")
+    _repair_state["repaired"] = located
     return located

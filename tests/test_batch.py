@@ -567,3 +567,41 @@ def test_batch_with_seed_proceeds(
     exit_code = cli.main(["--profile", "itp", "-i", "a.mkv", "--config", "config.toml"])
     assert exit_code == 0
     assert ran == ["a.mkv"]
+
+
+def test_cli_wires_auto_repair_from_tools_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N2 pin: `auto_repair = not bool(config.tools.ffmpeg)` reaches run_pipeline
+    from the real cli path (fakes assert the flag, not just absorb it)."""
+    _tmp_project(tmp_path, monkeypatch)
+    captured: list[bool] = []
+
+    def fake_run_pipeline(
+        ctx, source, output, ffmpeg_path, progress_update=None, *, auto_repair=True, **_kw
+    ):
+        captured.append(auto_repair)
+        return (60, 1)
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+
+    cli.main(["--profile", "enc", "-i", "a.mkv", "--config", "config.toml"])
+    assert captured == [True]  # no override → repair ladder allowed
+
+    pinned = tmp_path / "pinned-ffmpeg"
+    pinned.write_text("#!/bin/sh\nexit 0\n")
+    pinned.chmod(0o755)
+    (tmp_path / "config.toml").write_text(
+        "[pipeline]\n"
+        'order = ["descale", "deband", "upscale", "interpolate", "encode"]\n'
+        "[stages.encode]\n"
+        "crf = 16\n"
+        "[profiles.enc]\n"
+        'stages = ["encode"]\n'
+        "[tools]\n"
+        f'ffmpeg = "{pinned.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    cli.main(["--profile", "enc", "-i", "a.mkv", "--config", "config.toml"])
+    assert captured == [True, False]  # pinned [tools] ffmpeg → ladder disabled
