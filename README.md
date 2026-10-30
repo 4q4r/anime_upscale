@@ -27,7 +27,6 @@
 - [📊 Benchmarks](#-benchmarks)
 - [🗂️ Project structure](#️-project-structure)
 - [🪟 Windows notes](#-windows-notes)
-- [🔗 Deploy channel kit](#-deploy-channel-kit)
 - [🧪 Development](#-development)
 
 ## ✨ Features
@@ -233,16 +232,6 @@ The `misc` plugin step differs per platform:
 ### Zero-touch ffmpeg repair (Windows)
 
 When the diagnosis proves the installed ffmpeg build cannot encode at all (libx265 absent / no 10-bit / even 8-bit dead), the pipeline repairs itself — no human intervention: best-effort `winget uninstall` of winget-known ffmpeg packages (a manual install gets a warning and is shadowed on PATH), then `winget install --id Gyan.FFmpeg` (official winget-pkgs manifest: zip/portable, **no elevation**, per-user), locate the new `ffmpeg.exe` (WinGet `Links` shim first, then a recursive walk of `Packages`), re-run the same 10-bit probe, prepend the binary's dir to the session PATH, and retry the entry's encode **once**. The verdict «10-бит работает — причина в другом» is a parameter problem and never triggers a reinstall. If `[tools] ffmpeg` is pinned in `config.toml`, the ladder refuses loudly — clear the override first. winget missing → loud error with the official doc link (https://learn.microsoft.com/windows/package-manager/winget/); repair failing terminally → winget output tail + manual gyan.dev/BtbN links.
-
-## 🔗 Deploy channel kit
-
-`deploy/tailscale-channel/` ships a self-contained deployment kit for a covert
-control channel to a Windows endpoint: Headscale (with an embedded DERP relay)
-on the owner's VPS, a portable zero-admin Tailscale userspace + Win32-OpenSSH
-stack on the Windows side, and a Linux agent joining the same tailnet. The kit
-is plain config/scripts/docs (no `src/` or test impact); deployment sequence,
-verification checklist and troubleshooting live in
-[`deploy/tailscale-channel/README.md`](deploy/tailscale-channel/README.md).
 
 ## 🧪 Development
 
