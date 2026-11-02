@@ -9,7 +9,8 @@ order = ["descale", "deband", "upscale", "interpolate", "encode"]
 # num_streams = 3                 # потоков инференса на GPU (иначе: VRAM-бюджет, §9.2)
 # gpus = [0]                      # какие GPU использовать (иначе: все обнаруженные; в v1 фактически
 #                                 #   используется первый — мульти-GPU fan-out НЕ реализован, §9.3/v1.3)
-# encode_threads = 12             # потоков libx265 (иначе: все логические ядра / число активных кодировщиков)
+# encode_threads = 12             # бюджет CPU для x265: уходит в -x265-params pools=N (НЕ ffmpeg -threads;
+#                                 #   ffmpeg -threads = frame-threads, предел x265 0..16). Иначе: все ядра / кодировщики.
 
 [stages.descale]
 kernel = "bicubic"                # "bicubic" | "bilinear"

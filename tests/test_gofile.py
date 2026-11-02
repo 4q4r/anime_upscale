@@ -1,6 +1,8 @@
 """gofile client tests: wt vectors (source), token lifecycle, folder expansion."""
 
 import hashlib
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 from typing import Self
 
@@ -136,12 +138,29 @@ class TestStateFile:
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict, status_code: int = 200) -> None:
+    def __init__(
+        self,
+        payload: dict,
+        status_code: int = 200,
+        *,
+        headers: dict[str, str] | None = None,
+        json_raises: bool = False,
+    ) -> None:
         self._payload = payload
         self.status_code = status_code
-        self.text = str(payload)
+        # Preserve a subclass's class-level headers (the download fake sets them
+        # that way); only an explicit argument overrides them.
+        if headers is not None:
+            self.headers = headers
+        elif not hasattr(type(self), "headers"):
+            self.headers = {}
+        self._json_raises = json_raises
+        self.text = payload if isinstance(payload, str) else str(payload)
 
     def json(self) -> dict:
+        if self._json_raises:
+            msg = "Expecting value: line 1 column 1 (char 0)"
+            raise ValueError(msg)
         return self._payload
 
 
@@ -281,10 +300,12 @@ class TestFetchContents:
         fake = _FakeSession()
         fake._queue("contents", _FakeResponse({"status": "error-notPremium"}))
         fake._queue("contents", _FakeResponse({"status": "error-notPremium"}))
+        fake._queue("accounts", _FakeResponse({"status": "ok", "data": {"token": "fresh"}}))
+        fake._queue("contents", _FakeResponse({"status": "error-notPremium"}))
         client = _client(fake, state_path=tmp_path / "g.toml")
         with pytest.raises(GofileError, match="wt_salt"):
             client.fetch_contents("abc")
-        assert len(fake.calls) == 2
+        assert sum("contents" in url for _, url in fake.calls) == 3
 
     def test_connection_error_is_gofile_error(self, tmp_path: Path) -> None:
         """M1: §11.3 — connection reset = loud error quoting that diagnosis."""
@@ -307,6 +328,127 @@ class TestFetchContents:
         client = _client(fake, state_path=tmp_path / "g.toml")
         with pytest.raises(GofileError, match="children"):
             client.expand_entries("abc")
+
+
+class TestFetchContentsTokenRecovery:
+    """Live bug 2026-11-02: a stale guest token returned 401 + error-wrongToken,
+    but the client checked HTTP before JSON and reported a useless «HTTP 401»."""
+
+    def test_wrong_token_refreshes_guest_once_and_retries(self, tmp_path: Path) -> None:
+        state = save_guest("stale-guest", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue("contents", _FakeResponse({"status": "error-wrongToken"}, status_code=401))
+        fake._queue(
+            "accounts",
+            _FakeResponse({"status": "ok", "data": {"token": "fresh-guest"}}),
+        )
+        fake._queue("contents", _FakeResponse({"status": "ok", "data": {"type": "file"}}))
+        client = _client(fake, state_path=state)
+        assert client.fetch_contents("abc")["data"]["type"] == "file"
+        assert load_saved_guest(state) == "fresh-guest"
+        assert [call[1] for call in fake.calls].count("https://api.gofile.io/accounts") == 1
+        assert sum("contents" in url for _, url in fake.calls) == 2
+
+    def test_error_token_also_refreshes_guest(self, tmp_path: Path) -> None:
+        state = save_guest("stale-guest", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue("contents", _FakeResponse({"status": "error-token"}, status_code=401))
+        fake._queue("accounts", _FakeResponse({"status": "ok", "data": {"token": "fresh"}}))
+        fake._queue("contents", _FakeResponse({"status": "ok", "data": {"type": "file"}}))
+        client = _client(fake, state_path=state)
+        assert client.fetch_contents("abc")["status"] == "ok"
+        assert client.token == "fresh"
+
+    def test_second_wrong_token_is_loud_and_names_state_file(self, tmp_path: Path) -> None:
+        state = save_guest("stale-guest", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue("contents", _FakeResponse({"status": "error-wrongToken"}, status_code=401))
+        fake._queue("accounts", _FakeResponse({"status": "ok", "data": {"token": "fresh"}}))
+        fake._queue("contents", _FakeResponse({"status": "error-wrongToken"}, status_code=401))
+        client = _client(fake, state_path=state)
+        with pytest.raises(GofileError, match="error-wrongToken") as exc_info:
+            client.fetch_contents("abc")
+        assert str(state) in str(exc_info.value)
+        assert sum("accounts" in url for _, url in fake.calls) == 1
+
+    def test_account_token_is_never_replaced_by_a_guest(self, tmp_path: Path) -> None:
+        state = tmp_path / "g.toml"
+        fake = _FakeSession()
+        fake._queue("contents", _FakeResponse({"status": "error-wrongToken"}, status_code=401))
+        client = _client(fake, account_token="premium-token", state_path=state)
+        with pytest.raises(GofileError, match="аккаунт") as exc_info:
+            client.fetch_contents("abc")
+        assert "premium-token" not in str(exc_info.value)
+        assert not state.exists()
+        assert not any("accounts" in url for _, url in fake.calls)
+
+    def test_not_premium_order_window_minus_one_then_refresh_then_loud(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = save_guest("guest", tmp_path / "g.toml")
+        monkeypatch.setattr(gofile.time, "sleep", lambda _s: None)
+        fake = _FakeSession()
+        server_date = format_datetime(datetime.now(UTC) + timedelta(hours=1), usegmt=True)
+        fake._queue("contents", _FakeResponse({"status": "error-notPremium"}))
+        fake._queue("contents", _FakeResponse({"status": "error-notPremium"}))
+        fake._queue("accounts", _FakeResponse({"status": "ok", "data": {"token": "fresh"}}))
+        fake._queue(
+            "contents",
+            _FakeResponse({"status": "error-notPremium"}, headers={"Date": server_date}),
+        )
+        client = _client(fake, state_path=state)
+        with pytest.raises(GofileError, match="wt_salt") as exc_info:
+            client.fetch_contents("abc")
+        message = str(exc_info.value)
+        assert "заголовку Date" in message
+        assert "clock" not in message.lower()  # Russian message, not an English log
+        contents_calls = [url for _, url in fake.calls if "contents" in url]
+        assert len(contents_calls) == 3
+        assert sum("accounts" in url for _, url in fake.calls) == 1
+
+    def test_not_premium_without_date_never_invents_an_offset(self, tmp_path: Path) -> None:
+        state = save_guest("guest", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue("contents", _FakeResponse({"status": "error-notPremium"}))
+        fake._queue("contents", _FakeResponse({"status": "error-notPremium"}))
+        fake._queue("accounts", _FakeResponse({"status": "ok", "data": {"token": "fresh"}}))
+        fake._queue("contents", _FakeResponse({"status": "error-notPremium"}))
+        client = _client(fake, state_path=state)
+        with pytest.raises(GofileError, match="wt_salt") as exc_info:
+            client.fetch_contents("abc")
+        message = str(exc_info.value)
+        assert "заголовок Date отсутствует" in message
+        assert "Измеренный сдвиг" not in message
+
+    def test_non_json_401_quotes_truncated_body(self, tmp_path: Path) -> None:
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        body = "<html><body>blocked by provider gateway</body></html>"
+        fake._queue(
+            "contents",
+            _FakeResponse(body, status_code=401, json_raises=True),
+        )
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        with pytest.raises(GofileError, match="HTTP 401") as exc_info:
+            client.fetch_contents("abc")
+        assert "blocked by provider gateway" in str(exc_info.value)
+
+    def test_unknown_status_is_loud(self, tmp_path: Path) -> None:
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue("contents", _FakeResponse({"status": "error-mystery"}, status_code=418))
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        with pytest.raises(GofileError, match="error-mystery"):
+            client.fetch_contents("abc")
+
+    def test_refresh_guest_is_public_and_persists(self, tmp_path: Path) -> None:
+        state = save_guest("old", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue("accounts", _FakeResponse({"status": "ok", "data": {"token": "new"}}))
+        client = _client(fake, state_path=state)
+        assert client.refresh_guest() == "new"
+        assert client.token == "new"
+        assert load_saved_guest(state) == "new"
 
 
 def _folder_payload(children: list[dict], *, password_status: str = "passwordOk") -> dict:

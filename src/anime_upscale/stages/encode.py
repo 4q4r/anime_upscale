@@ -7,7 +7,7 @@ keyint/min-keyint follow the «10 s / 1 s» rule computed from the ACTUAL output
 
 from math import ceil
 
-from anime_upscale.config import EncodeConfig
+from anime_upscale.config import EncodeConfig, validate_x265_params
 
 
 def compute_keyint(output_fps: tuple[int, int]) -> tuple[int, int]:
@@ -33,6 +33,7 @@ def build_video_args(
     threads: int | None = None,
 ) -> list[str]:
     """Ffmpeg video args for the encode stage (everything between -i pipe and output)."""
+    validate_x265_params(cfg.x265_params)
     args: list[str] = [
         "-c:v",
         "libx265",
@@ -53,11 +54,14 @@ def build_video_args(
         "-color_range",
         cfg.color_range,
     ]
-    if threads is not None:
-        args += ["-threads", str(threads)]
 
     keyint, min_keyint = compute_keyint(output_fps)
     overrides = dict(cfg.x265_params)
+    # The CPU budget is an x265 pool, never ffmpeg -threads: ffmpeg maps
+    # -threads to frameNumThreads, which x265 rejects above its 16-thread
+    # ceiling (live failure 2026-11-02). A manual pools override wins.
+    if threads is not None and "pools" not in overrides:
+        overrides["pools"] = str(threads)
     # Manual override in [stages.encode.x265_params] wins — computed values not duplicated.
     sheet = list(overrides.items()) + [
         (k, v)

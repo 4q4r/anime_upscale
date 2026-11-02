@@ -81,6 +81,41 @@ class TestUnknownKeys:
             load_config(cfg_file)
 
 
+class TestX265ParamValidation:
+    """x265 thread knobs: frame-threads has a build limit, `threads` is not a knob."""
+
+    def test_frame_threads_above_limit_is_loud_at_load(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            "[stages.encode.x265_params]\nframe-threads = 32\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="frame-threads") as exc_info:
+            load_config(cfg_file)
+        message = str(exc_info.value)
+        assert "16" in message
+        assert "config.toml" in message
+
+    def test_threads_key_is_rejected_at_load(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            "[stages.encode.x265_params]\nthreads = 32\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="threads") as exc_info:
+            load_config(cfg_file)
+        assert "pools" in str(exc_info.value)
+
+    def test_frame_threads_up_to_limit_loads(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            "[stages.encode.x265_params]\nframe-threads = 16\n",
+            encoding="utf-8",
+        )
+        cfg = load_config(cfg_file)
+        assert ("frame-threads", "16") in cfg.stages.encode.x265_params
+
+
 class TestRationalFps:
     def test_fraction_string(self) -> None:
         assert parse_fps_argument("60000/1001") == (60000, 1001)

@@ -253,6 +253,9 @@ def _parse_decimal(text: str, original: str) -> Decimal:
 _THRESHOLD_LEN = 3
 _GRAIN_LEN = 2
 
+# x265's hard frame-thread ceiling (X265_MAX_FRAME_THREADS); 0 lets x265 decide.
+_X265_MAX_FRAME_THREADS = 16
+
 _STAGE_KEYS: dict[str, set[str]] = {
     dataclass_type.__name__.removesuffix("Config").lower(): {f.name for f in fields(dataclass_type)}
     for dataclass_type in (DescaleConfig, DebandConfig, UpscaleConfig, InterpolateConfig)
@@ -354,6 +357,7 @@ def _validate_stages(table: dict[str, Any]) -> StagesConfig:
         raise ConfigError(msg)
 
     x265_pairs = tuple(sorted((str(k), _x265_value(v)) for k, v in encode_extra.items()))
+    validate_x265_params(x265_pairs)
 
     return StagesConfig(
         descale=DescaleConfig(**descale),
@@ -375,6 +379,43 @@ def _x265_value(value: Any) -> str:  # noqa: ANN401
         return str(value)
     msg = f"[stages.encode.x265_params]: неподдерживаемый тип значения {value!r}."
     raise ConfigError(msg)
+
+
+def validate_x265_params(pairs: tuple[tuple[str, str], ...]) -> None:
+    """
+    Reject x265 thread knobs that break the encoder or the ffmpeg contract.
+
+    ``threads`` is an ffmpeg option, not an x265 parameter — the CPU budget is
+    ``pools``. ``frame-threads`` has a hard x265 ceiling (0..16); values above
+    it make libx265 refuse to open with a cryptic exit code instead of a
+    config error.
+    """
+    values = dict(pairs)
+    if "threads" in values:
+        msg = (
+            "[stages.encode.x265_params]: ключ threads не поддерживается x265 "
+            "(это не ffmpeg -threads). Задайте pools=<N> для бюджета CPU "
+            "в config.toml."
+        )
+        raise ConfigError(msg)
+    raw = values.get("frame-threads")
+    if raw is None:
+        return
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        msg = (
+            f"[stages.encode.x265_params]: frame-threads={raw!r} — ожидается целое "
+            f"0..{_X265_MAX_FRAME_THREADS} (config.toml)."
+        )
+        raise ConfigError(msg) from exc
+    if value < 0 or value > _X265_MAX_FRAME_THREADS:
+        msg = (
+            f"[stages.encode.x265_params]: frame-threads={value} вне предела x265 "
+            f"(0..{_X265_MAX_FRAME_THREADS}). Уменьшите frame-threads в config.toml; "
+            "бюджет CPU задаётся pools=<N>."
+        )
+        raise ConfigError(msg)
 
 
 def _validate_network(table: dict[str, Any]) -> NetworkConfig:
