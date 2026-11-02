@@ -38,7 +38,7 @@ _8BIT_VERDICT = (
 )
 _OTHER_VERDICT = (
     "ffmpeg завершился с ошибкой (код 1).\nCannot open libx265 encoder.\n"
-    "\nДИАГНОСТИКА КОДЕКА: 10-бит работает — причина в другом.\n"
+    "\nДИАГНОСТИКА КОДЕКА: проба с боевыми параметрами прошла — сборка и параметры рабочие.\n"
 )
 
 
@@ -423,7 +423,7 @@ class TestPipelineRetryOnce:
         monkeypatch.setattr(pipeline_mod, "_run_pipeline_once", fake_once)
         monkeypatch.setattr(repair_mod, "repair_ffmpeg_build", no_repair)
         monkeypatch.setattr(pipeline_mod, "verdict_wants_reinstall", lambda _r: False)
-        with pytest.raises(PipelineError, match="причина в другом"):
+        with pytest.raises(PipelineError, match="проба с боевыми параметрами"):
             pipeline_mod.run_pipeline(self._ctx(), Path("a.mkv"), Path("o.mkv"), "ffmpeg")
 
     def test_second_failure_after_repair_is_terminal(
@@ -478,7 +478,7 @@ class TestRealDiagnosisVerdictPins:
     def test_other_cause_verdict_does_not_trigger(self) -> None:
         runner = _WingetRunner(encoders_stdout=self._LIBX265_LINE, probe_ok=True)
         report = diagnose_encoder("ffmpeg", "Cannot open libx265 encoder.", runner=runner)
-        assert "10-бит работает — причина в другом" in report
+        assert "проба с боевыми параметрами" in report
         assert verdict_wants_reinstall(report) is False
 
 

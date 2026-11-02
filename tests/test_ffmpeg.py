@@ -13,6 +13,7 @@ from anime_upscale.ffmpeg import (
     encoder_open_failure,
     finish_encoder,
 )
+from anime_upscale.ffmpeg_repair import verdict_wants_reinstall
 
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
@@ -134,6 +135,27 @@ class TestFinishEncoder:
             finish_encoder(encoder)
         assert "Cannot open libx265 encoder" in str(exc_info.value)
 
+    def test_x265_error_lines_surface_first_from_full_ring(self) -> None:
+        """Live bug: the real x265 [error] sat above the last-10 line cut, so the
+        message showed only generic ffmpeg noise. Every x265 error/fatal line in
+        the 50-line ring must lead the report."""
+        encoder = self._encoder(1, [b"Cannot open libx265 encoder.\n"])
+        encoder.tail.extend(
+            [
+                (
+                    b"[libx265 @ 0x1] x265 [error]: frameNumThreads (--frame-threads) must be "
+                    b"[0 .. X265_MAX_FRAME_THREADS)\n"
+                ),
+                *[f"filler-{index}\n".encode() for index in range(20)],
+            ]
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            finish_encoder(encoder)
+        message = str(exc_info.value)
+        assert "x265 [error]" in message
+        error_pos = message.index("x265 [error]")
+        assert error_pos < message.index("filler-19")
+
 
 def _probe_result(returncode: int, stderr: bytes) -> Any:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=b"", stderr=stderr)
@@ -145,8 +167,10 @@ class _FakeRunner:
     def __init__(self, encoders_lines: bytes, probes: dict[str, tuple[int, bytes]]) -> None:
         self.encoders_lines = encoders_lines
         self.probes = probes
+        self.calls: list[list[str]] = []
 
     def __call__(self, args: list[str], **_kwargs: Any) -> Any:
+        self.calls.append(list(args))
         if "-encoders" in args:
             return subprocess.CompletedProcess(
                 args=args, returncode=0, stdout=self.encoders_lines, stderr=b""
@@ -154,6 +178,9 @@ class _FakeRunner:
         pix_fmt = args[args.index("-pix_fmt") + 1]
         returncode, stderr = self.probes.get(pix_fmt, (1, f"{pix_fmt} probe not scripted".encode()))
         return _probe_result(returncode, stderr)
+
+    def probe_calls(self) -> list[list[str]]:
+        return [call for call in self.calls if "-pix_fmt" in call]
 
 
 _FIX_URL = "gyan.dev"
@@ -178,15 +205,55 @@ class TestDiagnoseEncoder:
         assert _FIX_URL in report
         assert "10-bit probe died" in report
 
-    def test_ten_bit_ok_means_other_cause(self) -> None:
+    def test_ten_bit_ok_means_no_reproducible_cause(self) -> None:
         runner = _FakeRunner(
             b" V....D libx265              libx265 H.265 / HEVC\n",
             {"yuv420p10le": (0, b"")},
         )
         report = diagnose_encoder("ffmpeg", "Cannot open libx265 encoder.", runner=runner)
         assert report is not None
-        assert "10-бит работает — причина в другом" in report
+        assert "проба с боевыми параметрами" in report
+        assert "причина в другом" not in report
         assert _FIX_URL not in report
+        assert verdict_wants_reinstall(report) is False
+
+    def test_probe_runs_with_production_x265_params(self) -> None:
+        runner = _FakeRunner(
+            b" V....D libx265              libx265 H.265 / HEVC\n",
+            {"yuv420p10le": (0, b"")},
+        )
+        diagnose_encoder(
+            "ffmpeg",
+            "Cannot open libx265 encoder.",
+            runner=runner,
+            x265_params="pools=32:keyint=600",
+        )
+        probes = runner.probe_calls()
+        assert probes, "diagnosis must actually probe"
+        for probe in probes:
+            assert probe[probe.index("-x265-params") + 1] == "pools=32:keyint=600"
+
+    def test_x265_param_failure_is_params_verdict_without_reinstall(self) -> None:
+        """Live lie: the probe used default x265 params, passed, and the verdict
+        said «причина в другом» while production params were the actual cause."""
+        x265_error = (
+            b"x265 [error]: frameNumThreads (--frame-threads) must be [0 .. X265_MAX_FRAME_THREADS)"
+        )
+        runner = _FakeRunner(
+            b" V....D libx265              libx265 H.265 / HEVC\n",
+            {"yuv420p10le": (1, x265_error), "yuv420p": (1, x265_error)},
+        )
+        report = diagnose_encoder(
+            "ffmpeg",
+            "Cannot open libx265 encoder.",
+            runner=runner,
+            x265_params="pools=32",
+        )
+        assert report is not None
+        assert "frameNumThreads" in report
+        assert "параметр" in report
+        assert "причина в другом" not in report
+        assert verdict_wants_reinstall(report) is False
 
     def test_even_eight_bit_dead_verdict(self) -> None:
         runner = _FakeRunner(
@@ -225,7 +292,7 @@ class TestDiagnoseEncoderLive:
             for phrase in (
                 "libx265 отсутствует",
                 "10-бит (Main10) не поддерживается",
-                "10-бит работает — причина в другом",
+                "проба с боевыми параметрами",
                 "даже 8-битное кодирование",
             )
         )

@@ -3,8 +3,9 @@ Automatic ffmpeg repair via winget (zero-touch, Windows).
 
 Triggered ONLY by the diagnosis verdicts that mean the current build cannot
 encode the pipeline's format at all (libx265 absent / 10-bit unsupported /
-even 8-bit dead). The verdict «10-бит работает — причина в другом» is a real
-parameter problem — it stays a loud terminal failure with NO reinstall.
+even 8-bit dead). The other verdicts (probe passed with the production params,
+or an x265 parameter error) are real run problems — they stay loud terminal
+failures with NO reinstall.
 
 Ladder: best-effort `winget uninstall` of winget-known ffmpeg packages →
 `winget install --id Gyan.FFmpeg` (official winget-pkgs manifest: zip/portable,

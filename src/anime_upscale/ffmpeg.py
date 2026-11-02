@@ -81,6 +81,11 @@ _TAIL_LINES = 50
 # The second class fires when the build carries no libx265 at all.
 _ENCODER_OPEN_MARKERS = ("Cannot open libx265 encoder", "Unknown encoder 'libx265'")
 
+# x265's own parameter/build errors (live 2026-11-02). They identify a parameter
+# problem rather than a dead build, so they must lead the report and never
+# trigger a reinstall.
+_X265_ERROR_MARKERS = ("x265 [error]", "x265 [fatal]")
+
 # Probe pixel formats: 10-bit is the pipeline default (Main10), 8-bit is the
 # minimal-capability reference point for the diagnosis matrix.
 _PROBE_FMT_10BIT = "yuv420p10le"
@@ -102,14 +107,50 @@ def encoder_open_failure(tail_text: str) -> bool:
     return any(marker in tail_text for marker in _ENCODER_OPEN_MARKERS)
 
 
+def is_x265_error_line(line: str) -> bool:
+    """Whether one stderr line is an x265 parameter/fatal error."""
+    return any(marker in line for marker in _X265_ERROR_MARKERS)
+
+
+def x265_error_lines(text: str) -> list[str]:
+    """Every x265 [error]/[fatal] line in the given stderr text, in order."""
+    return [line for line in text.splitlines() if is_x265_error_line(line)]
+
+
+def _order_tail_lines(text: str) -> str:
+    """x265 errors first, then the last 10 ordinary lines (never cut the cause)."""
+    lines = text.strip().splitlines()
+    errors = [line for line in lines if is_x265_error_line(line)]
+    rest = [line for line in lines if not is_x265_error_line(line)][-10:]
+    return "\n".join(errors + rest)
+
+
+def _x265_params_from_args(args: object) -> str | None:
+    """Extract the production ``-x265-params`` value from the failed argv."""
+    if not isinstance(args, (list, tuple)):
+        return None
+    try:
+        index = args.index("-x265-params")
+    except ValueError:
+        return None
+    if index + 1 >= len(args):
+        return None
+    return str(args[index + 1])
+
+
 def _decode(value: bytes | str | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
     return value or ""
 
 
-def _probe_args(ffmpeg: str, pix_fmt: str, output: Path) -> list[str]:
-    return [
+def _probe_args(
+    ffmpeg: str,
+    pix_fmt: str,
+    output: Path,
+    x265_params: str | None = None,
+) -> list[str]:
+    args = [
         ffmpeg,
         "-y",
         "-hide_banner",
@@ -123,23 +164,28 @@ def _probe_args(ffmpeg: str, pix_fmt: str, output: Path) -> list[str]:
         pix_fmt,
         "-c:v",
         "libx265",
-        "-frames:v",
-        "3",
-        str(output),
     ]
+    if x265_params is not None:
+        # ONE shared source: the probe runs with the EXACT production params
+        # (extracted from the failed argv), so it can never pass while the
+        # real run dies on those params (live 2026-11-02 misdiagnosis).
+        args += ["-x265-params", x265_params]
+    args += ["-frames:v", "3", str(output)]
+    return args
 
 
 def _run_probe(
     ffmpeg: str,
     pix_fmt: str,
     runner: Any,  # noqa: ANN401 - subprocess.run-shaped callable
+    x265_params: str | None = None,
 ) -> tuple[bool, str]:
     """Minimal encode probe; (ok, stderr-tail) — failures keep the actual error."""
     with tempfile.TemporaryDirectory(prefix="anime-upscale-probe-") as tmp:
         output = Path(tmp) / f"probe_{pix_fmt}.mkv"
         try:
             completed = runner(
-                _probe_args(ffmpeg, pix_fmt, output),
+                _probe_args(ffmpeg, pix_fmt, output, x265_params),
                 capture_output=True,
                 timeout=_PROBE_TIMEOUT_S,
             )
@@ -158,24 +204,29 @@ def _list_x265_encoders(ffmpeg: str, runner: Any) -> list[str]:  # noqa: ANN401
 def probe_10bit(
     ffmpeg: str,
     runner: Any = None,  # noqa: ANN401 - subprocess.run-shaped callable
+    x265_params: str | None = None,
 ) -> tuple[bool, str]:
     """Public 10-bit capability probe (the repair ladder's re-verification step)."""
     run = runner if runner is not None else subprocess.run
-    return _run_probe(ffmpeg, _PROBE_FMT_10BIT, run)
+    return _run_probe(ffmpeg, _PROBE_FMT_10BIT, run, x265_params)
 
 
 def diagnose_encoder(
     ffmpeg: str,
     tail_text: str,
     runner: Any = None,  # noqa: ANN401 - subprocess.run-shaped callable
+    x265_params: str | None = None,
 ) -> str | None:
     """
     Capability diagnosis for a failed libx265 open; loud Russian verdict.
 
-    Matrix: encoder absent → full-build recommendation; 8-bit works but 10-bit
-    does not → incomplete build; both work → the cause is elsewhere (tail);
-    neither works → broken build. None when the failure is not an encoder-open
-    failure.
+    Probes replay the production ``-x265-params`` (extracted from the failed
+    argv). An x265 [error]/[fatal] from that probe is a PARAMETER problem: the
+    verdict quotes it and never triggers a winget reinstall. Otherwise the
+    build matrix applies: encoder absent → full build; 8-bit works but 10-bit
+    does not → incomplete build; neither works → broken build; the probe passes
+    → the failure is not reproducible with these params. None when the failure
+    is not an encoder-open failure.
     """
     if not encoder_open_failure(tail_text):
         return None
@@ -186,16 +237,27 @@ def diagnose_encoder(
             f"\nДИАГНОСТИКА КОДЕКА: libx265 отсутствует в этой сборке ffmpeg.\n{_FULL_BUILD_HINT}"
         )
 
-    ok10, err10 = _run_probe(ffmpeg, _PROBE_FMT_10BIT, run)
+    ok10, err10 = _run_probe(ffmpeg, _PROBE_FMT_10BIT, run, x265_params)
+    param_errors = x265_error_lines(err10)
+    if not ok10 and param_errors and x265_params is not None:
+        joined = "\n".join(param_errors)
+        return (
+            "\nДИАГНОСТИКА КОДЕКА: пробное кодирование с боевыми параметрами x265 упало — "
+            "причина в параметрах, а не в сборке ffmpeg.\n"
+            f"{joined}\n"
+            "Исправьте [stages.encode.x265_params] в config.toml "
+            "(frame-threads 0..16; бюджет CPU — pools=<N>)."
+        )
     if ok10:
         return (
-            "\nДИАГНОСТИКА КОДЕКА: 10-бит работает — причина в другом.\n"
-            "libx265 присутствует, пробное 10-битное кодирование (320x240, 3 кадра в MKV) "
-            "прошло успешно. Ищите причину в хвосте stderr выше "
-            "(например, несовместимые параметры потока)."
+            "\nДИАГНОСТИКА КОДЕКА: проба с боевыми параметрами прошла — сборка и параметры "
+            "рабочие.\n"
+            "Пробное 10-битное кодирование (320x240, 3 кадра в MKV) с теми же "
+            "-x265-params завершилось успешно; сбой не воспроизводится. "
+            "Смотрите полный хвост stderr выше."
         )
 
-    ok8, err8 = _run_probe(ffmpeg, _PROBE_FMT_8BIT, run)
+    ok8, err8 = _run_probe(ffmpeg, _PROBE_FMT_8BIT, run, x265_params)
     if ok8:
         probe_error = err10.splitlines()[-1] if err10 else "(пустой stderr)"
         return (
@@ -268,12 +330,13 @@ def finish_encoder(encoder: Encoder) -> None:
         # a moment away; joining guarantees the tail is complete.
         encoder.drain_thread.join(timeout=5)
     if process.returncode != 0:
-        tail = b"".join(encoder.tail).decode("utf-8", "replace").strip().splitlines()[-10:]
-        tail_text = "\n".join(tail)
+        raw_tail = b"".join(encoder.tail).decode("utf-8", "replace").strip()
+        tail_text = _order_tail_lines(raw_tail)
         message = f"ffmpeg завершился с ошибкой (код {process.returncode}).\n{tail_text}"
         raw_args = process.args
         ffmpeg = str(raw_args[0]) if raw_args else _FFMPEG  # ty: ignore[not-subscriptable]
-        report = diagnose_encoder(ffmpeg, tail_text)
+        x265_params = _x265_params_from_args(raw_args)
+        report = diagnose_encoder(ffmpeg, tail_text, x265_params=x265_params)
         if report is not None:
             message += report
         raise RuntimeError(message)

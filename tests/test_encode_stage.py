@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from anime_upscale.config import EncodeConfig, load_config
+from anime_upscale.config import ConfigError, EncodeConfig, load_config
 from anime_upscale.stages.encode import build_video_args, compute_keyint
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -73,10 +73,6 @@ class TestVideoArgs:
         assert parts["keyint"] == "300"
         assert parts["min-keyint"] == "60"
 
-    def test_threads_passed_when_given(self) -> None:
-        args = build_video_args(_cfg(), output_fps=(60, 1), threads=8)
-        assert args[args.index("-threads") + 1] == "8"
-
     def test_animation_tune_never_emitted(self) -> None:
         args = build_video_args(_cfg(), output_fps=(60, 1))
         assert "-tune" not in args
@@ -85,3 +81,59 @@ class TestVideoArgs:
     def test_crf_values_pass_through(self, crf: int) -> None:
         args = build_video_args(_cfg(crf=crf), output_fps=(60, 1))
         assert args[args.index("-crf") + 1] == str(crf)
+
+
+def _params(args: list[str]) -> dict[str, str]:
+    raw = args[args.index("-x265-params") + 1]
+    return dict(part.split("=", 1) for part in raw.split(":"))
+
+
+class TestThreadBudget:
+    """Live bug 2026-11-02: `-threads N` maps to x265 frameNumThreads and dies
+    above 16. The CPU budget belongs in `pools=N`; `-threads` is never emitted."""
+
+    def test_threads_never_emitted(self) -> None:
+        args = build_video_args(_cfg(), output_fps=(60, 1), threads=32)
+        assert "-threads" not in args
+
+    def test_threads_become_x265_pools(self) -> None:
+        args = build_video_args(_cfg(), output_fps=(60, 1), threads=32)
+        assert _params(args)["pools"] == "32"
+
+    def test_user_pools_override_wins(self) -> None:
+        cfg = _cfg(x265_params=(("pools", "8"),))
+        args = build_video_args(cfg, output_fps=(60, 1), threads=32)
+        assert _params(args)["pools"] == "8"
+        assert "-threads" not in args
+
+    def test_no_pools_without_threads(self) -> None:
+        args = build_video_args(_cfg(), output_fps=(60, 1), threads=None)
+        assert "pools" not in _params(args)
+
+
+class TestX265ParamValidation:
+    """frame-threads is the x265 knob with a hard build limit; bad config fails loud."""
+
+    def test_frame_threads_above_limit_is_loud(self) -> None:
+        cfg = _cfg(x265_params=(("frame-threads", "17"),))
+        with pytest.raises(ConfigError, match="frame-threads") as exc_info:
+            build_video_args(cfg, output_fps=(60, 1))
+        message = str(exc_info.value)
+        assert "16" in message
+        assert "config.toml" in message
+
+    def test_frame_threads_at_limit_is_legal(self) -> None:
+        cfg = _cfg(x265_params=(("frame-threads", "16"),))
+        args = build_video_args(cfg, output_fps=(60, 1))
+        assert _params(args)["frame-threads"] == "16"
+
+    def test_frame_threads_zero_is_legal(self) -> None:
+        cfg = _cfg(x265_params=(("frame-threads", "0"),))
+        args = build_video_args(cfg, output_fps=(60, 1))
+        assert _params(args)["frame-threads"] == "0"
+
+    def test_threads_key_in_x265_params_is_rejected(self) -> None:
+        cfg = _cfg(x265_params=(("threads", "32"),))
+        with pytest.raises(ConfigError, match="threads") as exc_info:
+            build_video_args(cfg, output_fps=(60, 1))
+        assert "pools" in str(exc_info.value)

@@ -21,6 +21,8 @@ import tomllib
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -393,12 +395,44 @@ def save_guest(token: str, path: Path | None = None) -> Path:
     return path
 
 
+def _server_date_offset(response: requests.Response) -> float | None:
+    """
+    Measured server-clock offset in seconds from the HTTP ``Date`` header.
+
+    None when the header is absent or unparseable — never invent an offset.
+    """
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("Date")
+    if not raw:
+        return None
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:  # pragma: no cover - stdlib always returns a datetime here
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (parsed - datetime.now(UTC)).total_seconds()
+
+
 @dataclass(frozen=True)
 class ResolvedChild:
     """One video file expanded from a (possibly nested) folder link."""
 
     name: str
     link: str
+
+
+@dataclass
+class _FetchState:
+    """Mutable retry bookkeeping for one fetch_contents call."""
+
+    window_offset: int = 0
+    refreshed: bool = False
+    not_premium_stage: int = 0
 
 
 class GofileClient:
@@ -425,14 +459,8 @@ class GofileClient:
         self.token = account_token
 
     # -- token lifecycle ---------------------------------------------------
-    def ensure_token(self) -> str:
-        """Resolve the token: account > saved guest > create once + save (plan §11.2)."""
-        if self.token:
-            return self.token
-        saved = load_saved_guest(self.state_path)
-        if saved:
-            self.token = saved
-            return self.token
+    def _create_guest_token(self) -> str:
+        """Create one guest account (the rate-limited operation) and return its token."""
         self.session.pin("api.gofile.io")
         try:
             response = adaptive_tls_request(
@@ -454,20 +482,122 @@ class GofileClient:
                 f"ответ: {payload.get('status', response.text[:200])}"
             )
             raise GofileError(msg)
-        self.token = data["token"]
-        if not self._account_token:  # account tokens never overwrite the guest state file
-            save_guest(self.token, self.state_path)
+        return str(data["token"])
+
+    def ensure_token(self) -> str:
+        """Resolve the token: account > saved guest > create once + save (plan §11.2)."""
+        if self.token:
+            return self.token
+        saved = load_saved_guest(self.state_path)
+        if saved:
+            self.token = saved
+            return self.token
+        self.token = self._create_guest_token()
+        save_guest(self.token, self.state_path)
+        return self.token
+
+    def refresh_guest(self) -> str:
+        """
+        Force a NEW guest token and persist it (stale-token recovery, 2026-11-02).
+
+        Account tokens are never replaced by a guest: this raises instead.
+        """
+        if self._account_token:
+            msg = (
+                "Задан токен аккаунта ([upload.gofile] token) — гостевой токен не создаётся "
+                "и не подставляется вместо него. Проверьте токен аккаунта в config.toml."
+            )
+            raise GofileError(msg)
+        self.token = self._create_guest_token()
+        save_guest(self.token, self.state_path)
         return self.token
 
     # -- contents (with the ported minimal retries) ------------------------
+    @staticmethod
+    def _parse_contents_response(
+        response: requests.Response,
+        content_id: str,
+    ) -> dict[str, Any]:
+        """Parse JSON BEFORE any HTTP-status branch (live 401 carried a useful status)."""
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            body = (getattr(response, "text", "") or "")[:200]
+            msg = (
+                f"gofile /contents/{content_id}: HTTP {response.status_code}, "
+                f"ответ не JSON: {body!r}"
+            )
+            raise GofileError(msg) from exc
+        if not isinstance(payload, dict):
+            body = (getattr(response, "text", "") or "")[:200]
+            msg = (
+                f"gofile /contents/{content_id}: HTTP {response.status_code}, "
+                f"ожидался JSON-объект, получено: {body!r}"
+            )
+            raise GofileError(msg)
+        return payload
+
+    def _not_premium_error(self, response: requests.Response, *, refreshed: bool) -> GofileError:
+        """Loud terminal notPremium verdict with the MEASURED clock offset when available."""
+        actions = "после окна −1"
+        if refreshed:
+            actions += " и обновления гостевого токена"
+        offset = _server_date_offset(response)
+        if offset is None:
+            clock = "Сдвиг часов измерить не удалось: заголовок Date отсутствует."
+        else:
+            clock = f"Измеренный сдвиг часов сервера по заголовку Date: {offset:+.0f} с."
+        msg = (
+            f"gofile отклонил X-Website-Token (error-notPremium) {actions}. "
+            "Вероятная причина: ротация соли wt.obf.js — обновите [fetch.gofile] wt_salt "
+            f"в config.toml; либо расхождение часов с сервером. {clock}"
+        )
+        return GofileError(msg)
+
+    def _recover_token_error(self, status: str, state: _FetchState) -> None:
+        """Handle error-wrongToken/error-token: ONE guest refresh, never for account."""
+        if self._account_token:
+            msg = (
+                f"gofile отклонил токен аккаунта (status={status}). "
+                "Гостевой токен не подставляется — проверьте [upload.gofile] token "
+                "в config.toml."
+            )
+            raise GofileError(msg)
+        if state.refreshed:
+            path = self.state_path or state_file_path()
+            msg = (
+                f"gofile отклонил гостевой токен (status={status}) даже после "
+                f"принудительного обновления. Файл состояния: {path}. "
+                "Удалите его и повторите запуск."
+            )
+            raise GofileError(msg)
+        self.refresh_guest()  # exactly once per fetch
+        state.refreshed = True
+        state.window_offset = 0
+
+    def _step_not_premium(self, response: requests.Response, state: _FetchState) -> None:
+        """Owner-verified notPremium order: window −1 → fresh guest token → loud."""
+        if state.not_premium_stage == 0:
+            state.not_premium_stage = 1
+            state.window_offset = -1
+            return
+        can_refresh = not state.refreshed and not self._account_token
+        if state.not_premium_stage == 1 and can_refresh:
+            state.not_premium_stage = 2
+            self.refresh_guest()
+            state.refreshed = True
+            state.window_offset = 0
+            return
+        raise self._not_premium_error(response, refreshed=state.refreshed)
+
     def fetch_contents(self, content_id: str) -> dict[str, Any]:
-        """GET /contents/{id} with wt headers; ported retry rules (run.py:595-667)."""
+        """GET /contents/{id}: JSON first, then status (live 401 recovery, 2026-11-02)."""
         self.ensure_token()
         self.session.pin("api.gofile.io")
         url = f"https://api.gofile.io/contents/{content_id}"
         max_attempts = 4
-        for attempt in range(max_attempts):
-            window_offset = -1 if attempt >= 1 else 0  # current window, then −1 once
+        state = _FetchState()
+        for attempt in range(1, max_attempts + 1):
             try:
                 response = adaptive_tls_request(
                     self.session.get,
@@ -478,7 +608,7 @@ class GofileClient:
                         user_agent=self.user_agent,
                         language=self.language,
                         salt=self.wt_salt,
-                        window_offset=window_offset,
+                        window_offset=state.window_offset,
                     ),
                     params=CONTENTS_QUERY_PARAMS,
                     timeout=60,
@@ -487,38 +617,35 @@ class GofileClient:
                 # §11.3: connection reset etc. = loud error quoting the diagnosis.
                 msg = (
                     f"Сетевая ошибка при запросе gofile /contents/{content_id} "
-                    f"(попытка {attempt + 1}/{max_attempts}): {exc}"
+                    f"(попытка {attempt}/{max_attempts}): {exc}"
                 )
                 raise GofileError(msg) from exc
-            if response.status_code != _HTTP_OK:
-                msg = f"gofile /contents/{content_id}: HTTP {response.status_code}."
-                raise GofileError(msg)
-            payload = response.json()
+            payload = self._parse_contents_response(response, content_id)
             status = payload.get("status")
             if status == "ok":
                 return payload
             if status == "error-rateLimit":
-                wait = 3 * (attempt + 1)  # linear backoff 3 s × attempt (run.py:631-639)
-                if attempt < max_attempts - 1:
-                    time.sleep(wait)
+                if attempt < max_attempts:
+                    time.sleep(3 * attempt)  # linear backoff 3 s × attempt (run.py:631-639)
                     continue
                 msg = (
                     "gofile ограничил частоту запросов (error-rateLimit после всех попыток). "
                     "Подождите несколько минут и повторите."
                 )
                 raise GofileError(msg)
+            if status in {"error-wrongToken", "error-token"}:
+                self._recover_token_error(status, state)
+                continue
             if status == "error-notPremium":
-                if attempt == 0:
-                    continue  # retry once with window − 1 (clock boundary, run.py:641-647)
-                msg = (
-                    "gofile отклонил X-Website-Token (error-notPremium). Вероятно, "
-                    "ротировалась соль wt.obf.js — обновите [fetch.gofile] wt_salt в config.toml."
-                )
-                raise GofileError(msg)
+                self._step_not_premium(response, state)
+                continue
             if status == "error-notFound":
-                msg = f"gofile: содержимое {content_id} не найдено (удалено?)."
+                msg = f"gofile: содержимое {content_id} не найдено (удалено или недоступно)."
                 raise GofileError(msg)
-            msg = f"gofile вернул ошибку «{status}» для /contents/{content_id}."
+            msg = (
+                f"gofile вернул неизвестный статус «{status}» для /contents/{content_id} "
+                f"(HTTP {response.status_code})."
+            )
             raise GofileError(msg)
         msg = f"gofile /contents/{content_id}: исчерпаны попытки."
         raise GofileError(msg)
