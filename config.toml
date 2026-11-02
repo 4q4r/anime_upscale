@@ -40,7 +40,7 @@ trt_cache_dir = "~/.cache/vsrife"
 # NVENC удалён из конфига; registry-механизм в stages/encode.py сохранён как точка расширения.
 # Канон флагов и обоснование каждого: research/05-encode-flags.md §1.1/§6.
 crf = 16                          # 14 = transparent/collection; 16 = VCB workhorse (владельческий референс); 18 = community floor
-preset = "slow"                   # efficiency knee: slower→veryslow ≈ +78% времени за ~0% размера (doom9 2020)
+preset = "medium"                 # прирост скорости кодирования с небольшим (приемлемым) увеличением размера выходного файла
 pix_fmt = "yuv420p10le"
 profile = "main10"
 colorspace = "bt709"              # теги форвардятся в HEVC VUI (libavcodec/libx265.c) — защита от «вымытых» цветов

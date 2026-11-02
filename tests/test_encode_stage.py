@@ -37,7 +37,7 @@ class TestVideoArgs:
     def test_flag_sheet_shape(self) -> None:
         args = build_video_args(_sheet_cfg(), output_fps=(60000, 1001))
         assert args[args.index("-c:v") + 1] == "libx265"
-        assert "-preset" in args and args[args.index("-preset") + 1] == "slow"
+        assert "-preset" in args and args[args.index("-preset") + 1] == "medium"
         assert "-crf" in args and args[args.index("-crf") + 1] == "16"
         assert "-pix_fmt" in args and args[args.index("-pix_fmt") + 1] == "yuv420p10le"
         assert "-profile:v" in args and args[args.index("-profile:v") + 1] == "main10"
