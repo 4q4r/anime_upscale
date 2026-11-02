@@ -26,7 +26,7 @@ class TestDefaults:
         assert cfg.stages.interpolate.model == "4.25"
         assert cfg.stages.interpolate.trt is True
         assert cfg.stages.encode.crf == 16
-        assert cfg.stages.encode.preset == "slow"
+        assert cfg.stages.encode.preset == "medium"
         assert cfg.stages.encode.x265_params == tuple(sorted(cfg.stages.encode.x265_params))
         assert ("no-sao", "1") in cfg.stages.encode.x265_params
         assert ("psy-rd", "2.0") in cfg.stages.encode.x265_params
