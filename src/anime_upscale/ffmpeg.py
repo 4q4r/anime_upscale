@@ -17,13 +17,28 @@ def resolve_ffmpeg(override: str | None = None) -> str:
     return resolve_tool(_FFMPEG, override)
 
 
-def build_mux_args(
+def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_args, ffmpeg, geometry/fps
     source: str | Path,
     output: str | Path,
     video_args: list[str],
     ffmpeg: str | None = None,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    fps_num: int | None = None,
+    fps_den: int | None = None,
 ) -> list[str]:
-    """Full ffmpeg argv: yuv4mpegpipe on stdin + source streams → MKV."""
+    """
+    Full ffmpeg argv: rawvideo on stdin + source streams → MKV.
+
+    rawvideo replaces yuv4mpegpipe because VS writes C420p10 in the y4m header
+    which ffmpeg misreads as 8-bit → violet-square artifacts on 10-bit sources.
+    width/height/fps_num/fps_den come from the assembled VS graph (known after
+    build_graph) and are required for rawvideo demuxer framing.
+    """
+    if width is None or height is None or fps_num is None or fps_den is None:
+        msg = "build_mux_args требует width, height, fps_num, fps_den для rawvideo-входа."
+        raise ValueError(msg)
     return [
         ffmpeg or _FFMPEG,
         "-y",
@@ -31,7 +46,13 @@ def build_mux_args(
         "error",
         "-stats",
         "-f",
-        "yuv4mpegpipe",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        f"{fps_num}/{fps_den}",
         "-i",
         "-",
         "-i",

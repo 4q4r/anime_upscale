@@ -182,6 +182,8 @@ class TestEncoderTeardown:
 
         class _FakeGraph:
             fps = Fraction(60000, 1001)
+            width = 640
+            height = 360
 
             def output(self, stream: object, **_kw: object) -> None:
                 raise output_exc
@@ -195,7 +197,7 @@ class TestEncoderTeardown:
                 return _FakeClip()
 
         monkeypatch.setattr(pl.vs, "core", type("_FakeCore", (), {"bs": _FakeBs})())
-        monkeypatch.setattr(pl, "build_graph", lambda ctx, clip: _FakeGraph())
+        monkeypatch.setattr(pl, "build_graph", lambda ctx, clip, **_kw: _FakeGraph())
         monkeypatch.setattr(pl, "spawn_encoder", lambda args: _FakeEncoder())
         return waits
 

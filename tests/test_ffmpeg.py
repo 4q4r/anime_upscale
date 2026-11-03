@@ -25,9 +25,16 @@ class TestMuxArgs:
             source="/proj/input/src.mkv",
             output="/proj/output/dst.mkv",
             video_args=["-c:v", "libx265", "-crf", "16"],
+            width=1920,
+            height=1080,
+            fps_num=60000,
+            fps_den=1001,
         )
         assert args[:2] == ["ffmpeg", "-y"]
-        assert "-f" in args and args[args.index("-f") + 1] == "yuv4mpegpipe"
+        assert "-f" in args and args[args.index("-f") + 1] == "rawvideo"
+        assert args[args.index("-pix_fmt") + 1] == "yuv420p10le"
+        assert args[args.index("-s") + 1] == "1920x1080"
+        assert args[args.index("-r") + 1] == "60000/1001"
         assert args[args.index("-i") + 1] == "-"
         src_index = args.index("/proj/input/src.mkv")
         assert args[src_index - 1] == "-i"
@@ -43,14 +50,30 @@ class TestMuxArgs:
 
     def test_video_args_land_between_inputs_and_output(self) -> None:
         video = ["-c:v", "libx265", "-x265-params", "keyint=600"]
-        args = build_mux_args(source="s.mkv", output="d.mkv", video_args=video)
+        args = build_mux_args(
+            source="s.mkv",
+            output="d.mkv",
+            video_args=video,
+            width=1280,
+            height=720,
+            fps_num=24000,
+            fps_den=1001,
+        )
         vpos = args.index("-c:v")
         srcpos = args.index("s.mkv")
         outpos = args.index("d.mkv")
         assert srcpos < vpos < outpos
 
     def test_stats_flag_present_for_progress(self) -> None:
-        args = build_mux_args(source="s.mkv", output="d.mkv", video_args=[])
+        args = build_mux_args(
+            source="s.mkv",
+            output="d.mkv",
+            video_args=[],
+            width=1280,
+            height=720,
+            fps_num=24000,
+            fps_den=1001,
+        )
         assert "-stats" in args
 
 
