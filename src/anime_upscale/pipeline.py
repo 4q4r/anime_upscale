@@ -1,5 +1,5 @@
 """
-Graph assembly: validate subset → build VS nodes in canonical order → y4m → ffmpeg (plan §1).
+Graph assembly: validate subset → build VS nodes in canonical order → rawvideo → ffmpeg (plan §1).
 
 Format flow: RGBH (fp16) around the upscale/interpolate segment, one conversion
 to YUV420P10 (BT.709) right before the pipe. Interp-only runs convert to RGBH
@@ -8,6 +8,7 @@ once before RIFE (no RGB round-trips). Scene detection runs inside vsrife
 """
 
 import contextlib
+import subprocess
 from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
@@ -29,23 +30,34 @@ from anime_upscale.stages import (  # noqa: F401 - descale/deband/interpolate/up
 )
 from anime_upscale.stages.dimensions import apply_even_align
 from anime_upscale.stages.encode import build_video_args
+from anime_upscale.tools import ToolError, resolve_tool
 
 
 class PipelineError(Exception):
     """Loud pipeline failure (Russian message)."""
 
 
-def _to_rgbh(clip: vs.VideoNode) -> vs.VideoNode:
-    return clip.resize.Bilinear(format=vs.RGBH, matrix_in=vs.MATRIX_BT709)  # ty: ignore[unresolved-attribute]
+def _to_rgbh(clip: vs.VideoNode, matrix: int = vs.MATRIX_BT709) -> vs.VideoNode:
+    return clip.resize.Bilinear(format=vs.RGBH, matrix_in=matrix)  # ty: ignore[unresolved-attribute]
 
 
-def build_graph(ctx: StageContext, clip: vs.VideoNode) -> vs.VideoNode:
-    """Assemble the selected stage subset over the decoded clip (canonical order)."""
+def build_graph(
+    ctx: StageContext,
+    clip: vs.VideoNode,
+    matrix: int = vs.MATRIX_BT709,
+) -> vs.VideoNode:
+    """
+    Assemble the selected stage subset over the decoded clip (canonical order).
+
+    ``matrix`` is the source color-space matrix (detected dynamically from the
+    container, fallback BT.709) and drives the YUV→RGBH conversion so 10-bit
+    sources keep correct chroma placement instead of being forced to BT.709.
+    """
     for name in ctx.run.stages:
         if name == "encode":
             continue  # encode is the subprocess sink, not a VS node
         if name == "upscale" or (name == "interpolate" and "upscale" not in ctx.run.stages):
-            clip = _to_rgbh(clip)
+            clip = _to_rgbh(clip, matrix=matrix)
         clip = get_builder(name)(ctx, clip)
     # Mod-2 guard BEFORE the final convert: on non-subsampled formats the 1px
     # crop is exact; on subsampled YUV the chroma granularity forces the scale
@@ -73,6 +85,54 @@ def check_target_fps(source_fps: Fraction, target_fps: tuple[int, int]) -> None:
             "или исключите стадию interpolate."
         )
         raise PipelineError(msg)
+
+
+def _detect_source_matrix(input_path: str | Path) -> int:
+    """
+    Ffprobe the source color_space; map to a vs.MATRIX_* constant, fallback BT.709.
+
+    Ffprobe reports e.g. bt709/smpte170m/bt2020nc/unknown. Unknown or
+    unprobeable sources degrade gracefully to BT.709 — never silently wrong.
+    """
+    try:
+        ffprobe = resolve_tool("ffprobe")
+    except ToolError:
+        return vs.MATRIX_BT709
+    matrix_map: dict[str, int] = {
+        "bt709": vs.MATRIX_BT709,
+        "smpte170m": vs.MATRIX_ST170_M,
+        "smpte240m": vs.MATRIX_ST240_M,
+        "bt470bg": vs.MATRIX_BT470_BG,
+        "bt470m": vs.MATRIX_BT470_BG,
+        "bt2020nc": vs.MATRIX_BT2020_NCL,
+        "bt2020cl": vs.MATRIX_BT2020_CL,
+        "chromaticity-derived-ncl": vs.MATRIX_CHROMATICITY_DERIVED_NCL,
+        "chromaticity-derived-cl": vs.MATRIX_CHROMATICITY_DERIVED_CL,
+        "ictcp": vs.MATRIX_ICTCP,
+    }
+    try:
+        completed = subprocess.run(  # noqa: S603 - ffprobe path from resolve_tool; input_path is a local file
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=color_space",
+                "-of",
+                "csv=p=0",
+                str(input_path),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return vs.MATRIX_BT709
+    raw = completed.stdout.strip().lower()
+    return matrix_map.get(raw, vs.MATRIX_BT709)
 
 
 def run_pipeline(  # noqa: PLR0913 - driver signature + repair-retry controls
@@ -130,24 +190,33 @@ def _run_pipeline_once(
     if "interpolate" in ctx.run.stages:
         check_target_fps(source_fps, ctx.run.interpolate.target_fps)
 
-    graph = build_graph(ctx, clip)
+    source_matrix = _detect_source_matrix(input_path)
+    graph = build_graph(ctx, clip, matrix=source_matrix)
     output_fps = Fraction(graph.fps)
     video_args = build_video_args(
         ctx.run.encode,
         (output_fps.numerator, output_fps.denominator),
         threads=ctx.hardware.encode_threads,
     )
-    args = build_mux_args(input_path, output_path, video_args, ffmpeg=ffmpeg_path)
+    args = build_mux_args(
+        input_path,
+        output_path,
+        video_args,
+        ffmpeg=ffmpeg_path,
+        width=graph.width,
+        height=graph.height,
+        fps_num=output_fps.numerator,
+        fps_den=output_fps.denominator,
+    )
 
     encoder = spawn_encoder(args)
     if encoder.stdin is None:
-        msg = "ffmpeg не открыл stdin для y4m-потока (неожиданный сбой Popen)."
+        msg = "ffmpeg не открыл stdin для rawvideo-потока (неожиданный сбой Popen)."
         raise PipelineError(msg)
     try:
         try:
             graph.output(
                 encoder.stdin,
-                y4m=True,
                 prefetch=max(1, ctx.hardware.num_streams_per_gpu) if ctx.hardware.gpus else 0,
                 progress_update=progress_update,
             )

@@ -69,6 +69,7 @@ no-open-gop = 1
 tskip = 1
 cbqpoffs = -2
 crqpoffs = -2
+chromaloc = 0                       # progresive (frame) chroma placement — rawvideo pipe пишет yuv420p10le без смещения chroma
 # tune НЕ используется: --tune animation = psy-rd 0.4/aq 0.4/deblock 1:1 (усиление мыла) — JET: «НЕ для аниме».
 
 [models]
