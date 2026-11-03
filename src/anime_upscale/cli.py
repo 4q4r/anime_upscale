@@ -31,7 +31,6 @@ from anime_upscale.hardware import HardwareError, HardwareProfile, detect_hardwa
 from anime_upscale.models.fetch import FetchError, ensure_vsrife_seed, verify_all
 from anime_upscale.models.manifest import ManifestError
 from anime_upscale.reporting import (
-    ProgressThrottle,
     Reporter,
     enable_windows_console_vt,
     resolve_mode,
@@ -312,18 +311,16 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
         if output_path.exists():
             reporter.warn(f"Файл существует, будет перезаписан: output/{output_name}")
 
-        # ≤10%-interval progress (§10.4 extended to the pipeline): the VS callback
-        # fires per frame — unthrottled printing would flood the console.
-        progress = ProgressThrottle(reporter, label=f"[{item.name}] Обработка").callback()
-
-        pipeline_mod.run_pipeline(
-            ctx,
-            source_path,
-            output_path,
-            ffmpeg_path=ffmpeg_path,
-            progress_update=progress,
-            auto_repair=auto_repair,
-        )
+        # Smooth live TQDM progress bar with Russian ETA and fps rate.
+        with reporter.progress_bar(label=f"[{item.name}] Обработка") as pbar:
+            pipeline_mod.run_pipeline(
+                ctx,
+                source_path,
+                output_path,
+                ffmpeg_path=ffmpeg_path,
+                progress_update=pbar.callback(),
+                auto_repair=auto_repair,
+            )
         if upload_enabled:
             upload_output(
                 output_path,

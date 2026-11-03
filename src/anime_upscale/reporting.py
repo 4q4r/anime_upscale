@@ -9,7 +9,9 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TextIO
+from typing import Self, TextIO
+
+from tqdm import tqdm
 
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
@@ -125,6 +127,176 @@ class Reporter:
                 self.error(f"{name}: {detail}")
         failed = len(results) - ok_count
         self.banner_line(f"Итог: {ok_count}/{len(results)} успешно, {failed} с ошибкой")
+
+    def progress_bar(
+        self,
+        *,
+        total: int | None = None,
+        label: str = "Обработка",
+    ) -> "PipelineProgressBar":
+        """Create a pipeline progress bar respecting this reporter's mode."""
+        return PipelineProgressBar(
+            total=total,
+            label=label,
+            stream=self.stream,
+            mode=self.mode,
+        )
+
+
+def format_eta(seconds: float | None) -> str:
+    """
+    Format remaining time (ETA) without leading zero units.
+
+    - > 0 hours: `Чч Ммин Сс` (e.g. `1ч 24мин 15с`)
+    - 0 hours and > 0 minutes: `Ммин Сс` (e.g. `8мин 42с`)
+    - 0 hours and 0 minutes: `Сс` (e.g. `35с`)
+    - None or negative: `?`
+    """
+    if seconds is None or seconds < 0:
+        return "?"
+    total_seconds = round(seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+
+    if hours > 0:
+        return f"{hours}ч {minutes}мин {secs}с"
+    if minutes > 0:
+        return f"{minutes}мин {secs}с"
+    return f"{secs}с"
+
+
+class _CustomTqdm(tqdm):
+    """tqdm subclass with customized format_dict for Russian time/rate formatting."""
+
+    @property
+    def format_dict(self) -> dict[str, object]:
+        d = super().format_dict
+        rate = d.get("rate")
+        if rate:
+            d["custom_rate"] = f"{rate:.1f} кадр/с"
+        else:
+            d["custom_rate"] = "? кадр/с"
+
+        remaining = d.get("remaining")
+        d["custom_eta"] = format_eta(remaining if isinstance(remaining, (int, float)) else None)
+        return d
+
+
+class PipelineProgressBar:
+    """
+    Smooth, live TQDM progress bar for VapourSynth processing.
+
+    Accepts (done, total) updates from `clip.output(progress_update=...)`.
+    Shows:
+    - Percentage and smooth progress bar.
+    - Rate in frames/sec (`124.5 кадр/с`).
+    - Exact frame count: `[кадр/всего]`.
+    - Compact Russian ETA without leading zeros (`1ч 24мин 15с`, `8мин 42с`, `35с`).
+    - Clean shutdown/close on finish and error.
+    - Safe non-interactive / no-tty fallback (disabled or line-buffered, no cursor thrashing).
+    """
+
+    def __init__(
+        self,
+        *,
+        total: int | None = None,
+        label: str = "Обработка",
+        stream: TextIO | None = None,
+        mode: OutputMode | None = None,
+        mininterval: float = 0.1,
+    ) -> None:
+        """Initialize pipeline progress bar with optional total frame count and label."""
+        self._stream = stream if stream is not None else sys.stdout
+        self._mode = mode if mode is not None else resolve_mode(stream=self._stream)
+        self._label = label
+        self._total = total
+        self._current_n = 0
+        self._closed = False
+
+        # If non-TTY, disable dynamic bar to prevent carriage return spam
+        is_tty = self._mode.tty and hasattr(self._stream, "isatty") and self._stream.isatty()
+        self._disable = not is_tty
+
+        bar_format = (
+            "{desc}: {percentage:3.0f}%|{bar}| [{n_fmt}/{total_fmt}] [{custom_eta}, {custom_rate}]"
+        )
+
+        self._pbar: tqdm | None = None
+        self._fallback_throttle: ProgressThrottle | None = None
+        if not self._disable:
+            self._pbar = _CustomTqdm(
+                total=total,
+                desc=label,
+                file=self._stream,
+                bar_format=bar_format,
+                unit="кадр",
+                unit_scale=False,
+                dynamic_ncols=True,
+                mininterval=mininterval,
+                leave=True,
+            )
+        else:
+            # Fallback throttle for non-TTY / captured streams (M10, §10.4)
+            reporter = Reporter(mode=self._mode, stream=self._stream)
+            self._fallback_throttle = ProgressThrottle(reporter, label=label)
+
+    @property
+    def disabled(self) -> bool:
+        """Whether dynamic display is disabled (e.g. non-TTY)."""
+        return self._disable
+
+    @property
+    def closed(self) -> bool:
+        """Whether the progress bar has been closed."""
+        return self._closed
+
+    def update(self, done: int, total: int) -> None:
+        """Update progress from VapourSynth progress_update(done, total)."""
+        if self._closed:
+            return
+        if total > 0 and self._total != total:
+            self._total = total
+            if self._pbar is not None:
+                self._pbar.total = total
+
+        delta = done - self._current_n
+        self._current_n = done
+
+        if self._pbar is not None and delta > 0:
+            self._pbar.update(delta)
+        elif self._fallback_throttle is not None:
+            self._fallback_throttle.update(done, total)
+
+    def close(self) -> None:
+        """Close and cleanly finalize the progress bar."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._pbar is not None:
+            self._pbar.close()
+            self._pbar = None
+
+    def __enter__(self) -> Self:
+        """Enter context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        """Exit context manager, ensuring progress bar is closed."""
+        self.close()
+
+    def callback(self) -> Callable[[int, int], None]:
+        """Adapter matching the VS output(progress_update=…) signature."""
+
+        def _update(done: int, total: int) -> None:
+            self.update(done, total)
+
+        return _update
 
 
 class ProgressThrottle:

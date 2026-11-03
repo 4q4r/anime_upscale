@@ -2,15 +2,30 @@
 
 import pytest
 
-from anime_upscale.reporting import OutputMode, ProgressThrottle, Reporter, resolve_mode
+from anime_upscale.reporting import (
+    OutputMode,
+    PipelineProgressBar,
+    ProgressThrottle,
+    Reporter,
+    format_eta,
+    resolve_mode,
+)
 
 
 class _FakeStream:
     def __init__(self, tty: bool) -> None:
         self._tty = tty
+        self.written: list[str] = []
 
     def isatty(self) -> bool:
         return self._tty
+
+    def write(self, s: str) -> int:
+        self.written.append(s)
+        return len(s)
+
+    def flush(self) -> None:
+        pass
 
 
 class TestResolveModeMatrix:
@@ -106,3 +121,86 @@ class TestProgressThrottle:
         cb(50, 100)
         cb(51, 100)  # within the same window → suppressed
         assert len(reporter.lines) == 1
+
+
+class TestFormatEta:
+    """Format ETA requirements: >0h -> 'Hч Mмин Sс', 0h -> 'Mмин Sс', 0h0m -> 'Sс'."""
+
+    def test_seconds_only(self) -> None:
+        assert format_eta(35) == "35с"
+        assert format_eta(0) == "0с"
+        assert format_eta(59.4) == "59с"
+        assert format_eta(30) == "30с"
+
+    def test_minutes_and_seconds(self) -> None:
+        # 8m 42s = 8 * 60 + 42 = 522s
+        assert format_eta(522) == "8мин 42с"
+        # 5m 12s = 5 * 60 + 12 = 312s
+        assert format_eta(312) == "5мин 12с"
+
+    def test_hours_minutes_and_seconds(self) -> None:
+        # 1h 24m 15s = 3600 + 1440 + 15 = 5055s
+        assert format_eta(5055) == "1ч 24мин 15с"
+        # 2h 10m 5s = 7200 + 600 + 5 = 7805s
+        assert format_eta(7805) == "2ч 10мин 5с"
+
+    def test_invalid_or_none(self) -> None:
+        assert format_eta(None) == "?"
+        assert format_eta(-5) == "?"
+
+
+class _DummyTtyStream(_FakeStream):
+    def __init__(self) -> None:
+        super().__init__(tty=True)
+
+
+class TestPipelineProgressBar:
+    def test_disabled_on_non_tty(self) -> None:
+        stream = _FakeStream(tty=False)
+        pbar = PipelineProgressBar(total=100, stream=stream)
+        assert pbar.disabled is True
+        cb = pbar.callback()
+        cb(10, 100)
+        pbar.close()
+        assert pbar.closed is True
+
+    def test_enabled_on_tty(self) -> None:
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        with PipelineProgressBar(total=100, stream=stream, mode=mode) as pbar:
+            assert pbar.disabled is False
+            cb = pbar.callback()
+            cb(50, 100)
+            assert pbar._current_n == 50
+        assert pbar.closed is True
+
+    def test_rate_formatting_in_format_dict(self) -> None:
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        with PipelineProgressBar(total=100, stream=stream, mode=mode) as pbar:
+            assert pbar._pbar is not None
+            # Force rate in format_dict
+            d = pbar._pbar.format_dict
+            assert "кадр/с" in str(d.get("custom_rate"))
+
+    def test_context_manager_closes_on_error(self) -> None:
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        pbar_ref = None
+        try:
+            with PipelineProgressBar(total=100, stream=stream, mode=mode) as pbar:
+                pbar_ref = pbar
+                msg = "boom"
+                raise RuntimeError(msg)
+        except RuntimeError:
+            pass
+        assert pbar_ref is not None
+        assert pbar_ref.closed is True
+
+    def test_update_changes_total_if_adjusted(self) -> None:
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        with PipelineProgressBar(total=100, stream=stream, mode=mode) as pbar:
+            pbar.update(20, 200)
+            assert pbar._total == 200
+            assert pbar._current_n == 20
