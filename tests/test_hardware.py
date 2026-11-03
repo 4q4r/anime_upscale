@@ -11,8 +11,13 @@ from anime_upscale.hardware import (
 )
 
 
-def _gpu(vram_mb: int = 16384) -> GPUInfo:
-    return GPUInfo(index=0, name="NVIDIA GeForce RTX 5080", vram_mb=vram_mb)
+def _gpu(vram_mb: int = 16384, compute_capability: tuple[int, int] = (12, 0)) -> GPUInfo:
+    return GPUInfo(
+        index=0,
+        name="NVIDIA GeForce RTX 5080",
+        vram_mb=vram_mb,
+        compute_capability=compute_capability,
+    )
 
 
 class TestVramBudget:
@@ -102,3 +107,91 @@ class TestDetect:
         )
         assert profile.gpu_count == 1
         assert profile.gpus[0].index == 1
+
+
+class TestBlackwellDetection:
+    def test_blackwell_by_compute_capability(self) -> None:
+        gpu = GPUInfo(index=0, name="Custom GPU", vram_mb=16384, compute_capability=(12, 0))
+        profile = HardwareProfile(
+            gpus=(gpu,),
+            gpu_count=1,
+            cpu_logical_cores=8,
+            num_streams_per_gpu=2,
+            encode_threads=8,
+            precision="fp16",
+        )
+        assert profile.is_blackwell is True
+        assert profile.recommended_interp_format == "rgbs"
+        assert profile.recommended_trt is False
+
+    def test_blackwell_by_name(self) -> None:
+        gpu = GPUInfo(
+            index=0,
+            name="NVIDIA GeForce RTX 5080",
+            vram_mb=16384,
+            compute_capability=(0, 0),
+        )
+        profile = HardwareProfile(
+            gpus=(gpu,),
+            gpu_count=1,
+            cpu_logical_cores=8,
+            num_streams_per_gpu=2,
+            encode_threads=8,
+            precision="fp16",
+        )
+        assert profile.is_blackwell is True
+        assert profile.recommended_interp_format == "rgbs"
+        assert profile.recommended_trt is False
+
+    def test_older_gpu_defaults(self) -> None:
+        gpu = GPUInfo(
+            index=0,
+            name="NVIDIA GeForce RTX 4090",
+            vram_mb=24576,
+            compute_capability=(8, 9),
+        )
+        profile = HardwareProfile(
+            gpus=(gpu,),
+            gpu_count=1,
+            cpu_logical_cores=16,
+            num_streams_per_gpu=3,
+            encode_threads=16,
+            precision="fp16",
+        )
+        assert profile.is_blackwell is False
+        assert profile.recommended_interp_format == "rgbh"
+        assert profile.recommended_trt is True
+
+    def test_banner_blackwell_highlight(self) -> None:
+        from anime_upscale.hardware import print_banner
+        from anime_upscale.reporting import Reporter, resolve_mode
+
+        lines: list[str] = []
+
+        class InterceptReporter(Reporter):
+            def note(self, text: str) -> None:
+                lines.append(text)
+                super().note(text)
+
+        reporter = InterceptReporter(resolve_mode(no_color=True, no_tty=True))
+        gpu = GPUInfo(
+            index=0,
+            name="NVIDIA GeForce RTX 5080",
+            vram_mb=16384,
+            compute_capability=(12, 0),
+        )
+        profile = HardwareProfile(
+            gpus=(gpu,),
+            gpu_count=1,
+            cpu_logical_cores=8,
+            num_streams_per_gpu=2,
+            encode_threads=8,
+            precision="fp16",
+        )
+        print_banner(reporter, profile, stages=("interpolate", "encode"))
+        expected_msg = (
+            "Детект GPU: NVIDIA GeForce RTX 5080 (Blackwell sm_120) → "
+            "автоматический выбор: FP32 (RGBS) без TensorRT "
+            "для предотвращения глитчей/сеток в RIFE."
+        )
+        assert any(expected_msg in line for line in lines)

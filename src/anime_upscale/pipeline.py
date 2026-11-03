@@ -37,8 +37,12 @@ class PipelineError(Exception):
     """Loud pipeline failure (Russian message)."""
 
 
-def _to_rgbh(clip: vs.VideoNode, matrix: int = vs.MATRIX_BT709) -> vs.VideoNode:
-    return clip.resize.Bilinear(format=vs.RGBH, matrix_in=matrix)  # ty: ignore[unresolved-attribute]
+def _to_rgb(
+    clip: vs.VideoNode,
+    target_format: int = vs.RGBH,
+    matrix: int = vs.MATRIX_BT709,
+) -> vs.VideoNode:
+    return clip.resize.Bilinear(format=target_format, matrix_in=matrix)  # ty: ignore[unresolved-attribute]
 
 
 def build_graph(
@@ -50,14 +54,17 @@ def build_graph(
     Assemble the selected stage subset over the decoded clip (canonical order).
 
     ``matrix`` is the source color-space matrix (detected dynamically from the
-    container, fallback BT.709) and drives the YUV→RGBH conversion so 10-bit
+    container, fallback BT.709) and drives the YUV→RGB conversion so 10-bit
     sources keep correct chroma placement instead of being forced to BT.709.
     """
     for name in ctx.run.stages:
         if name == "encode":
             continue  # encode is the subprocess sink, not a VS node
-        if name == "upscale" or (name == "interpolate" and "upscale" not in ctx.run.stages):
-            clip = _to_rgbh(clip, matrix=matrix)
+        if name == "upscale":
+            clip = _to_rgb(clip, target_format=vs.RGBH, matrix=matrix)
+        elif name == "interpolate" and "upscale" not in ctx.run.stages:
+            interp_format = vs.RGBS if ctx.hardware.recommended_interp_format == "rgbs" else vs.RGBH
+            clip = _to_rgb(clip, target_format=interp_format, matrix=matrix)
         clip = get_builder(name)(ctx, clip)
     # Mod-2 guard BEFORE the final convert: on non-subsampled formats the 1px
     # crop is exact; on subsampled YUV the chroma granularity forces the scale

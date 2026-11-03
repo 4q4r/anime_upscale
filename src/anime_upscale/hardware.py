@@ -35,6 +35,7 @@ class GPUInfo:
     index: int
     name: str
     vram_mb: int
+    compute_capability: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,27 @@ class HardwareProfile:
     num_streams_per_gpu: int
     encode_threads: int
     precision: str
+
+    @property
+    def is_blackwell(self) -> bool:
+        """True if compute capability >= (12, 0) or device name matches RTX 50xx."""
+        for gpu in self.gpus:
+            if gpu.compute_capability >= (12, 0):
+                return True
+            name_upper = gpu.name.upper()
+            if "RTX 50" in name_upper or "RTX50" in name_upper:
+                return True
+        return False
+
+    @property
+    def recommended_interp_format(self) -> str:
+        """'rgbs' for Blackwell / fp16 overflow risk devices; 'rgbh' for others."""
+        return "rgbs" if self.is_blackwell else "rgbh"
+
+    @property
+    def recommended_trt(self) -> bool:
+        """False for Blackwell due to TRT 11 + RIFE compiler bug; True for older tested GPUs."""
+        return not self.is_blackwell
 
 
 def streams_for_vram(vram_mb: int) -> int:
@@ -70,6 +92,7 @@ def _probe_torch_gpus() -> list[GPUInfo]:
             index=index,
             name=torch.cuda.get_device_properties(index).name,
             vram_mb=round(torch.cuda.get_device_properties(index).total_memory / (1024 * 1024)),
+            compute_capability=torch.cuda.get_device_capability(index),
         )
         for index in range(torch.cuda.device_count())
     ]
@@ -168,3 +191,11 @@ def print_banner(reporter: Reporter, profile: HardwareProfile, stages: tuple[str
         stages=" → ".join(stages),
         encode=str(profile.encode_threads),
     )
+    if profile.is_blackwell and profile.gpus:
+        target_gpu = profile.gpus[0]
+        major, minor = target_gpu.compute_capability
+        reporter.note(
+            f"Детект GPU: {target_gpu.name} (Blackwell sm_{major}{minor}) → "
+            "автоматический выбор: FP32 (RGBS) без TensorRT "
+            "для предотвращения глитчей/сеток в RIFE."
+        )

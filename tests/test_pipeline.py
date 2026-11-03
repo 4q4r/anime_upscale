@@ -34,6 +34,7 @@ class TestGraphAssembly:
         descale_height: int | None = None,
         models_dir: object = None,
         models_manifest: object = None,
+        is_blackwell: bool = False,
     ) -> "object":
         _skip_without_vs()
         from anime_upscale.config import (
@@ -43,13 +44,18 @@ class TestGraphAssembly:
             InterpolateConfig,
             UpscaleConfig,
         )
-        from anime_upscale.hardware import HardwareProfile
+        from anime_upscale.hardware import GPUInfo, HardwareProfile
         from anime_upscale.reporting import Reporter, resolve_mode
         from anime_upscale.stages import StageContext
 
+        gpus = (
+            (GPUInfo(index=0, name="RTX 5080", vram_mb=16384, compute_capability=(12, 0)),)
+            if is_blackwell
+            else ()
+        )
         hw = HardwareProfile(
-            gpus=(),
-            gpu_count=0,
+            gpus=gpus,
+            gpu_count=len(gpus),
             cpu_logical_cores=4,
             num_streams_per_gpu=0,
             encode_threads=4,
@@ -70,7 +76,7 @@ class TestGraphAssembly:
             hardware=hw,
             project_root=None,  # type: ignore[arg-type]
             reporter=Reporter(resolve_mode(no_color=True, no_tty=True)),
-            models_dir=models_dir,
+            models_dir=models_dir,  # type: ignore[arg-type]
             models_manifest=models_manifest,  # type: ignore[arg-type]
         )
 
@@ -113,6 +119,49 @@ class TestGraphAssembly:
                 ),
                 clip,
             )
+
+    def test_interp_format_selection_rgbs_for_blackwell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When interpolate stage is entered without upscale on Blackwell, RGBS is selected."""
+        import vapoursynth as vs
+
+        from anime_upscale.pipeline import _to_rgb
+        from anime_upscale.stages import STAGE_BUILDERS
+
+        converted_formats: list[int] = []
+
+        def spy_to_rgb(
+            clip: vs.VideoNode,
+            target_format: int = vs.RGBH,
+            matrix: int = vs.MATRIX_BT709,
+        ) -> vs.VideoNode:
+            converted_formats.append(target_format)
+            return _to_rgb(clip, target_format=target_format, matrix=matrix)
+
+        monkeypatch.setattr("anime_upscale.pipeline._to_rgb", spy_to_rgb)
+
+        # Mock the interpolate builder so we don't need real RIFE/GPU
+        monkeypatch.setitem(
+            STAGE_BUILDERS,
+            "interpolate",
+            lambda ctx, clip: clip,
+        )
+
+        core = vs.core
+        clip = core.std.BlankClip(format=vs.YUV420P8, width=64, height=64, length=5)
+
+        # Blackwell context
+        ctx_bw = self._ctx(("interpolate", "encode"), is_blackwell=True)
+        out_bw = build_graph(ctx_bw, clip)
+        assert converted_formats[-1] == vs.RGBS
+        assert out_bw.format.id == vs.YUV420P10
+
+        # Non-Blackwell context
+        ctx_non_bw = self._ctx(("interpolate", "encode"), is_blackwell=False)
+        out_non_bw = build_graph(ctx_non_bw, clip)
+        assert converted_formats[-1] == vs.RGBH
+        assert out_non_bw.format.id == vs.YUV420P10
 
 
 class _RecordingReporter:
@@ -259,3 +308,79 @@ class TestEncoderTeardown:
                 ffmpeg_path="/usr/bin/ffmpeg",
             )
         assert waits == [True]
+
+
+class TestInterpolateStageTRTFallback:
+    def test_trt_disabled_on_blackwell_with_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+        import types
+
+        from anime_upscale.config import (
+            DebandConfig,
+            DescaleConfig,
+            EncodeConfig,
+            InterpolateConfig,
+            RunConfig,
+            UpscaleConfig,
+        )
+        from anime_upscale.hardware import GPUInfo, HardwareProfile
+        from anime_upscale.reporting import Reporter, resolve_mode
+        from anime_upscale.stages import StageContext
+        from anime_upscale.stages.interpolate import apply as interp_apply
+
+        captured_kwargs: dict[str, object] = {}
+
+        fake_vsrife = types.ModuleType("vsrife")
+
+        def fake_rife(clip: object, **kwargs: object) -> object:
+            captured_kwargs.update(kwargs)
+            return clip
+
+        fake_vsrife.rife = fake_rife  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "vsrife", fake_vsrife)
+
+        warnings: list[str] = []
+
+        class InterceptReporter(Reporter):
+            def warn(self, text: str) -> None:
+                warnings.append(text)
+                super().warn(text)
+
+        gpu = GPUInfo(index=0, name="RTX 5080", vram_mb=16384, compute_capability=(12, 0))
+        hw = HardwareProfile(
+            gpus=(gpu,),
+            gpu_count=1,
+            cpu_logical_cores=8,
+            num_streams_per_gpu=2,
+            encode_threads=8,
+            precision="fp16",
+        )
+        run = RunConfig(
+            stages=("interpolate",),
+            descale=DescaleConfig(),
+            deband=DebandConfig(),
+            upscale=UpscaleConfig(),
+            interpolate=InterpolateConfig(trt=True),
+            encode=EncodeConfig(),
+            descale_height=None,
+            upload=False,
+        )
+        reporter = InterceptReporter(resolve_mode(no_color=True, no_tty=True))
+        ctx = StageContext(
+            run=run,
+            hardware=hw,
+            project_root=None,  # type: ignore[arg-type]
+            reporter=reporter,
+            models_dir=None,  # type: ignore[arg-type]
+            models_manifest=None,  # type: ignore[arg-type]
+        )
+
+        class FakeClip:
+            width = 1920
+            height = 1080
+
+        interp_apply(ctx, FakeClip())  # type: ignore[arg-type]
+
+        assert captured_kwargs["trt"] is False
+        expected_warning = "TensorRT отключен, используется безопасный режим PyTorch CUDA"
+        assert any(expected_warning in w for w in warnings)

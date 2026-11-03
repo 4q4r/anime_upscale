@@ -33,6 +33,15 @@ def apply(ctx: StageContext, clip: vs.VideoNode) -> vs.VideoNode:
     device_index = ctx.hardware.gpus[0].index if ctx.hardware.gpus else 0
     cache_dir = Path(cfg.trt_cache_dir).expanduser()
     cache_dir.mkdir(parents=True, exist_ok=True)  # vsrife requires an existing dir
+
+    use_trt = cfg.trt
+    if use_trt and not ctx.hardware.recommended_trt:
+        ctx.reporter.warn(
+            "Обнаружена несовместимость TensorRT с текущей архитектурой GPU (Blackwell). "
+            "TensorRT отключен, используется безопасный режим PyTorch CUDA."
+        )
+        use_trt = False
+
     return rife(
         clip,
         device_index=device_index,
@@ -42,7 +51,7 @@ def apply(ctx: StageContext, clip: vs.VideoNode) -> vs.VideoNode:
         fps_den=cfg.target_fps[1],
         sc=cfg.scene_detection,
         sc_threshold=cfg.scene_threshold if cfg.scene_detection else None,
-        trt=cfg.trt,
+        trt=use_trt,
         trt_static_shape=True,
         trt_opt_shape=shape,
         trt_cache_dir=str(cache_dir),
