@@ -35,6 +35,38 @@ def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_a
     which ffmpeg misreads as 8-bit → violet-square artifacts on 10-bit sources.
     width/height/fps_num/fps_den come from the assembled VS graph (known after
     build_graph) and are required for rawvideo demuxer framing.
+
+    Audio stream muxing problem & investigation:
+    --------------------------------------------
+    Problem:
+        When encoding rawvideo from stdin and simultaneously copying audio tracks,
+        subtitles, and font attachments from the source container into a single MKV,
+        the resulting audio tracks ended up empty (0 bytes).
+
+    Root Cause (Investigation):
+        Anime release containers typically contain sparse streams: ASS subtitle
+        events and attachment fonts (OTF/TTF). FFmpeg's default stream interleaving
+        algorithm (`max_interleave_delta=10000000`, i.e., 10 seconds) buffers packets
+        and waits for packets from all streams to maintain interleaved presentation.
+        Because rawvideo from stdin was fed using the legacy `-r` option instead of
+        `-framerate`, timestamps on the raw demuxer could desync or lack granular
+        framing markers. Simultaneously, without `-thread_queue_size`, the demuxer's
+        internal packet queues for both stdin and file streams starved. When the
+        rawvideo stdin reached EOF and closed, the demuxer flushed the remaining
+        state while dropping un-interleaved audio packets, writing 0 bytes of audio data.
+
+    Solution & Rationale:
+        To resolve this cleanly in a single FFmpeg process without disk overhead or
+        intermediate temporary files:
+        1. `-framerate {fps_num}/{fps_den}`: Sets exact timestamps (PTS) directly on
+           the rawvideo demuxer (unlike `-r` which drops/duplicates frames).
+        2. `-thread_queue_size 4096`: Placed before both inputs (`-i -` and `-i {source}`)
+           to prevent queue starvation and buffer packet bursts during slow encoding.
+        3. `-max_interleave_delta 0`: Forces FFmpeg to flush interleaved packets
+           immediately upon readiness rather than buffering up to 10 seconds waiting
+           for sparse subtitle/font packets.
+        4. `-max_muxing_queue_size 4096`: Extends muxer packet buffer capacity to safely
+           handle slower libx265 processing intervals without buffer overruns.
     """
     if width is None or height is None or fps_num is None or fps_den is None:
         msg = "build_mux_args требует width, height, fps_num, fps_den для rawvideo-входа."
@@ -51,10 +83,14 @@ def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_a
         "yuv420p10le",
         "-s",
         f"{width}x{height}",
-        "-r",
+        "-framerate",
         f"{fps_num}/{fps_den}",
+        "-thread_queue_size",
+        "4096",
         "-i",
         "-",
+        "-thread_queue_size",
+        "4096",
         "-i",
         str(source),
         *video_args,
@@ -76,6 +112,10 @@ def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_a
         "copy",
         "-c:t",
         "copy",
+        "-max_interleave_delta",
+        "0",
+        "-max_muxing_queue_size",
+        "4096",
         "-f",
         "matroska",
         str(output),

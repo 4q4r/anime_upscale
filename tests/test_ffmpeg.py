@@ -34,10 +34,15 @@ class TestMuxArgs:
         assert "-f" in args and args[args.index("-f") + 1] == "rawvideo"
         assert args[args.index("-pix_fmt") + 1] == "yuv420p10le"
         assert args[args.index("-s") + 1] == "1920x1080"
-        assert args[args.index("-r") + 1] == "60000/1001"
-        assert args[args.index("-i") + 1] == "-"
+        assert "-r" not in args
+        assert args[args.index("-framerate") + 1] == "60000/1001"
+        assert args.count("-thread_queue_size") == 2
+        stdin_idx = args.index("-")
+        assert args[stdin_idx - 1] == "-i"
+        assert args[stdin_idx - 3 : stdin_idx - 1] == ["-thread_queue_size", "4096"]
         src_index = args.index("/proj/input/src.mkv")
         assert args[src_index - 1] == "-i"
+        assert args[src_index - 3 : src_index - 1] == ["-thread_queue_size", "4096"]
         assert "-map" in args and args[args.index("-map") + 1] == "0:v:0"
         maps = [args[i + 1] for i, a in enumerate(args) if a == "-map"]
         assert maps == ["0:v:0", "1:a?", "1:s?", "1:t?"]
@@ -46,6 +51,8 @@ class TestMuxArgs:
         assert args[args.index("-c:a") + 1] == "copy"
         assert args[args.index("-c:s") + 1] == "copy"
         assert args[args.index("-c:t") + 1] == "copy"
+        assert args[args.index("-max_interleave_delta") + 1] == "0"
+        assert args[args.index("-max_muxing_queue_size") + 1] == "4096"
         assert args[-1] == "/proj/output/dst.mkv"
 
     def test_video_args_land_between_inputs_and_output(self) -> None:
