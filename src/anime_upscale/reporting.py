@@ -142,6 +142,20 @@ class Reporter:
             mode=self.mode,
         )
 
+    def upload_progress_bar(
+        self,
+        *,
+        total: int,
+        filename: str,
+    ) -> "UploadProgressBar":
+        """Create a network upload progress bar respecting this reporter's mode."""
+        return UploadProgressBar(
+            total=total,
+            filename=filename,
+            stream=self.stream,
+            mode=self.mode,
+        )
+
 
 def format_eta(seconds: float | None) -> str:
     """
@@ -181,6 +195,142 @@ class _CustomTqdm(tqdm):
         remaining = d.get("remaining")
         d["custom_eta"] = format_eta(remaining if isinstance(remaining, (int, float)) else None)
         return d
+
+
+class _UploadCustomTqdm(tqdm):
+    """tqdm subclass with customized format_dict for network upload rate and Russian ETA."""
+
+    @property
+    def format_dict(self) -> dict[str, object]:
+        d = super().format_dict
+        rate = d.get("rate")
+        if rate:
+            # rate is in bytes per second because unit="B", unit_scale=True, unit_divisor=1024
+            mbytes = rate / (1024 * 1024)
+            d["custom_rate"] = f"{mbytes:.1f} МБ/с"
+        else:
+            d["custom_rate"] = "? МБ/с"
+
+        remaining = d.get("remaining")
+        d["custom_eta"] = format_eta(remaining if isinstance(remaining, (int, float)) else None)
+        return d
+
+
+class UploadProgressBar:
+    """
+    Smooth, live TQDM progress bar for network uploads (plan §10).
+
+    Shows:
+    - Prefix: `[{filename}] Загрузка`
+    - Percentage: every 1% update
+    - Transferred bytes out of total with unit_divisor=1024 (e.g. 512.0M/10.0G or MiB/GiB)
+    - Real-time speed in `МБ/с`
+    - Compact Russian ETA formatted via `format_eta` (`35с`, `8мин 42с`, `1ч 24мин 15с`)
+    - Context manager protocol (`with reporter.upload_progress_bar(...) as pbar:`)
+    - Safe non-interactive / non-TTY fallback (line-buffered progress_bytes).
+    """
+
+    def __init__(
+        self,
+        *,
+        total: int,
+        filename: str,
+        stream: TextIO | None = None,
+        mode: OutputMode | None = None,
+        mininterval: float = 0.1,
+    ) -> None:
+        """Initialize upload progress bar with filename, total bytes, and output mode."""
+        self._stream = stream if stream is not None else sys.stdout
+        self._mode = mode if mode is not None else resolve_mode(stream=self._stream)
+        self._filename = filename
+        self._total = total
+        self._current_n = 0
+        self._closed = False
+
+        is_tty = self._mode.tty and hasattr(self._stream, "isatty") and self._stream.isatty()
+        self._disable = not is_tty
+
+        desc = f"[{filename}] Загрузка"
+        bar_format = (
+            "{desc}: {percentage:3.0f}%|{bar}| [{n_fmt}/{total_fmt}] [{custom_eta}, {custom_rate}]"
+        )
+
+        self._pbar: tqdm | None = None
+        self._fallback_reporter: Reporter | None = None
+        if not self._disable:
+            self._pbar = _UploadCustomTqdm(
+                total=total,
+                desc=desc,
+                file=self._stream,
+                bar_format=bar_format,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                dynamic_ncols=True,
+                mininterval=mininterval,
+                leave=True,
+            )
+        else:
+            self._fallback_reporter = Reporter(mode=self._mode, stream=self._stream)
+
+    @property
+    def disabled(self) -> bool:
+        """Whether dynamic display is disabled (e.g. non-TTY)."""
+        return self._disable
+
+    @property
+    def closed(self) -> bool:
+        """Whether the progress bar has been closed."""
+        return self._closed
+
+    def update(self, done: int, total: int | None = None) -> None:
+        """Update progress with current transferred bytes and optional total."""
+        if self._closed:
+            return
+        if total is not None and total > 0 and self._total != total:
+            self._total = total
+            if self._pbar is not None:
+                self._pbar.total = total
+
+        delta = done - self._current_n
+        self._current_n = done
+
+        if self._pbar is not None and delta > 0:
+            self._pbar.update(delta)
+        elif self._fallback_reporter is not None:
+            self._fallback_reporter.progress_bytes(
+                f"[{self._filename}] Загрузка", done, self._total
+            )
+
+    def close(self) -> None:
+        """Close and cleanly finalize the progress bar."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._pbar is not None:
+            self._pbar.close()
+            self._pbar = None
+
+    def __enter__(self) -> Self:
+        """Enter context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        """Exit context manager, ensuring progress bar is closed."""
+        self.close()
+
+    def callback(self) -> Callable[[int, int], None]:
+        """Adapter matching the progress(sent, total) signature."""
+
+        def _update(done: int, total: int) -> None:
+            self.update(done, total)
+
+        return _update
 
 
 class PipelineProgressBar:

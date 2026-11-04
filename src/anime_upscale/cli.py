@@ -322,12 +322,14 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
                 auto_repair=auto_repair,
             )
         if upload_enabled:
-            upload_output(
-                output_path,
-                client_factory(),
-                reporter,
-                progress=lambda done, total: reporter.progress_bytes("Загрузка", done, total),
-            )
+            total_size = output_path.stat().st_size if output_path.exists() else 0
+            with reporter.upload_progress_bar(total=total_size, filename=item.name) as upbar:
+                upload_output(
+                    output_path,
+                    client_factory(),
+                    reporter,
+                    progress=upbar.callback(),
+                )
     except ImportError as exc:
         # Must precede the pipeline_mod tuple below: with the import itself
         # failed, pipeline_mod is unbound and evaluating that tuple would

@@ -6,7 +6,13 @@ import pytest
 
 from anime_upscale.gofile import GofileClient, GofileError
 from anime_upscale.reporting import Reporter, resolve_mode
-from anime_upscale.upload import UploadError, pick_server, upload_file, upload_output
+from anime_upscale.upload import (
+    AdaptiveStreamingMultipart,
+    UploadError,
+    pick_server,
+    upload_file,
+    upload_output,
+)
 
 
 class _Response:
@@ -34,12 +40,21 @@ class _FakeSession:
 
     def post(self, url: str, **kwargs: object) -> _Response:
         files = kwargs.get("files")
+        data = kwargs.get("data")
         if files and "file" in files:
             name, stream = files["file"]
             chunks = []
             while chunk := stream.read(65536):  # emulate requests draining the stream
                 chunks.append(chunk)
             kwargs = {**kwargs, "files": {"file": (name, b"".join(chunks))}}
+        elif (
+            data is not None
+            and hasattr(data, "__iter__")
+            and not isinstance(data, (bytes, str, dict))
+        ):
+            # Emulate streaming body consumption by requests / socket sendall
+            streamed = list(data)
+            kwargs = {**kwargs, "data": b"".join(streamed)}
         self.post_kwargs = {"url": url, **kwargs}
         return self.post_response
 
@@ -100,6 +115,12 @@ class TestUploadFile:
         assert fake.post_kwargs["url"] == "https://store-eu-par-1.gofile.io/uploadfile"
         assert fake.post_kwargs["cookies"] == {"accountToken": "guest"}
         assert "store-eu-par-1.gofile.io" in fake.pins
+        assert "headers" in fake.post_kwargs
+        assert "Content-Length" in fake.post_kwargs["headers"]
+        assert "multipart/form-data; boundary=" in fake.post_kwargs["headers"]["Content-Type"]
+        assert isinstance(fake.post_kwargs["data"], bytes)
+        # Check that file content is in the streamed multipart body
+        assert file.read_bytes() in fake.post_kwargs["data"]
 
     def test_account_token_cookie_attached(self, tmp_path: Path) -> None:
         file, fake = _setup(tmp_path)
@@ -107,6 +128,21 @@ class TestUploadFile:
         upload_file(file, client)
         assert fake.post_kwargs is not None
         assert fake.post_kwargs["cookies"] == {"accountToken": "premium-tok"}
+        data = fake.post_kwargs["data"]
+        assert b'name="token"\r\n\r\npremium-tok\r\n' in data
+
+    def test_folder_id_attached(self, tmp_path: Path) -> None:
+        file, fake = _setup(tmp_path)
+        client = _client(fake, account_token="tok")
+        upload_file(file, client, folder_id="fld-12345")
+        assert fake.post_kwargs is not None
+        data = fake.post_kwargs["data"]
+        # Strict ordering: token before folderId before file
+        token_idx = data.find(b'name="token"')
+        folder_idx = data.find(b'name="folderId"')
+        file_idx = data.find(b'name="file"')
+        assert -1 < token_idx < folder_idx < file_idx
+        assert b"fld-12345" in data
 
     def test_progress_called(self, tmp_path: Path) -> None:
         file, fake = _setup(tmp_path)
@@ -164,3 +200,70 @@ class TestUploadOutput:
         reporter = Reporter(resolve_mode(no_color=True, no_tty=True))
         with pytest.raises(UploadError, match="network dead"):
             upload_output(file, client, reporter)
+
+
+class TestAdaptiveStreamingMultipart:
+    def test_len_matches_exact_bytes(self, tmp_path: Path) -> None:
+        content = b"hello multipart world"
+        file = tmp_path / "video.mkv"
+        file.write_bytes(content)
+
+        streamer = AdaptiveStreamingMultipart(
+            file,
+            token="secret_token",
+            folder_id="target_folder",
+            boundary="CustomBoundary123",
+        )
+        total_len = len(streamer)
+        yielded_bytes = b"".join(list(streamer))
+        assert len(yielded_bytes) == total_len
+
+    def test_field_order_and_content_type(self, tmp_path: Path) -> None:
+        content = b"fake video bytes"
+        file = tmp_path / "episode1.mkv"
+        file.write_bytes(content)
+
+        streamer = AdaptiveStreamingMultipart(
+            file,
+            token="tok123",
+            folder_id="fol456",
+            boundary="BND",
+        )
+        payload = b"".join(list(streamer))
+        tok_pos = payload.find(b'name="token"\r\n\r\ntok123')
+        fol_pos = payload.find(b'name="folderId"\r\n\r\nfol456')
+        file_pos = payload.find(b'name="file"; filename="episode1.mkv"')
+        ct_pos = payload.find(b"Content-Type: video/x-matroska")
+
+        assert tok_pos != -1
+        assert fol_pos != -1
+        assert file_pos != -1
+        assert ct_pos != -1
+        assert tok_pos < fol_pos < file_pos < ct_pos
+        assert payload.endswith(b"--BND--\r\n")
+
+    def test_adaptive_scaling_up_and_down(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Create a 20MB file
+        chunk_data = b"0" * (1024 * 1024)
+        file = tmp_path / "big.mkv"
+        file.write_bytes(chunk_data * 20)
+
+        # Mock time.monotonic to simulate fast network (0.01s elapsed per chunk)
+        cur_time = [0.0]
+
+        def fake_monotonic() -> float:
+            cur_time[0] += 0.05
+            return cur_time[0]
+
+        monkeypatch.setattr("time.monotonic", fake_monotonic)
+
+        streamer = AdaptiveStreamingMultipart(file, initial_chunk_size=1 * 1024 * 1024)
+        chunks = list(streamer)
+        # Check that chunk sizes scaled up
+        # chunks: [0]=pre_headers, [1]=file_header, [2..N-1]=file chunks, [N]=closing
+        file_chunks = chunks[1:-1]
+        chunk_sizes = [len(c) for c in file_chunks]
+        # At least one chunk should be larger than 1 MiB
+        assert any(size > 1 * 1024 * 1024 for size in chunk_sizes)
