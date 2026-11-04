@@ -8,9 +8,12 @@ with printed skips). Bare names are never renamed; download collisions
 disambiguate as <stem>-2<ext> with a printed note (plan §11.6).
 """
 
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import requests
@@ -216,6 +219,8 @@ class QueueItem:
     name: str  # file name inside input/
     kind: str  # "local" | "url" | "gofile"
     url: str = ""  # download URL for url/gofile kinds
+    expected_size: int | None = None
+    expected_md5: str | None = None
 
 
 def build_queue(
@@ -278,6 +283,8 @@ def build_queue(
                             name=name,
                             kind="gofile",
                             url=child.link,
+                            expected_size=child.size,
+                            expected_md5=child.md5,
                         )
                     )
     return queue
@@ -328,19 +335,148 @@ def ensure_local(name: str, input_dir: Path) -> Path:
     return path
 
 
+def compute_file_md5(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Compute hex-encoded MD5 digest of a local file."""
+    md5 = hashlib.md5(usedforsecurity=False)
+    with path.open("rb") as f:
+        while chunk := f.read(chunk_size):
+            md5.update(chunk)
+    return md5.hexdigest().lower()
+
+
+class FetchCache:
+    """Persistent cache in input/.fetch_cache.json for downloaded remote inputs."""
+
+    def __init__(self, cache_file: Path) -> None:
+        """Initialize and load cache from file."""
+        self.cache_file = cache_file
+        self._entries: dict[str, dict[str, Any]] = {}
+        self.load()
+
+    def load(self) -> None:
+        """Load cache entries from JSON file on disk."""
+        if not self.cache_file.is_file():
+            self._entries = {}
+            return
+        try:
+            with self.cache_file.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    self._entries = {k: v for k, v in data.items() if isinstance(v, dict)}
+                else:
+                    self._entries = {}
+        except (json.JSONDecodeError, OSError):
+            self._entries = {}
+
+    def save(self) -> None:
+        """Save cache entries to JSON file on disk atomically."""
+        try:
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = self.cache_file.with_name(f"{self.cache_file.name}.tmp")
+            with tmp_file.open("w", encoding="utf-8") as f:
+                json.dump(self._entries, f, indent=2, ensure_ascii=False)
+            tmp_file.replace(self.cache_file)
+        except OSError:
+            pass
+
+    def get(self, filename: str) -> dict[str, Any] | None:
+        """Retrieve cached metadata for filename."""
+        return self._entries.get(filename)
+
+    def record(  # noqa: PLR0913, PLR0917
+        self,
+        filename: str,
+        source: str,
+        size: int,
+        md5: str | None,
+        local_size: int,
+        mtime: float,
+    ) -> None:
+        """Record or update entry in cache."""
+        self._entries[filename] = {
+            "source": source,
+            "size": size,
+            "md5": md5,
+            "local_size": local_size,
+            "mtime": mtime,
+        }
+        self.save()
+
+
+def _verify_existing_remote(
+    item: QueueItem,
+    target: Path,
+    cache: FetchCache,
+    reporter: Reporter,
+) -> bool:
+    """Verify local file matches expected size and MD5, returning True if valid."""
+    local_stat = target.stat()
+    local_size = local_stat.st_size
+
+    # 1. Size verification if expected_size is known
+    if item.expected_size is not None and local_size != item.expected_size:
+        reporter.warn(
+            f"Файл {item.name} повреждён или недокачан "
+            f"({local_size} байт вместо {item.expected_size}) — перекачиваю..."
+        )
+        target.unlink(missing_ok=True)
+        return False
+
+    # 2. MD5 verification if expected_md5 is known
+    if item.expected_md5:
+        cached = cache.get(item.name)
+        expected_clean = item.expected_md5.lower().strip()
+        if (
+            cached
+            and cached.get("mtime") == local_stat.st_mtime
+            and cached.get("local_size") == local_size
+            and cached.get("md5")
+        ):
+            local_md5 = str(cached["md5"]).lower().strip()
+        else:
+            local_md5 = compute_file_md5(target)
+            cache.record(
+                filename=item.name,
+                source=item.source,
+                size=item.expected_size if item.expected_size is not None else local_size,
+                md5=local_md5,
+                local_size=local_size,
+                mtime=local_stat.st_mtime,
+            )
+
+        if local_md5 != expected_clean:
+            reporter.warn(
+                f"Файл {item.name} повреждён: хэш MD5 не совпадает "
+                f"({local_md5} вместо {expected_clean}) — перекачиваю..."
+            )
+            target.unlink(missing_ok=True)
+            return False
+
+    reporter.note(f"Уже в input/ и актуален: {item.name} — загрузка пропущена")
+    return True
+
+
 def fetch_queue_item(
     item: QueueItem,
     input_dir: Path,
     client_factory: Callable[[], GofileClient],
     reporter: Reporter,
 ) -> Path:
-    """Per-entry download step (idempotent skip; .part + atomic rename inside client)."""
+    """Per-entry download step with smart cache, size/MD5 integrity and delta downloads."""
     target = input_dir / item.name
+    cache = FetchCache(input_dir / ".fetch_cache.json")
+
     if target.is_file():
-        reporter.note(f"Уже в input/: {item.name} — загрузка пропущена")
-        return target
+        if item.kind == "local":
+            reporter.note(f"Уже в input/: {item.name} — загрузка пропущена")
+            return target
+
+        if _verify_existing_remote(item, target, cache, reporter):
+            return target
+
     if item.kind == "local":
         return ensure_local(item.name, input_dir)
+
     client = client_factory()
     input_dir.mkdir(parents=True, exist_ok=True)
     last_note = [0]
@@ -354,4 +490,18 @@ def fetch_queue_item(
             reporter.progress_bytes("Загрузка", done, total)
 
     client.download_file(item.url, target, progress=progress)
+
+    # After download, record to cache if target exists
+    if target.is_file():
+        stat = target.stat()
+        local_md5 = compute_file_md5(target) if item.expected_md5 else None
+        cache.record(
+            filename=item.name,
+            source=item.source,
+            size=item.expected_size if item.expected_size is not None else stat.st_size,
+            md5=local_md5 or item.expected_md5,
+            local_size=stat.st_size,
+            mtime=stat.st_mtime,
+        )
+
     return target

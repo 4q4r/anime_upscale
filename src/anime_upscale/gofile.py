@@ -424,6 +424,8 @@ class ResolvedChild:
 
     name: str
     link: str
+    size: int | None = None
+    md5: str | None = None
 
 
 @dataclass
@@ -675,7 +677,17 @@ class GofileClient:
         found: list[ResolvedChild] = []
         if children is None:
             if data.get("type") == "file":
-                return [ResolvedChild(name=data.get("name", ""), link=data.get("link", ""))]
+                raw_size = data.get("size")
+                size = int(raw_size) if raw_size is not None and str(raw_size).isdigit() else None
+                md5 = str(data.get("md5")) if data.get("md5") is not None else None
+                return [
+                    ResolvedChild(
+                        name=data.get("name", ""),
+                        link=data.get("link", ""),
+                        size=size,
+                        md5=md5,
+                    )
+                ]
             msg = f"gofile: у содержимого {content_id} отсутствуют данные children."
             raise GofileError(msg)
         self._walk(children, found, reporter, depth=0)
@@ -743,7 +755,11 @@ class GofileClient:
             if not link:
                 msg = f"gofile: у файла «{name}» нет ссылки link (повреждённые данные)."
                 raise GofileError(msg)
-            found.append(ResolvedChild(name=name, link=str(link)))
+            raw_size = child.get("size")
+            size = int(raw_size) if raw_size is not None and str(raw_size).isdigit() else None
+            raw_md5 = child.get("md5")
+            md5 = str(raw_md5) if raw_md5 is not None else None
+            found.append(ResolvedChild(name=name, link=str(link), size=size, md5=md5))
 
     # -- file download ------------------------------------------------------
     def download_file(
