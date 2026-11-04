@@ -68,7 +68,13 @@ def _setup(tmp_path: Path) -> tuple[Path, _FakeSession]:
         {"status": "ok", "data": {"servers": [{"name": "store-eu-par-1"}]}}
     )
     fake.post_response = _Response(
-        {"status": "ok", "data": {"downloadPage": "https://gofile.io/d/ZZ9"}}
+        {
+            "status": "ok",
+            "data": {
+                "downloadPage": "https://gofile.io/d/ZZ9",
+                "parentFolder": "folder-uuid-123",
+            },
+        }
     )
     return file, fake
 
@@ -109,8 +115,9 @@ class TestUploadFile:
             fake
         )  # no account token; no state file → guest creation... avoid: pre-set token
         client.token = "guest"
-        link = upload_file(file, client)
+        link, parent = upload_file(file, client)
         assert link == "https://gofile.io/d/ZZ9"
+        assert parent == "folder-uuid-123"
         assert fake.post_kwargs is not None
         assert fake.post_kwargs["url"] == "https://store-eu-par-1.gofile.io/uploadfile"
         assert fake.post_kwargs["cookies"] == {"accountToken": "guest"}
@@ -184,8 +191,9 @@ class TestUploadOutput:
         client = _client(fake)
         client.token = "g"
         reporter = Reporter(resolve_mode(no_color=True, no_tty=True))
-        link = upload_output(file, client, reporter)
+        link, parent = upload_output(file, client, reporter)
         assert link == "https://gofile.io/d/ZZ9"
+        assert parent == "folder-uuid-123"
         assert "gofile.io/d/ZZ9" in capsys.readouterr().out
 
     def test_gofile_error_wrapped(self, tmp_path: Path) -> None:

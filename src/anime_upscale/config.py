@@ -115,9 +115,11 @@ class ModelsConfig:
 
 @dataclass(frozen=True)
 class GofileUploadConfig:
-    """[upload.gofile] — опциональный токен аккаунта."""
+    """[upload.gofile] — опциональный токен аккаунта, режим загрузки и автоудаление."""
 
     token: str = ""
+    mode: str = "album"
+    delete_after_upload: bool = False
 
 
 @dataclass(frozen=True)
@@ -418,6 +420,30 @@ def validate_x265_params(pairs: tuple[tuple[str, str], ...]) -> None:
         raise ConfigError(msg)
 
 
+def _validate_upload(table: dict[str, Any]) -> UploadConfig:
+    """[upload] — секция пост-шага выгрузки."""
+    _reject_unknown(table, {"gofile"}, "upload")
+    gofile_raw = table.get("gofile", {})
+    _reject_unknown(gofile_raw, {"token", "mode", "delete_after_upload"}, "upload.gofile")
+    upload_mode = str(gofile_raw.get("mode", "album"))
+    if upload_mode not in {"album", "separate"}:
+        msg = (
+            f"[upload.gofile]: недопустимый режим «{upload_mode}». Разрешены: «album», «separate»."
+        )
+        raise ConfigError(msg)
+    delete_after_upload = gofile_raw.get("delete_after_upload", False)
+    if not isinstance(delete_after_upload, bool):
+        msg = "[upload.gofile]: delete_after_upload должен быть булевым значением (true/false)."
+        raise ConfigError(msg)
+    return UploadConfig(
+        gofile=GofileUploadConfig(
+            token=str(gofile_raw.get("token", "")),
+            mode=upload_mode,
+            delete_after_upload=delete_after_upload,
+        )
+    )
+
+
 def _validate_network(table: dict[str, Any]) -> NetworkConfig:
     """[network] — transport policy section (adaptive TLS kill-switch)."""
     _reject_unknown(table, {"strict_tls"}, "network")
@@ -485,12 +511,7 @@ def load_config(path: Path) -> Config:
     )
 
     network = _validate_network(raw.get("network", {}))
-
-    upload_raw = raw.get("upload", {})
-    _reject_unknown(upload_raw, {"gofile"}, "upload")
-    gofile_upload_raw = upload_raw.get("gofile", {})
-    _reject_unknown(gofile_upload_raw, {"token"}, "upload.gofile")
-    upload = UploadConfig(gofile=GofileUploadConfig(token=str(gofile_upload_raw.get("token", ""))))
+    upload = _validate_upload(raw.get("upload", {}))
 
     fetch_raw = raw.get("fetch", {})
     _reject_unknown(fetch_raw, {"gofile"}, "fetch")

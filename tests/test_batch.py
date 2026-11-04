@@ -139,7 +139,13 @@ def test_upload_failure_gets_dedicated_exit_3(
         lambda ctx, s, o, ffmpeg_path, progress_update=None, **_kw: (60, 1),
     )
 
-    def fake_upload(path: object, client: object, reporter: object, progress: object = None) -> str:
+    def fake_upload(
+        path: object,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
         raise UploadError("gofile upload вернул «error-serverError»")
 
     monkeypatch.setattr(cli, "upload_output", fake_upload)
@@ -167,7 +173,13 @@ def test_pipeline_failure_outranks_upload_failure_on_mixed_batch(
             raise PipelineError("батч-фейк: декодер умер")
         return (60, 1)
 
-    def fake_upload(path: object, client: object, reporter: object, progress: object = None) -> str:
+    def fake_upload(
+        path: object,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
         raise UploadError("upload dead")
 
     monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
@@ -567,6 +579,152 @@ def test_batch_with_seed_proceeds(
     exit_code = cli.main(["--profile", "itp", "-i", "a.mkv", "--config", "config.toml"])
     assert exit_code == 0
     assert ran == ["a.mkv"]
+
+
+def test_batch_album_mode_links_folder_id_and_prints_album_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tmp_project(tmp_path, monkeypatch)
+    config = (
+        "[pipeline]\n"
+        'order = ["descale", "deband", "upscale", "interpolate", "encode"]\n'
+        "[stages.encode]\n"
+        "crf = 16\n"
+        "[upload.gofile]\n"
+        'mode = "album"\n'
+        "[profiles.upl]\n"
+        'stages = ["encode"]\n'
+        "upload = true\n"
+    )
+    (tmp_path / "config.toml").write_text(config, encoding="utf-8")
+
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
+        output.write_bytes(b"dummy")
+        return (60, 1)
+
+    folder_ids_received: list[str | None] = []
+
+    def fake_upload(
+        path: Path,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        folder_ids_received.append(folder_id)
+        return "https://gofile.io/d/ALBUM123", "album-parent-uuid"
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+
+    exit_code = cli.main(
+        ["--profile", "upl", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    # First file had no folder_id, second file got the parent_folder from first
+    assert folder_ids_received == [None, "album-parent-uuid"]
+    # Final summary printed the album link
+    assert "https://gofile.io/d/ALBUM123" in out
+
+
+def test_batch_separate_mode_does_not_pass_folder_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _tmp_project(tmp_path, monkeypatch)
+    config = (
+        "[pipeline]\n"
+        'order = ["descale", "deband", "upscale", "interpolate", "encode"]\n'
+        "[stages.encode]\n"
+        "crf = 16\n"
+        "[upload.gofile]\n"
+        'mode = "separate"\n'
+        "[profiles.upl]\n"
+        'stages = ["encode"]\n'
+        "upload = true\n"
+    )
+    (tmp_path / "config.toml").write_text(config, encoding="utf-8")
+
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
+        output.write_bytes(b"dummy")
+        return (60, 1)
+
+    folder_ids_received: list[str | None] = []
+
+    def fake_upload(
+        path: Path,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        folder_ids_received.append(folder_id)
+        return "https://gofile.io/d/SEP", "sep-parent-uuid"
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+
+    exit_code = cli.main(
+        ["--profile", "upl", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+    )
+    assert exit_code == 0
+    assert folder_ids_received == [None, None]
+
+
+def test_delete_after_upload_deletes_only_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tmp_project(tmp_path, monkeypatch)
+    config = (
+        "[pipeline]\n"
+        'order = ["descale", "deband", "upscale", "interpolate", "encode"]\n'
+        "[stages.encode]\n"
+        "crf = 16\n"
+        "[upload.gofile]\n"
+        "delete_after_upload = true\n"
+        "[profiles.upl]\n"
+        'stages = ["encode"]\n'
+        "upload = true\n"
+    )
+    (tmp_path / "config.toml").write_text(config, encoding="utf-8")
+
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
+        output.write_bytes(b"encoded content")
+        return (60, 1)
+
+    from anime_upscale.upload import UploadError
+
+    def fake_upload(
+        path: Path,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        if "b.mkv" in path.name:
+            raise UploadError("network error during upload")
+        return "https://gofile.io/d/OK", "uuid"
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+
+    exit_code = cli.main(
+        ["--profile", "upl", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+    )
+    out = capsys.readouterr().out
+    # a.mkv was uploaded successfully -> deleted
+    assert not (tmp_path / "output" / "a.mkv").exists()
+    assert "Файл a.mkv удалён из output/ после выгрузки" in out
+
+    # b.mkv failed upload -> NOT deleted
+    assert (tmp_path / "output" / "b.mkv").exists()
+    assert exit_code == cli.EXIT_UPLOAD == 3
 
 
 def test_cli_wires_auto_repair_from_tools_override(

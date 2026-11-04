@@ -183,8 +183,12 @@ def upload_file(
     progress: Callable[[int, int], None] | None = None,
     folder_id: str | None = None,
     chunk_size: int = AdaptiveStreamingMultipart.INIT_CHUNK_SIZE,
-) -> str:
-    """Upload one file; returns data.downloadPage. Token cookie when configured (§10.3)."""
+) -> tuple[str, str | None]:
+    """
+    Upload one file.
+
+    Returns tuple of (download_page, parent_folder_id). Token cookie when configured (§10.3).
+    """
     if not path.is_file():
         msg = f"Файл для загрузки не найден: {path}"
         raise UploadError(msg)
@@ -223,11 +227,13 @@ def upload_file(
             f"({str(payload.get('data'))[:200]}). Файл не изменён."
         )
         raise UploadError(msg)
-    download_page = (payload.get("data") or {}).get("downloadPage")  # "data": null tolerated
+    data = payload.get("data") or {}  # "data": null tolerated
+    download_page = data.get("downloadPage")
     if not download_page:
         msg = f"gofile upload не вернул downloadPage: {str(payload)[:200]}"
         raise UploadError(msg)
-    return str(download_page)
+    parent_folder = data.get("parentFolder")
+    return str(download_page), str(parent_folder) if parent_folder else None
 
 
 def upload_output(
@@ -235,12 +241,13 @@ def upload_output(
     client: GofileClient,
     reporter: "Reporter",
     progress: Callable[[int, int], None] | None = None,
-) -> str:
+    folder_id: str | None = None,
+) -> tuple[str, str | None]:
     """Post-step entry: loud failure keeps the output untouched; prints the link."""
     try:
-        link = upload_file(path, client, progress=progress)
+        link, parent_folder = upload_file(path, client, progress=progress, folder_id=folder_id)
     except (GofileError, requests.RequestException) as exc:
         msg = f"Загрузка {path.name} не удалась: {exc}"
         raise UploadError(msg) from exc
     reporter.link(link)
-    return link
+    return link, parent_folder

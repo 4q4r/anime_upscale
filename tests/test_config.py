@@ -49,7 +49,49 @@ class TestDefaults:
         assert cfg.profiles["interp-only"].stages == ("interpolate", "encode")
         assert cfg.profiles["full"].upload is True
 
-    def test_gofile_fetch_defaults_from_source(self) -> None:
+    def test_gofile_upload_defaults(self) -> None:
+        cfg = _load_default()
+        assert cfg.upload.gofile.token == ""
+        assert cfg.upload.gofile.mode == "album"
+        assert cfg.upload.gofile.delete_after_upload is False
+
+    def test_gofile_upload_custom_valid(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            '[upload.gofile]\ntoken = "abc"\nmode = "separate"\ndelete_after_upload = true\n',
+            encoding="utf-8",
+        )
+        cfg = load_config(cfg_file)
+        assert cfg.upload.gofile.token == "abc"
+        assert cfg.upload.gofile.mode == "separate"
+        assert cfg.upload.gofile.delete_after_upload is True
+
+    def test_gofile_upload_invalid_mode_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            '[upload.gofile]\nmode = "invalid_mode"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="недопустимый режим"):
+            load_config(cfg_file)
+
+    def test_gofile_upload_invalid_delete_flag_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            '[upload.gofile]\ndelete_after_upload = "yes"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="delete_after_upload должен быть булевым"):
+            load_config(cfg_file)
+
+    def test_gofile_upload_unknown_key_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            "[upload.gofile]\nextra_key = 123\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match=r"Неизвестный ключ в \[upload\.gofile\]"):
+            load_config(cfg_file)
         cfg = _load_default()
         assert cfg.fetch.gofile.wt_salt == "12af056dacea0b"
         assert cfg.fetch.gofile.language == "en-US"
