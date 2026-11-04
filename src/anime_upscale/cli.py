@@ -166,9 +166,27 @@ def _default_inputs(input_dir: Path) -> list[str]:
     raise EntryError(msg)
 
 
-def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
-    root = Path.cwd()
-    config = load_config(root / args.config)
+def _update_album_tracking(
+    upload_info: tuple[str, str | None] | None,
+    current_folder_id: str | None,
+    current_album_link: str | None,
+    mode: str,
+) -> tuple[str | None, str | None]:
+    """Track first parentFolder and downloadPage link for batch album mode."""
+    if upload_info is None or mode != "album":
+        return current_folder_id, current_album_link
+    link, parent_folder = upload_info
+    folder_id = current_folder_id if current_folder_id is not None else parent_folder
+    album_link = current_album_link if current_album_link is not None else link
+    return folder_id, album_link
+
+
+def _resolve_batch_inputs(
+    args: argparse.Namespace,
+    config: Config,
+    root: Path,
+) -> tuple[RunConfig, HardwareProfile, str, list[str]]:
+    """Resolve stages, run config, hardware detection and input list."""
     stages: tuple[str, ...] | None = None
     if args.stages:
         stages = tuple(s.strip() for s in args.stages.split(",") if s.strip())
@@ -185,14 +203,20 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     hardware = detect_hardware(
         config.hardware, cli_num_streams=None, nn_stages_selected=nn_selected
     )
+    ffmpeg_path = resolve_tool("ffmpeg", config.tools.ffmpeg)
+    entries = args.inputs or _default_inputs(root / "input")
+    return run, hardware, ffmpeg_path, entries
+
+
+def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
+    root = Path.cwd()
+    config = load_config(root / args.config)
+    run, hardware, ffmpeg_path, entries = _resolve_batch_inputs(args, config, root)
     print_banner(reporter, hardware, run.stages)
 
-    ffmpeg_path = resolve_tool("ffmpeg", config.tools.ffmpeg)
     input_dir = root / "input"
     output_dir = root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    entries = args.inputs or _default_inputs(input_dir)
 
     # Pre-flight (§11.5): queue resolution incl. gofile folder expansion (metadata only).
     def client_factory() -> GofileClient:
@@ -217,6 +241,9 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     ctx = _stage_context(config, run, hardware, root, reporter)
     results: list[tuple[str, bool, str]] = []
     failures = {"pipeline": False, "upload": False}
+    batch_folder_id: str | None = None
+    batch_album_link: str | None = None
+
     for index, item in enumerate(queue, start=1):
         # M1: an earlier entry's successful repair replaces the stale resolved
         # path, so later entries start directly on the repaired binary instead
@@ -225,7 +252,8 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
         if repaired is not None:
             ffmpeg_path = str(repaired)
         reporter.file_banner(index, len(queue), item.name)
-        outcome = _process_entry(
+        folder_for_file = batch_folder_id if config.upload.gofile.mode == "album" else None
+        outcome, upload_info = _process_entry(
             ctx,
             item,
             input_dir,
@@ -235,8 +263,16 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
             output_override=output_override,
             upload_enabled=run.upload,
             auto_repair=not bool(config.tools.ffmpeg),
+            folder_id=folder_for_file,
+            delete_after_upload=config.upload.gofile.delete_after_upload,
         )
         if outcome is None:
+            batch_folder_id, batch_album_link = _update_album_tracking(
+                upload_info,
+                batch_folder_id,
+                batch_album_link,
+                config.upload.gofile.mode,
+            )
             # Per-entry phase terminator (live-bug fix 2026-10-29): the ✓ line
             # closes the file's download→processing→upload block so the next
             # banner can never read as if it stole the console mid-file.
@@ -254,6 +290,8 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
         reporter.error(f"{item.name}: {detail}")
         results.append((item.name, False, detail))
     reporter.batch_summary(results)
+    if config.upload.gofile.mode == "album" and run.upload and batch_album_link is not None:
+        reporter.link(batch_album_link)
     if failures["pipeline"]:
         return EXIT_FAILURE
     if failures["upload"]:
@@ -288,14 +326,18 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     output_override: str | None = None,
     upload_enabled: bool,
     auto_repair: bool,
-) -> tuple[str, str] | None:
+    folder_id: str | None = None,
+    delete_after_upload: bool = False,
+) -> tuple[tuple[str, str] | None, tuple[str, str | None] | None]:
     """
     Run one batch entry (fetch → pipeline → optional upload).
 
-    Returns None on success, or ("pipeline" | "upload", detail) on failure —
-    the continue-and-summarize ruling keeps the batch alive either way.
+    Returns (outcome, upload_info):
+    - outcome: None on success, or ("pipeline" | "upload", detail) on failure
+    - upload_info: (link, parent_folder_id) if uploaded, else None
     """
     reporter = ctx.reporter
+    upload_info: tuple[str, str | None] | None = None
     try:
         # Lazy VS/torch stack (M7): resolved at call time as a MODULE so tests
         # can patch anime_upscale.pipeline.run_pipeline and the attribute
@@ -324,23 +366,27 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
         if upload_enabled:
             total_size = output_path.stat().st_size if output_path.exists() else 0
             with reporter.upload_progress_bar(total=total_size, filename=item.name) as upbar:
-                upload_output(
+                upload_info = upload_output(
                     output_path,
                     client_factory(),
                     reporter,
                     progress=upbar.callback(),
+                    folder_id=folder_id,
                 )
+            if delete_after_upload:
+                output_path.unlink()
+                reporter.note(f"Файл {output_name} удалён из output/ после выгрузки")
     except ImportError as exc:
         # Must precede the pipeline_mod tuple below: with the import itself
         # failed, pipeline_mod is unbound and evaluating that tuple would
         # raise NameError over the real cause.
         msg = f"VapourSynth не найден — установите зависимости (`uv sync`) ({exc})."
-        return ("pipeline", msg)
+        return ("pipeline", msg), None
     except UploadError as exc:
-        return ("upload", f"пайплайн ok, загрузка не удалась: {exc}")
+        return ("upload", f"пайплайн ok, загрузка не удалась: {exc}"), None
     except (pipeline_mod.PipelineError, EntryError, GofileError, RuntimeError, OSError) as exc:
-        return ("pipeline", str(exc))
-    return None
+        return ("pipeline", str(exc)), None
+    return None, upload_info
 
 
 def _stage_context(
