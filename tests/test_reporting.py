@@ -204,3 +204,38 @@ class TestPipelineProgressBar:
             pbar.update(20, 200)
             assert pbar._total == 200
             assert pbar._current_n == 20
+
+
+class TestUploadProgressBar:
+    def test_disabled_on_non_tty(self) -> None:
+        stream = _FakeStream(tty=False)
+        reporter = Reporter(resolve_mode(no_color=True, no_tty=True), stream=stream)
+        with reporter.upload_progress_bar(total=1024 * 1024, filename="ep01.mkv") as pbar:
+            assert pbar.disabled is True
+            cb = pbar.callback()
+            cb(512 * 1024, 1024 * 1024)
+        assert pbar.closed is True
+        # Check fallback emitted progress line
+        assert any("[ep01.mkv] Загрузка:" in line for line in stream.written)
+
+    def test_enabled_on_tty(self) -> None:
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        reporter = Reporter(mode, stream=stream)
+        with reporter.upload_progress_bar(total=10 * 1024 * 1024, filename="ep02.mkv") as pbar:
+            assert pbar.disabled is False
+            assert pbar._pbar is not None
+            assert "[ep02.mkv] Загрузка" in pbar._pbar.desc
+            cb = pbar.callback()
+            cb(5 * 1024 * 1024, 10 * 1024 * 1024)
+            assert pbar._current_n == 5 * 1024 * 1024
+        assert pbar.closed is True
+
+    def test_rate_formatting_in_format_dict(self) -> None:
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        reporter = Reporter(mode, stream=stream)
+        with reporter.upload_progress_bar(total=1024 * 1024, filename="ep03.mkv") as pbar:
+            assert pbar._pbar is not None
+            d = pbar._pbar.format_dict
+            assert "МБ/с" in str(d.get("custom_rate"))
