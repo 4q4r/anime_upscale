@@ -4,7 +4,7 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 import pytest
 import requests
@@ -463,8 +463,18 @@ def _folder_payload(children: list[dict], *, password_status: str = "passwordOk"
     }
 
 
-def _file(name: str, link: str = "https://store.gofile.io/download/x") -> dict:
-    return {"type": "file", "name": name, "link": link, "id": name}
+def _file(
+    name: str,
+    link: str = "https://store.gofile.io/download/x",
+    size: int | None = None,
+    md5: str | None = None,
+) -> dict:
+    d: dict[str, Any] = {"type": "file", "name": name, "link": link, "id": name}
+    if size is not None:
+        d["size"] = size
+    if md5 is not None:
+        d["md5"] = md5
+    return d
 
 
 class TestFolderExpansion:
@@ -503,12 +513,20 @@ class TestFolderExpansion:
         fake = _FakeSession()
         fake._queue(
             "contents/x",
-            _folder_payload([_file("keep.mkv"), _file("image.jpg"), _file("nfo.txt")]),
+            _folder_payload(
+                [
+                    _file("keep.mkv", size=1048576, md5="098f6bcd4621d373cade4e832627b4f6"),
+                    _file("image.jpg"),
+                    _file("nfo.txt"),
+                ]
+            ),
         )
         reporter = _FakeReporter()
         client = _client(fake, state_path=tmp_path / "g.toml")
         children = client.expand_entries("x", reporter)
         assert [c.name for c in children] == ["keep.mkv"]
+        assert children[0].size == 1048576
+        assert children[0].md5 == "098f6bcd4621d373cade4e832627b4f6"
         assert "Пропуск (не видео): image.jpg" in reporter.notes
         assert "Пропуск (не видео): nfo.txt" in reporter.notes
 

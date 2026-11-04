@@ -188,8 +188,8 @@ class TestBuildQueue:
 
                 assert content_id == "folder1"
                 return [
-                    ResolvedChild(name="ep.mkv", link="https://s/1"),
-                    ResolvedChild(name="ep.mkv", link="https://s/2"),
+                    ResolvedChild(name="ep.mkv", link="https://s/1", size=100, md5="hash1"),
+                    ResolvedChild(name="ep.mkv", link="https://s/2", size=200, md5="hash2"),
                 ]
 
         queue = build_queue(
@@ -199,6 +199,10 @@ class TestBuildQueue:
         )
         assert [item.name for item in queue] == ["local.mkv", "ep.mkv", "ep-2.mkv"]
         assert queue[1].kind == "gofile"
+        assert queue[1].expected_size == 100
+        assert queue[1].expected_md5 == "hash1"
+        assert queue[2].expected_size == 200
+        assert queue[2].expected_md5 == "hash2"
         assert "gofile папка folder1" in queue[2].origin
         assert any("ep-2.mkv" in w for w in reporter.warnings)
 
@@ -240,10 +244,95 @@ class TestFetchQueueItem:
             name="ep.mkv",
             kind="gofile",
             url="https://store.gofile.io/download/x/ep.mkv",
+            expected_size=1,
         )
         result = fetch_queue_item(item, tmp_path, _client_factory_fake, reporter)
         assert result == existing
         assert any("загрузка пропущена" in n for n in reporter.notes)
+
+    def test_fetch_cache_smart_skip_and_delta(self, tmp_path: Path) -> None:
+        """Verify smart caching, skipping unchanged files, redownloading corrupted files."""
+        import hashlib
+
+        from anime_upscale.fetch_input import FetchCache, QueueItem
+
+        reporter = _MuteReporter()
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+
+        content = b"valid video payload"
+        valid_md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
+        valid_size = len(content)
+
+        # 1. Delta download: new episode from album
+        download_calls: list[str] = []
+
+        class _MockClient:
+            def download_file(self, url: str, destination: Path, progress: object = None) -> None:
+                download_calls.append(url)
+                destination.write_bytes(content)
+
+        item1 = QueueItem(
+            source="https://gofile.io/d/album1",
+            origin="gofile папка album1 → файл",
+            name="ep01.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/ep01.mkv",
+            expected_size=valid_size,
+            expected_md5=valid_md5,
+        )
+
+        res1 = fetch_queue_item(item1, input_dir, _MockClient, reporter)
+        assert res1 == input_dir / "ep01.mkv"
+        assert len(download_calls) == 1
+        assert (input_dir / ".fetch_cache.json").is_file()
+
+        cache = FetchCache(input_dir / ".fetch_cache.json")
+        entry = cache.get("ep01.mkv")
+        assert entry is not None
+        assert entry["size"] == valid_size
+        assert entry["md5"] == valid_md5
+
+        # 2. Skip already downloaded valid file
+        reporter.notes.clear()
+        res2 = fetch_queue_item(item1, input_dir, _MockClient, reporter)
+        assert res2 == input_dir / "ep01.mkv"
+        assert len(download_calls) == 1  # No new download
+        msg_sub = f"Уже в input/ и актуален: {item1.name} — загрузка пропущена"
+        assert any(msg_sub in n for n in reporter.notes)
+
+        # 3. Detect size mismatch -> redownload
+        (input_dir / "ep01.mkv").write_bytes(b"short")  # size is 5 instead of valid_size
+        reporter.warnings.clear()
+        reporter.notes.clear()
+        res3 = fetch_queue_item(item1, input_dir, _MockClient, reporter)
+        assert res3 == input_dir / "ep01.mkv"
+        assert len(download_calls) == 2  # Downloaded again
+        assert any("повреждён или недокачан" in w for w in reporter.warnings)
+        assert (input_dir / "ep01.mkv").read_bytes() == content
+
+        # 4. Detect MD5 mismatch -> redownload
+        corrupt_content = b"corrupted payload!!"  # same length: 19 bytes
+        assert len(corrupt_content) == valid_size
+        (input_dir / "ep01.mkv").write_bytes(corrupt_content)
+        # update cache so mtime matches corrupted file but old md5 was valid_md5
+        stat = (input_dir / "ep01.mkv").stat()
+        cache.record(
+            "ep01.mkv",
+            item1.source,
+            valid_size,
+            "wrongmd5",
+            valid_size,
+            stat.st_mtime - 100,
+        )
+
+        reporter.warnings.clear()
+        reporter.notes.clear()
+        res4 = fetch_queue_item(item1, input_dir, _MockClient, reporter)
+        assert res4 == input_dir / "ep01.mkv"
+        assert len(download_calls) == 3  # Downloaded again
+        assert any("хэш MD5 не совпадает" in w for w in reporter.warnings)
+        assert (input_dir / "ep01.mkv").read_bytes() == content
 
     def test_url_kind_existing_file_skips_without_client(self, tmp_path: Path) -> None:
         from anime_upscale.fetch_input import QueueItem
