@@ -11,6 +11,7 @@ disambiguate as <stem>-2<ext> with a printed note (plan §11.6).
 import hashlib
 import json
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -223,20 +224,25 @@ class QueueItem:
     expected_md5: str | None = None
 
 
-def build_queue(
+def build_queue(  # noqa: PLR0913
     entries: list[str],
     client_factory: Callable[[], GofileClient],
     reporter: Reporter,
     name_prober: Callable[[str], str] | None = None,
     *,
     strict_tls: bool = False,
+    size_prober: Callable[[str], int | None] | None = None,
 ) -> list[QueueItem]:
     """
     Resolve all entries into a sequential queue (pre-flight metadata only).
 
     No file downloads here — those happen per-entry at each file's turn.
     `name_prober` is a test seam (default: live header probe, threaded
-    ``strict_tls`` for interception-adaptive TLS).
+    ``strict_tls`` for interception-adaptive TLS). ``size_prober`` is the test
+    seam for the F4 expected-size scope: by default a url-kind item carries the
+    Content-Length captured by the live ``_remote_name`` HEAD (one probe per
+    URL); an injected ``name_prober`` without a sizer leaves ``expected_size``
+    None, so test seams never trigger a live probe.
     """
     prober = name_prober or (lambda url: _remote_name(url, strict_tls=strict_tls))
     queue: list[QueueItem] = []
@@ -262,10 +268,22 @@ def build_queue(
                 )
             case DirectUrl(url=url):
                 name = prober(url)
+                expected_size = (
+                    size_prober(url)
+                    if size_prober is not None
+                    else _PROBED_CONTENT_LENGTHS.get(url)
+                )
                 name = disambiguate(name, taken, reporter)
                 taken.add(name)
                 queue.append(
-                    QueueItem(source=text, origin="прямая ссылка", name=name, kind="url", url=url)
+                    QueueItem(
+                        source=text,
+                        origin="прямая ссылка",
+                        name=name,
+                        kind="url",
+                        url=url,
+                        expected_size=expected_size,
+                    )
                 )
             case GofileLink(content_id=content_id):
                 client = client_factory()
@@ -294,8 +312,30 @@ _HTTP_OK = 200
 _PERCENT = 100
 
 
+_PROBED_CONTENT_LENGTHS: dict[str, int | None] = {}
+
+
+def _content_length(headers: CaseInsensitiveDict[str]) -> int | None:
+    """Best-effort Content-Length parse; absent, garbage or negative → None."""
+    raw = headers.get("Content-Length")
+    if raw is None:
+        return None
+    try:
+        size = int(raw)
+    except ValueError:
+        return None
+    return size if size >= 0 else None
+
+
 def _remote_name(url: str, *, strict_tls: bool = False) -> str:
-    """Probe download headers for the filename; fall back to the URL path segment."""
+    """
+    Probe download headers for the filename; fall back to the URL path segment.
+
+    F4: the same HEAD already carries Content-Length — it is recorded into
+    ``_PROBED_CONTENT_LENGTHS[url]`` so the queue build can scope url-kind
+    items by expected size without a second probe (a patched test double
+    simply records nothing).
+    """
     if urlparse(url).hostname == "gofile.io":
         msg = f"Ссылка gofile вне обработчика: {url}"
         raise EntryError(msg)
@@ -313,6 +353,7 @@ def _remote_name(url: str, *, strict_tls: bool = False) -> str:
         msg = f"Недоступна прямая ссылка {url}: {exc}"
         raise EntryError(msg) from exc
     if response.status_code == _HTTP_OK:
+        _PROBED_CONTENT_LENGTHS[url] = _content_length(response.headers)
         # A sanitizer rejection inside derive_filename is TERMINAL — it must
         # never fall through to the raw URL segment (fix-round-2, item 1).
         return derive_filename(response.headers, response.url or url)
@@ -347,9 +388,10 @@ def compute_file_md5(path: Path, chunk_size: int = 1024 * 1024) -> str:
 class FetchCache:
     """Persistent cache in input/.fetch_cache.json for downloaded remote inputs."""
 
-    def __init__(self, cache_file: Path) -> None:
+    def __init__(self, cache_file: Path, reporter: Reporter) -> None:
         """Initialize and load cache from file."""
         self.cache_file = cache_file
+        self.reporter = reporter
         self._entries: dict[str, dict[str, Any]] = {}
         self.load()
 
@@ -369,15 +411,23 @@ class FetchCache:
             self._entries = {}
 
     def save(self) -> None:
-        """Save cache entries to JSON file on disk atomically."""
+        """
+        Save cache entries to JSON file on disk atomically.
+
+        F14: persistence failure is an audible degradation — warn with the
+        reason and never leave the tmp orphan behind.
+        """
+        tmp_file = self.cache_file.with_name(f"{self.cache_file.name}.tmp")
         try:
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_file = self.cache_file.with_name(f"{self.cache_file.name}.tmp")
             with tmp_file.open("w", encoding="utf-8") as f:
                 json.dump(self._entries, f, indent=2, ensure_ascii=False)
             tmp_file.replace(self.cache_file)
-        except OSError:
-            pass
+        except OSError as exc:
+            self.reporter.warn(f"Кэш входа не сохранён: {exc}")
+        finally:
+            with suppress(OSError):
+                tmp_file.unlink(missing_ok=True)
 
     def get(self, filename: str) -> dict[str, Any] | None:
         """Retrieve cached metadata for filename."""
@@ -409,9 +459,28 @@ def _verify_existing_remote(
     cache: FetchCache,
     reporter: Reporter,
 ) -> bool:
-    """Verify local file matches expected size and MD5, returning True if valid."""
+    """
+    Verify a cached remote download: source scope, size and MD5 integrity.
+
+    F4/F5: the cache is scoped by origin — a cached entry written by another
+    source is never accepted for this item (re-download with an honest note
+    instead of a false «повреждён» diagnosis). F3: when the expected MD5 is
+    known the disk is ALWAYS hashed — the mtime shortcut never substitutes for
+    the digest check; without an expected MD5 the size+mtime fingerprint
+    recorded at download time is the only freshness proof.
+    """
     local_stat = target.stat()
     local_size = local_stat.st_size
+    cached = cache.get(item.name)
+
+    # 0. Source scope (F4/F5): content under this name came from another
+    #    source — re-download instead of mislabeling it as corrupted.
+    if cached is not None and str(cached.get("source", "")) != item.source:
+        reporter.warn(
+            f"По имени «{item.name}» в input/ скачан файл из другого источника — перекачиваю..."
+        )
+        target.unlink(missing_ok=True)
+        return False
 
     # 1. Size verification if expected_size is known
     if item.expected_size is not None and local_size != item.expected_size:
@@ -422,36 +491,51 @@ def _verify_existing_remote(
         target.unlink(missing_ok=True)
         return False
 
-    # 2. MD5 verification if expected_md5 is known
+    # 2. MD5 verification: always computed from disk when a digest is expected.
     if item.expected_md5:
-        cached = cache.get(item.name)
         expected_clean = item.expected_md5.lower().strip()
-        if (
-            cached
-            and cached.get("mtime") == local_stat.st_mtime
-            and cached.get("local_size") == local_size
-            and cached.get("md5")
-        ):
-            local_md5 = str(cached["md5"]).lower().strip()
-        else:
-            local_md5 = compute_file_md5(target)
-            cache.record(
-                filename=item.name,
-                source=item.source,
-                size=item.expected_size if item.expected_size is not None else local_size,
-                md5=local_md5,
-                local_size=local_size,
-                mtime=local_stat.st_mtime,
-            )
-
+        local_md5 = compute_file_md5(target)
         if local_md5 != expected_clean:
             reporter.warn(
-                f"Файл {item.name} повреждён: хэш MD5 не совпадает "
-                f"({local_md5} вместо {expected_clean}) — перекачиваю..."
+                f"Файл {item.name} повреждён или изменился на сервере: "
+                f"хэш MD5 не совпадает ({local_md5} вместо {expected_clean}) — перекачиваю..."
             )
             target.unlink(missing_ok=True)
             return False
+        cache.record(
+            filename=item.name,
+            source=item.source,
+            size=item.expected_size if item.expected_size is not None else local_size,
+            md5=local_md5,
+            local_size=local_size,
+            mtime=local_stat.st_mtime,
+        )
+        reporter.note(f"Уже в input/ и актуален: {item.name} — загрузка пропущена")
+        return True
 
+    # 3. No expected digest: the size+mtime fingerprint recorded at download
+    #    time is the only freshness proof (the mtime shortcut lives HERE only).
+    fingerprint_fresh = cached is None or (
+        cached.get("mtime") == local_stat.st_mtime and cached.get("local_size") == local_size
+    )
+    if not fingerprint_fresh:
+        reporter.warn(
+            f"Файл {item.name} изменился после загрузки "
+            "(размер/время изменения не совпадают с кэшем) — перекачиваю..."
+        )
+        target.unlink(missing_ok=True)
+        return False
+
+    # First sighting of a remote name (no cache entry): establish provenance.
+    if cached is None:
+        cache.record(
+            filename=item.name,
+            source=item.source,
+            size=item.expected_size if item.expected_size is not None else local_size,
+            md5=None,
+            local_size=local_size,
+            mtime=local_stat.st_mtime,
+        )
     reporter.note(f"Уже в input/ и актуален: {item.name} — загрузка пропущена")
     return True
 
@@ -464,7 +548,7 @@ def fetch_queue_item(
 ) -> Path:
     """Per-entry download step with smart cache, size/MD5 integrity and delta downloads."""
     target = input_dir / item.name
-    cache = FetchCache(input_dir / ".fetch_cache.json")
+    cache = FetchCache(input_dir / ".fetch_cache.json", reporter)
 
     if target.is_file():
         if item.kind == "local":

@@ -8,7 +8,9 @@ from anime_upscale.fetch_input import (
     BareName,
     DirectUrl,
     EntryError,
+    FetchCache,
     GofileLink,
+    QueueItem,
     build_queue,
     classify_entry,
     derive_filename,
@@ -287,7 +289,7 @@ class TestFetchQueueItem:
         assert len(download_calls) == 1
         assert (input_dir / ".fetch_cache.json").is_file()
 
-        cache = FetchCache(input_dir / ".fetch_cache.json")
+        cache = FetchCache(input_dir / ".fetch_cache.json", reporter)
         entry = cache.get("ep01.mkv")
         assert entry is not None
         assert entry["size"] == valid_size
@@ -510,3 +512,268 @@ class TestSanitizeRemoteFilename:
                 _FakeClient,  # type: ignore[arg-type,return-value]
                 reporter,
             )
+
+
+class TestCacheIntegrity:
+    """Adversarial-review F3/F4/F5/F14 regressions: the fetch cache is
+    integrity-checked, source-scoped, and fails audibly."""
+
+    @staticmethod
+    def _gofile_item(md5: str | None, size: int | None) -> QueueItem:
+        return QueueItem(
+            source="https://gofile.io/d/album1",
+            origin="gofile папка album1 → файл",
+            name="ep01.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/ep01.mkv",
+            expected_size=size,
+            expected_md5=md5,
+        )
+
+    @staticmethod
+    def _recorder(calls: list[str], content: bytes) -> type:
+        class _MockClient:
+            def download_file(self, url: str, destination: Path, progress: object = None) -> None:
+                calls.append(url)
+                destination.write_bytes(content)
+
+        return _MockClient
+
+    def test_corrupted_same_size_same_mtime_redownloaded(self, tmp_path: Path) -> None:
+        """F3 probe: corrupting content while preserving size+mtime must NOT pass
+        verification — with expected_md5 the disk is ALWAYS hashed."""
+        import hashlib
+        import os
+
+        reporter = _MuteReporter()
+        content = b"valid video payload"
+        valid_md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
+        calls: list[str] = []
+        item = self._gofile_item(valid_md5, len(content))
+        fetch_queue_item(item, tmp_path, self._recorder(calls, content), reporter)  # type: ignore[arg-type]
+        target = tmp_path / "ep01.mkv"
+        saved_mtime = target.stat().st_mtime
+        target.write_bytes(b"X" * len(content))
+        os.utime(target, (saved_mtime, saved_mtime))
+        reporter.warnings.clear()
+        reporter.notes.clear()
+        fetch_queue_item(item, tmp_path, self._recorder(calls, content), reporter)  # type: ignore[arg-type]
+        assert len(calls) == 2
+        assert any("MD5" in w for w in reporter.warnings)
+        assert target.read_bytes() == content
+
+    def test_url_cache_hit_from_other_source_redownloaded(self, tmp_path: Path) -> None:
+        """F4 probe: cache hits are source-scoped — the same name previously
+        fetched from another source is re-downloaded with an honest note."""
+        reporter = _MuteReporter()
+        target = tmp_path / "e.mkv"
+        target.write_bytes(b"from source A")
+        cache = FetchCache(tmp_path / ".fetch_cache.json", reporter)
+        cache.record(
+            "e.mkv",
+            "https://a/e.mkv",
+            len(b"from source A"),
+            None,
+            target.stat().st_size,
+            target.stat().st_mtime,
+        )
+        calls: list[str] = []
+        item = QueueItem(
+            source="https://b/e.mkv",
+            origin="прямая ссылка",
+            name="e.mkv",
+            kind="url",
+            url="https://b/e.mkv",
+        )
+        result = fetch_queue_item(item, tmp_path, self._recorder(calls, b"from source B"), reporter)  # type: ignore[arg-type]
+        assert result == target
+        assert len(calls) == 1
+        assert any("другого источника" in w for w in reporter.warnings)
+        assert target.read_bytes() == b"from source B"
+        reloaded = FetchCache(tmp_path / ".fetch_cache.json", reporter)
+        assert reloaded.get("e.mkv") is not None
+        assert reloaded.get("e.mkv")["source"] == "https://b/e.mkv"
+
+    def test_url_cache_hit_changed_file_redownloaded(self, tmp_path: Path) -> None:
+        """F3 (no-md5 path): the size+mtime fingerprint recorded at download time
+        is the only freshness proof — an altered file is re-fetched."""
+        reporter = _MuteReporter()
+        calls: list[str] = []
+        item = QueueItem(
+            source="https://a/e.mkv",
+            origin="прямая ссылка",
+            name="e.mkv",
+            kind="url",
+            url="https://a/e.mkv",
+        )
+        fetch_queue_item(item, tmp_path, self._recorder(calls, b"original"), reporter)  # type: ignore[arg-type]
+        (tmp_path / "e.mkv").write_bytes(b"tampered!")
+        reporter.warnings.clear()
+        reporter.notes.clear()
+        fetch_queue_item(item, tmp_path, self._recorder(calls, b"original"), reporter)  # type: ignore[arg-type]
+        assert len(calls) == 2
+        assert any("перекачиваю" in w for w in reporter.warnings)
+        assert (tmp_path / "e.mkv").read_bytes() == b"original"
+
+    def test_url_cache_hit_same_source_unchanged_skips(self, tmp_path: Path) -> None:
+        """F4 pin: an unchanged same-source fingerprint keeps the smart skip."""
+        reporter = _MuteReporter()
+        calls: list[str] = []
+        item = QueueItem(
+            source="https://a/e.mkv",
+            origin="прямая ссылка",
+            name="e.mkv",
+            kind="url",
+            url="https://a/e.mkv",
+        )
+        fetch_queue_item(item, tmp_path, self._recorder(calls, b"original"), reporter)  # type: ignore[arg-type]
+        reporter.notes.clear()
+        fetch_queue_item(item, tmp_path, self._recorder(calls, b"original"), reporter)  # type: ignore[arg-type]
+        assert len(calls) == 1
+        assert any("загрузка пропущена" in n for n in reporter.notes)
+
+    def test_build_queue_head_probe_sets_expected_size(self) -> None:
+        """F4: url-kind items carry the HEAD Content-Length as expected_size."""
+        queue = build_queue(
+            ["https://x/e.mkv"],
+            _client_factory_fake,
+            _MuteReporter(),
+            name_prober=lambda url: "e.mkv",
+            size_prober=lambda url: 12345,
+        )
+        assert queue[0].kind == "url"
+        assert queue[0].expected_size == 12345
+
+    def test_build_queue_name_prober_only_keeps_expected_size_none(self) -> None:
+        """F4 pin: an injected name prober without a sizer keeps None (test
+        seams never trigger a live probe)."""
+        queue = build_queue(
+            ["https://x/e.mkv"],
+            _client_factory_fake,
+            _MuteReporter(),
+            name_prober=lambda url: "e.mkv",
+        )
+        assert queue[0].expected_size is None
+
+    def test_remote_name_records_content_length_for_queue(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F4 live path: the single HEAD probe already carries Content-Length —
+        it is recorded for the queue build, no second probe happens."""
+        from anime_upscale import fetch_input as fi
+
+        class _FakeSession:
+            def pin(self, host: str) -> str:
+                return "203.0.113.10"
+
+            def head(self, url: str = "", **kwargs: object):
+                final_url = url
+
+                class _Resp:
+                    status_code = 200
+                    headers = {
+                        "Content-Length": "4321",
+                        "Content-Disposition": 'attachment; filename="e.mkv"',
+                    }
+                    url = final_url
+
+                return _Resp()
+
+        monkeypatch.setattr(fi, "PinnedSession", _FakeSession)
+        assert fi._remote_name("https://host/get/e.mkv") == "e.mkv"
+        assert fi._PROBED_CONTENT_LENGTHS["https://host/get/e.mkv"] == 4321
+
+    def test_build_queue_live_head_probe_feeds_expected_size(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F4: the default (live) queue build scopes url-kind items by the
+        Content-Length captured during the filename HEAD — one probe per URL."""
+        from anime_upscale import fetch_input as fi
+
+        class _FakeSession:
+            def pin(self, host: str) -> str:
+                return "203.0.113.10"
+
+            def head(self, url: str = "", **kwargs: object):
+                final_url = url
+
+                class _Resp:
+                    status_code = 200
+                    headers = {
+                        "Content-Length": "777",
+                        "Content-Disposition": 'attachment; filename="e.mkv"',
+                    }
+                    url = final_url
+
+                return _Resp()
+
+        monkeypatch.setattr(fi, "PinnedSession", _FakeSession)
+        monkeypatch.setattr(fi.gofile, "adaptive_tls_request", lambda fn, **kwargs: fn(**kwargs))
+        queue = build_queue(["https://host/get/e.mkv"], _client_factory_fake, _MuteReporter())
+        assert [i.name for i in queue] == ["e.mkv"]
+        assert queue[0].expected_size == 777
+
+    def test_same_source_md5_mismatch_diagnoses_changed_server(self, tmp_path: Path) -> None:
+        """F5: same source + md5 mismatch = «повреждён или изменился на сервере»."""
+        import hashlib
+
+        reporter = _MuteReporter()
+        content = b"valid video payload"
+        valid_md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
+        calls: list[str] = []
+        item = self._gofile_item(valid_md5, len(content))
+        fetch_queue_item(item, tmp_path, self._recorder(calls, content), reporter)  # type: ignore[arg-type]
+        (tmp_path / "ep01.mkv").write_bytes(b"X" * len(content))
+        reporter.warnings.clear()
+        fetch_queue_item(item, tmp_path, self._recorder(calls, content), reporter)  # type: ignore[arg-type]
+        assert len(calls) == 2
+        assert any("повреждён или изменился на сервере" in w for w in reporter.warnings)
+        assert any("хэш MD5 не совпадает" in w for w in reporter.warnings)
+        assert (tmp_path / "ep01.mkv").read_bytes() == content
+
+    def test_cross_source_same_name_is_not_called_corrupted(self, tmp_path: Path) -> None:
+        """F5 probe: a same-name file from another album is re-downloaded with
+        the honest cross-source message — never a false «повреждён»."""
+        import hashlib
+
+        reporter = _MuteReporter()
+        content_a = b"album A payload"
+        content_b = b"album B payload"
+        calls: list[str] = []
+        item_a = self._gofile_item(
+            hashlib.md5(content_a, usedforsecurity=False).hexdigest(), len(content_a)
+        )
+        fetch_queue_item(item_a, tmp_path, self._recorder(calls, content_a), reporter)  # type: ignore[arg-type]
+        item_b = QueueItem(
+            source="https://gofile.io/d/album2",
+            origin="gofile папка album2 → файл",
+            name="ep01.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/ep01-b.mkv",
+            expected_size=len(content_b),
+            expected_md5=hashlib.md5(content_b, usedforsecurity=False).hexdigest(),
+        )
+        reporter.warnings.clear()
+        fetch_queue_item(item_b, tmp_path, self._recorder(calls, content_b), reporter)  # type: ignore[arg-type]
+        assert len(calls) == 2
+        assert any("другого источника" in w for w in reporter.warnings)
+        assert not any("повреждён" in w for w in reporter.warnings)
+        assert (tmp_path / "ep01.mkv").read_bytes() == content_b
+
+    def test_cache_save_failure_warns_and_cleans_tmp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F14: a failing cache persist is audible and leaves no tmp orphan."""
+        reporter = _MuteReporter()
+        cache = FetchCache(tmp_path / ".fetch_cache.json", reporter)
+        cache.record("e.mkv", "https://a", 1, None, 1, 1.0)
+        tmp_file = tmp_path / ".fetch_cache.json.tmp"
+
+        def broken_replace(target: Path, other: Path) -> None:
+            msg = "disk full"
+            raise OSError(msg)
+
+        monkeypatch.setattr(Path, "replace", broken_replace)
+        cache.record("e.mkv", "https://a", 2, None, 2, 2.0)
+        assert any("Кэш входа не сохранён" in w for w in reporter.warnings)
+        assert not tmp_file.exists()
