@@ -124,12 +124,55 @@ class TestBlackwellDetection:
         assert profile.recommended_interp_format == "rgbs"
         assert profile.recommended_trt is False
 
-    def test_blackwell_by_name(self) -> None:
+    def test_blackwell_by_name_alone_is_not_enough(self) -> None:
+        """W7: the name substring heuristic is gone — cc ≥ (12,0) is the only
+        signal. A literal "RTX 5080" name with a stale/zero cc is NOT Blackwell."""
         gpu = GPUInfo(
             index=0,
             name="NVIDIA GeForce RTX 5080",
             vram_mb=16384,
             compute_capability=(0, 0),
+        )
+        profile = HardwareProfile(
+            gpus=(gpu,),
+            gpu_count=1,
+            cpu_logical_cores=8,
+            num_streams_per_gpu=2,
+            encode_threads=8,
+            precision="fp16",
+        )
+        assert profile.is_blackwell is False
+        assert profile.recommended_interp_format == "rgbh"
+        assert profile.recommended_trt is True
+
+    def test_quadro_rtx_5000_turing_not_blackwell(self) -> None:
+        """W7 false-positive class: "Quadro RTX 5000" contains the old "RTX 50"
+        substring but is Turing (cc 7.5) — it must keep TRT enabled and RGBH."""
+        gpu = GPUInfo(
+            index=0,
+            name="NVIDIA Quadro RTX 5000",
+            vram_mb=16384,
+            compute_capability=(7, 5),
+        )
+        profile = HardwareProfile(
+            gpus=(gpu,),
+            gpu_count=1,
+            cpu_logical_cores=8,
+            num_streams_per_gpu=2,
+            encode_threads=8,
+            precision="fp16",
+        )
+        assert profile.is_blackwell is False
+        assert profile.recommended_interp_format == "rgbh"
+        assert profile.recommended_trt is True
+
+    def test_blackwell_real_5080_by_cc(self) -> None:
+        """The real RTX 5080 reports cc (12, 0) via torch — detected Blackwell."""
+        gpu = GPUInfo(
+            index=0,
+            name="NVIDIA GeForce RTX 5080",
+            vram_mb=16384,
+            compute_capability=(12, 0),
         )
         profile = HardwareProfile(
             gpus=(gpu,),
