@@ -158,6 +158,91 @@ class TestX265ParamValidation:
         assert ("frame-threads", "16") in cfg.stages.encode.x265_params
 
 
+class TestEncodeValueValidation:
+    """Scalar encode values: crf range and preset whitelist fail loudly at load."""
+
+    def test_crf_integer_in_range_loads(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[stages.encode]\ncrf = 16\n", encoding="utf-8")
+        assert load_config(cfg_file).stages.encode.crf == 16
+
+    def test_crf_float_is_legal(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[stages.encode]\ncrf = 16.5\n", encoding="utf-8")
+        assert load_config(cfg_file).stages.encode.crf == 16.5
+
+    def test_crf_boundary_values_load(self, tmp_path: Path) -> None:
+        low = tmp_path / "low.toml"
+        low.write_text("[stages.encode]\ncrf = 0\n", encoding="utf-8")
+        assert load_config(low).stages.encode.crf == 0
+        high = tmp_path / "high.toml"
+        high.write_text("[stages.encode]\ncrf = 51\n", encoding="utf-8")
+        assert load_config(high).stages.encode.crf == 51
+
+    def test_crf_string_rejected_with_russian_error(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('[stages.encode]\ncrf = "high"\n', encoding="utf-8")
+        with pytest.raises(ConfigError, match="crf") as exc_info:
+            load_config(cfg_file)
+        message = str(exc_info.value)
+        assert "должен быть числом" in message
+        assert "stages.encode" in message
+
+    def test_crf_below_range_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[stages.encode]\ncrf = -1\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="вне допустимого диапазона") as exc_info:
+            load_config(cfg_file)
+        assert "stages.encode" in str(exc_info.value)
+
+    def test_crf_above_range_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[stages.encode]\ncrf = 52\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="вне допустимого диапазона"):
+            load_config(cfg_file)
+
+    def test_crf_bool_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[stages.encode]\ncrf = true\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="crf"):
+            load_config(cfg_file)
+
+    def test_crf_non_finite_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[stages.encode]\ncrf = nan\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="вне допустимого диапазона"):
+            load_config(cfg_file)
+
+    def test_preset_medium_loads(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('[stages.encode]\npreset = "medium"\n', encoding="utf-8")
+        assert load_config(cfg_file).stages.encode.preset == "medium"
+
+    def test_preset_unknown_rejected_with_russian_error(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('[stages.encode]\npreset = "werkzeug"\n', encoding="utf-8")
+        with pytest.raises(ConfigError, match="недопустимый пресет") as exc_info:
+            load_config(cfg_file)
+        message = str(exc_info.value)
+        assert "werkzeug" in message
+        assert "veryslow" in message  # hint carries the full official preset list
+
+    def test_preset_non_string_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[stages.encode]\npreset = 5\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="недопустимый пресет"):
+            load_config(cfg_file)
+
+    def test_crf_bad_value_in_profile_override_rejected_at_load(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(
+            '[profiles.bad]\nstages = ["encode"]\n[profiles.bad.overrides.encode]\ncrf = "high"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="profiles\\.bad\\.overrides\\.encode"):
+            load_config(cfg_file)
+
+
 class TestRationalFps:
     def test_fraction_string(self) -> None:
         assert parse_fps_argument("60000/1001") == (60000, 1001)
