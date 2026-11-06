@@ -1,0 +1,49 @@
+# Build context contract (docs/docker.md): the image builds only from
+# src/ scripts/ models/manifest.toml models/interpolate/ pyproject.toml
+# uv.lock README.md config.toml — everything else is excluded.
+# Model binaries are downloaded inside the build (anime-pipeline models
+# fetch, sha256-pinned); host-local copies never enter the context.
+
+# Local environments / version control
+.venv/
+.git/
+.gitattributes
+.gitignore
+.python-version
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.ty_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# I/O directories — pipeline data never enters the image (bind mounts only)
+input/
+output/
+cache/
+
+# Documentation / research / tests — not needed inside the build
+docs/
+research/
+benchmarks/
+tests/
+
+# Legacy machinery (deleted during migration, kept out of the image)
+models/rife/
+
+# Model binaries — fetched inside the build with sha256 verification
+models/**/*.pth
+models/**/*.pkl
+models/**/*.onnx
+models/**/*.engine
+
+# Deploy archives (rife_master.zip, anime_upscale-deploy-*.zip) and junk
+*.zip
+*.log
+.env
