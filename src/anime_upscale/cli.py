@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -315,6 +316,26 @@ def _resolve_output_override(output: str | None, queue_len: int) -> str | None:
     return output if output.endswith(".mkv") else f"{output}.mkv"
 
 
+def _delete_uploaded_output(path: Path, name: str, reporter: Reporter) -> None:
+    """
+    Delete an uploaded output file; cleanup must never reclassify the upload.
+
+    Windows AV/indexer locks make unlink fail transiently right after upload:
+    retry once after 0.5 s (handles are usually released by then), then warn
+    and leave the file in output/. The entry stays successful either way.
+    """
+    try:
+        path.unlink()
+    except OSError:
+        time.sleep(0.5)
+        try:
+            path.unlink()
+        except OSError as exc:
+            reporter.warn(f"Файл {name} не удалён: {exc} — остался в output/")
+            return
+    reporter.note(f"Файл {name} удалён из output/ после выгрузки")
+
+
 def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
     ctx: StageContext,
     item: QueueItem,
@@ -374,8 +395,10 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
                     folder_id=folder_id,
                 )
             if delete_after_upload:
-                output_path.unlink()
-                reporter.note(f"Файл {output_name} удалён из output/ после выгрузки")
+                # F2 (adversarial review): the unlink sits in its own guard so
+                # an OSError can never reach the pipeline-error handler below
+                # and flip a successful upload into a pipeline failure.
+                _delete_uploaded_output(output_path, output_name, reporter)
     except ImportError as exc:
         # Must precede the pipeline_mod tuple below: with the import itself
         # failed, pipeline_mod is unbound and evaluating that tuple would

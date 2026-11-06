@@ -1,5 +1,6 @@
 """Batch driver tests: continue-and-summarize policy (controller ruling, §11.5)."""
 
+import time
 from pathlib import Path
 
 import pytest
@@ -725,6 +726,219 @@ def test_delete_after_upload_deletes_only_on_success(
     # b.mkv failed upload -> NOT deleted
     assert (tmp_path / "output" / "b.mkv").exists()
     assert exit_code == cli.EXIT_UPLOAD == 3
+
+
+# --- F2 (adversarial review 2026-11): post-upload unlink must never
+# reclassify a successful upload as a pipeline failure. Windows AV/indexer
+# locks on the freshly written file make unlink fail transiently; the upload
+# result and the album link have to survive regardless (retry once after
+# 0.5 s, then warn and keep the entry successful).
+
+_LOCK_MSG = "Процесс не может получить доступ к файлу: файл занят другим процессом"
+
+
+def _write_delete_config(tmp_path: Path, *, album: bool) -> None:
+    """Config with delete_after_upload enabled (optionally album mode)."""
+    config = (
+        "[pipeline]\n"
+        'order = ["descale", "deband", "upscale", "interpolate", "encode"]\n'
+        "[stages.encode]\n"
+        "crf = 16\n"
+        "[upload.gofile]\n"
+        "delete_after_upload = true\n" + ('mode = "album"\n' if album else "") + "[profiles.upl]\n"
+        'stages = ["encode"]\n'
+        "upload = true\n"
+    )
+    (tmp_path / "config.toml").write_text(config, encoding="utf-8")
+
+
+def _patch_unlink(
+    monkeypatch: pytest.MonkeyPatch, locked: set[Path], fail_times_per_path: int | None
+) -> dict[Path, int]:
+    """Simulate Windows file locks: locked paths raise PermissionError for the
+    first ``fail_times_per_path`` attempts each (None = always); other paths
+    (and later attempts) delete normally. Returns the attempt counts."""
+    original = Path.unlink
+    attempts: dict[Path, int] = {}
+
+    def fake(self: Path, missing_ok: bool = False) -> None:
+        attempts[self] = attempts.get(self, 0) + 1
+        if self in locked and (
+            fail_times_per_path is None or attempts[self] <= fail_times_per_path
+        ):
+            raise PermissionError(_LOCK_MSG)
+        original(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fake)
+    return attempts
+
+
+def _patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record time.sleep durations instead of actually sleeping in tests."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    return sleeps
+
+
+def test_delete_failure_keeps_upload_success_and_album_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F2: unlink PermissionError after a successful upload must not flip the
+    entry to a pipeline failure — outcome stays success, upload_info (the
+    album link) survives, the warn is printed, exit 0."""
+    _tmp_project(tmp_path, monkeypatch)
+    _write_delete_config(tmp_path, album=True)
+    locked = {tmp_path / "output" / "a.mkv", tmp_path / "output" / "b.mkv"}
+    _patch_unlink(monkeypatch, locked, fail_times_per_path=None)
+    sleeps = _patch_sleep(monkeypatch)
+
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
+        output.write_bytes(b"encoded content")
+        return (60, 1)
+
+    def fake_upload(
+        path: Path,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        return "https://gofile.io/d/ALBUM123", "album-parent-uuid"
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+
+    exit_code = cli.main(
+        ["--profile", "upl", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    # Both entries stay successful despite the deletion failure.
+    assert "Итог: 2/2 успешно, 0 с ошибкой" in out
+    # upload_info survived -> the album link is still printed.
+    assert "https://gofile.io/d/ALBUM123" in out
+    # Warn with the reason, not the deletion note.
+    assert "не удалён" in out and _LOCK_MSG in out
+    assert "удалён из output/ после выгрузки" not in out
+    assert (tmp_path / "output" / "a.mkv").exists()
+    assert (tmp_path / "output" / "b.mkv").exists()
+    assert sleeps == [0.5, 0.5]
+
+
+def test_delete_retry_second_attempt_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F2: first unlink attempt fails (transient Windows AV lock), the retry
+    after 0.5 s succeeds — file deleted, note printed, no warning, exit 0."""
+    _tmp_project(tmp_path, monkeypatch)
+    _write_delete_config(tmp_path, album=False)
+    locked = {tmp_path / "output" / "a.mkv"}
+    _patch_unlink(monkeypatch, locked, fail_times_per_path=1)
+    sleeps = _patch_sleep(monkeypatch)
+
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
+        output.write_bytes(b"encoded content")
+        return (60, 1)
+
+    def fake_upload(
+        path: Path,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        return "https://gofile.io/d/OK", "uuid"
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+
+    exit_code = cli.main(["--profile", "upl", "-i", "a.mkv", "--config", "config.toml"])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert not (tmp_path / "output" / "a.mkv").exists()
+    assert "Файл a.mkv удалён из output/ после выгрузки" in out
+    assert "не удалён" not in out
+    assert sleeps == [0.5]
+
+
+def test_delete_persistent_failure_warns_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F2: both unlink attempts fail — the warn fires exactly once with the
+    reason, the entry stays successful, exit 0."""
+    _tmp_project(tmp_path, monkeypatch)
+    _write_delete_config(tmp_path, album=False)
+    locked = {tmp_path / "output" / "a.mkv"}
+    _patch_unlink(monkeypatch, locked, fail_times_per_path=None)
+    sleeps = _patch_sleep(monkeypatch)
+
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
+        output.write_bytes(b"encoded content")
+        return (60, 1)
+
+    def fake_upload(
+        path: Path,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        return "https://gofile.io/d/OK", "uuid"
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+
+    exit_code = cli.main(["--profile", "upl", "-i", "a.mkv", "--config", "config.toml"])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert out.count("не удалён") == 1
+    assert _LOCK_MSG in out
+    assert "Итог: 1/1 успешно, 0 с ошибкой" in out
+    assert (tmp_path / "output" / "a.mkv").exists()
+    assert sleeps == [0.5]
+
+
+def test_delete_success_keeps_note_and_no_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F2 regression pin: successful deletion keeps the previous behavior —
+    note printed, file gone, no warning, no retry sleep, exit 0."""
+    _tmp_project(tmp_path, monkeypatch)
+    _write_delete_config(tmp_path, album=False)
+    _patch_unlink(monkeypatch, locked=set(), fail_times_per_path=None)
+    sleeps = _patch_sleep(monkeypatch)
+
+    def fake_run(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
+        output.write_bytes(b"encoded content")
+        return (60, 1)
+
+    def fake_upload(
+        path: Path,
+        client: object,
+        reporter: object,
+        progress: object = None,
+        folder_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        return "https://gofile.io/d/OK", "uuid"
+
+    monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run)
+    monkeypatch.setattr(cli, "upload_output", fake_upload)
+    monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+    monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+
+    exit_code = cli.main(["--profile", "upl", "-i", "a.mkv", "--config", "config.toml"])
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert not (tmp_path / "output" / "a.mkv").exists()
+    assert "Файл a.mkv удалён из output/ после выгрузки" in out
+    assert "не удалён" not in out
+    assert sleeps == []
 
 
 def test_cli_wires_auto_repair_from_tools_override(
