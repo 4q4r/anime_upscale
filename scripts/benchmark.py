@@ -24,7 +24,6 @@ import argparse
 import dataclasses
 import itertools
 import json
-import os
 import subprocess
 import sys
 import time
@@ -43,6 +42,7 @@ from anime_upscale.hardware import (
     query_driver_version,
     resolve_pools_from_anchor,
     resolve_streams_from_anchor,
+    usable_cpu_count,
     validate_anchor,
 )
 from anime_upscale.pipeline import run_pipeline
@@ -557,7 +557,9 @@ def check_anchor(path: Path, reporter: Reporter | None = None) -> int:
         return 1
     vram = int(anchor.get("gpu_vram_mb", 0) or 0)
     streams = resolve_streams_from_anchor(anchor, vram)
-    cores = os.cpu_count() or 1
+    # F-1 (review #35): the preview must mirror detection's honest basis — the
+    # usable CPU budget (affinity/cgroup-aware), never the raw host size.
+    cores = usable_cpu_count()
     pools = resolve_pools_from_anchor(anchor, cores=cores, active_encoders=1)
     reporter.success(f"Якорь валиден (schema_version {anchor.get('schema_version')}): {path}")
     reporter.note(f"  GPU: {anchor.get('gpu_name')} ({vram} МБ, driver {anchor.get('driver')})")

@@ -12,8 +12,11 @@ and usage errors must never load the GPU stacks.
 from __future__ import annotations
 
 import argparse
+import multiprocessing
+import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -28,7 +31,13 @@ from anime_upscale.config import (
 )
 from anime_upscale.fetch_input import EntryError, QueueItem, build_queue, fetch_queue_item
 from anime_upscale.gofile import GofileClient, GofileError
-from anime_upscale.hardware import HardwareError, HardwareProfile, detect_hardware, print_banner
+from anime_upscale.hardware import (
+    HardwareError,
+    HardwareProfile,
+    detect_hardware,
+    print_banner,
+    usable_cpu_count,
+)
 from anime_upscale.models.fetch import FetchError, ensure_vsrife_seed, verify_all
 from anime_upscale.models.manifest import ManifestError
 from anime_upscale.reporting import (
@@ -40,7 +49,7 @@ from anime_upscale.tools import ToolError, resolve_tool
 from anime_upscale.upload import UploadError, upload_output
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from anime_upscale.stages import StageContext
 
@@ -51,6 +60,26 @@ MEDIA_EXTENSIONS = frozenset(
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_UPLOAD = 3
+
+# Multi-GPU dispatch threshold (plan §9.3 as-built): at this many detected
+# CUDA cards the batch driver switches to spawned per-GPU workers; below it
+# the sequential v1 driver runs untouched (zero-regression contract).
+_FANOUT_MIN_GPUS = 2
+
+
+def _make_client_factory(config: Config) -> Callable[[], GofileClient]:
+    """Build the gofile client factory from the resolved config (wiring helper)."""
+
+    def client_factory() -> GofileClient:
+        return GofileClient(
+            account_token=config.upload.gofile.token,
+            user_agent=config.fetch.gofile.user_agent,
+            language=config.fetch.gofile.language,
+            wt_salt=config.fetch.gofile.wt_salt,
+            strict_tls=config.network.strict_tls,
+        )
+
+    return client_factory
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -230,15 +259,7 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Pre-flight (§11.5): queue resolution incl. gofile folder expansion (metadata only).
-    def client_factory() -> GofileClient:
-        return GofileClient(
-            account_token=config.upload.gofile.token,
-            user_agent=config.fetch.gofile.user_agent,
-            language=config.fetch.gofile.language,
-            wt_salt=config.fetch.gofile.wt_salt,
-            strict_tls=config.network.strict_tls,
-        )
-
+    client_factory = _make_client_factory(config)
     queue = build_queue(entries, client_factory, reporter, strict_tls=config.network.strict_tls)
     if "upscale" in run.stages:
         verify_all(root / config.models.manifest, root / config.models.dir)
@@ -249,7 +270,54 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
         ensure_vsrife_seed(root / config.models.manifest)
     output_override = _resolve_output_override(args.output, len(queue))
 
+    # Multi-GPU dispatch (plan §9.3 as-built): two or more visible CUDA cards
+    # engage fan-out — one spawned worker per GPU over a shared dynamic queue.
+    # One card or a CPU-only box keeps the exact sequential v1 driver below
+    # (zero-regression contract, pinned by tests/test_batch_fanout.py).
+    if hardware.gpu_count >= _FANOUT_MIN_GPUS:
+        return _run_batch_fanout(
+            queue=queue,
+            hardware=hardware,
+            config=config,
+            run=run,
+            ffmpeg_path=ffmpeg_path,
+            output_override=output_override,
+            root=root,
+            reporter=reporter,
+            num_streams=args.num_streams,
+            no_color=args.no_color,
+            no_tty=args.no_tty,
+        )
+
     ctx = _stage_context(config, run, hardware, root, reporter)
+    return _run_batch_sequential(
+        ctx=ctx,
+        queue=queue,
+        config=config,
+        run=run,
+        ffmpeg_path=ffmpeg_path,
+        output_override=output_override,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        client_factory=client_factory,
+        reporter=reporter,
+    )
+
+
+def _run_batch_sequential(  # noqa: PLR0913 - driver wiring bundle
+    *,
+    ctx: StageContext,
+    queue: list[QueueItem],
+    config: Config,
+    run: RunConfig,
+    ffmpeg_path: str,
+    output_override: str | None,
+    input_dir: Path,
+    output_dir: Path,
+    client_factory: Callable[[], GofileClient],
+    reporter: Reporter,
+) -> int:
+    """Run the strict sequential v1 driver: unchanged loop, continue-and-summarize."""
     results: list[tuple[str, bool, str]] = []
     failures = {"pipeline": False, "upload": False}
     batch_folder_id: str | None = None
@@ -308,6 +376,326 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     if failures["upload"]:
         return EXIT_UPLOAD
     return EXIT_OK
+
+
+# --- Multi-GPU fan-out (plan §9.3 as-built; load-dist canon §1/§2/§4) --------
+#
+# Canon: episode-level distribution only — a clip is NEVER split across GPUs
+# (vs-mlrt #145: interleaved frames disrupt RIFE temporal consistency).
+# Process-per-GPU because torch/vsrife device selection is process-global
+# state (VS prefetch would race per-branch pinning) and CUDA+fork is unsafe
+# ("poison fork"); spawn is also the only portable start method on Windows
+# (the owner's server) — Python 3.14 additionally switched the Linux default
+# away from fork, so the context is always requested explicitly.
+#
+# TRT engine sharing (canon §2): every child reads the same
+# [stages.interpolate] trt_cache_dir (default ~/.cache/vsrife); vsrife keys
+# engines by GPU model, so a same-SKU farm (e.g. Kaggle 2×T4) shares ONE
+# engine — the first child to need it builds it, the rest load it cached.
+# Known limitation (documented, deliberately no invented write-guard): on the
+# FIRST parallel run over brand-new cards two children can race the engine
+# build and build it twice — safe, costs only time.
+#
+# Progress: children inherit the parent's stdout, so per-entry lines from
+# concurrent workers can interleave on a TTY (accepted for Kaggle/Compose
+# runs); the parent prints command-level progress (N/M entries completed) and
+# the end-of-batch summary stays byte-identical to the sequential driver.
+# No merge barriers, no per-child progress plumbing (simplicity over
+# cleverness).
+
+
+@dataclass(frozen=True)
+class _FanoutSpec:
+    """Spawn-safe worker wiring bundle (plain picklable data only)."""
+
+    config: Config
+    run: RunConfig
+    root: Path
+    ffmpeg_path: str
+    output_override: str | None
+    upload_enabled: bool
+    auto_repair: bool
+    delete_after_upload: bool
+    total: int
+    num_streams: int | None
+    no_color: bool
+    no_tty: bool
+
+
+@dataclass(frozen=True)
+class _FanoutTask:
+    """One unit of fan-out work: 1-based queue ordinal, entry, album folder."""
+
+    ordinal: int
+    item: QueueItem
+    folder_id: str | None
+
+
+@dataclass(frozen=True)
+class _FanoutResult:
+    """One processed entry, reported back for the parent's batch summary."""
+
+    ordinal: int
+    name: str
+    # None = success; otherwise "pipeline" | "upload" (same ranking as the
+    # sequential driver's failure classification for exit codes).
+    failure_kind: str | None
+    detail: str
+    upload_info: tuple[str, str | None] | None
+
+
+def _pin_visible_gpu(gpu_index: int) -> None:
+    """
+    Belt-and-braces child-side GPU pin (driver-level, not config delivery).
+
+    Called at the very start of the worker, BEFORE any torch import: the CUDA
+    runtime reads CUDA_VISIBLE_DEVICES at init time, so the spawned child sees
+    exactly one card and its own detect_hardware reports it at cuda:0.
+    """
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+
+
+def _fanout_worker(
+    gpu_index: int,
+    task_queue: multiprocessing.Queue[_FanoutTask | None],
+    result_queue: multiprocessing.Queue[_FanoutResult],
+    spec: _FanoutSpec,
+) -> None:
+    """
+    One episode-processing worker per GPU (spawn child entry point).
+
+    Module-top-level by multiprocessing requirement (picklable target). Runs
+    the FULL ``_process_entry`` chain (fetch → pipeline → upload) for entries
+    pulled from the shared dynamic queue: whoever finishes first takes the
+    next one — fast cards pull more, no round-robin. Exactly one
+    ``_FanoutResult`` is pushed per entry (every Python-level escape is
+    classified as a pipeline failure so the parent's collector can never hang
+    on a raised worker); a hard OS-level kill of the worker process remains
+    the same hazard class as any multiprocessing consumer.
+
+    Hardware: the child re-runs detect_hardware itself — with the pin from
+    ``_pin_visible_gpu`` the probe sees exactly one card at index 0, so
+    ``interpolate``/``upscale`` keep their unchanged ``gpus[0]`` device
+    resolution (cuda:0 == the pinned physical card).
+    """
+    _pin_visible_gpu(gpu_index)
+    reporter = Reporter(resolve_mode(no_color=spec.no_color, no_tty=spec.no_tty))
+    input_dir = spec.root / "input"
+    output_dir = spec.root / "output"
+    nn_stages_selected = bool({"upscale", "interpolate"} & set(spec.run.stages))
+    hardware = detect_hardware(
+        spec.config.hardware,
+        cli_num_streams=spec.num_streams,
+        nn_stages_selected=nn_stages_selected,
+    )
+    ctx = _stage_context(spec.config, spec.run, hardware, spec.root, reporter)
+
+    def client_factory() -> GofileClient:
+        return GofileClient(
+            account_token=spec.config.upload.gofile.token,
+            user_agent=spec.config.fetch.gofile.user_agent,
+            language=spec.config.fetch.gofile.language,
+            wt_salt=spec.config.fetch.gofile.wt_salt,
+            strict_tls=spec.config.network.strict_tls,
+        )
+
+    ffmpeg_path = spec.ffmpeg_path
+    while True:
+        task = task_queue.get()
+        if task is None:  # sentinel: the queue is fully drained
+            return
+        # M1 (sequential-driver parity): an earlier entry's successful repair
+        # replaces the stale resolved path for later entries in this worker.
+        repaired = ffmpeg_repair.repaired_ffmpeg()
+        if repaired is not None:
+            ffmpeg_path = str(repaired)
+        reporter.file_banner(task.ordinal, spec.total, task.item.name)
+        try:
+            outcome, upload_info = _process_entry(
+                ctx,
+                task.item,
+                input_dir,
+                output_dir,
+                client_factory,
+                ffmpeg_path,
+                output_override=spec.output_override,
+                upload_enabled=spec.upload_enabled,
+                auto_repair=spec.auto_repair,
+                folder_id=task.folder_id,
+                delete_after_upload=spec.delete_after_upload,
+            )
+        except Exception as exc:  # noqa: BLE001 - see the docstring hang guard
+            outcome, upload_info = ("pipeline", str(exc)), None
+        if outcome is None:
+            reporter.success(f"{task.item.name} — готово")
+            result_queue.put(_FanoutResult(task.ordinal, task.item.name, None, "", upload_info))
+        else:
+            kind, detail = outcome
+            reporter.error(f"{task.item.name}: {detail}")
+            result_queue.put(_FanoutResult(task.ordinal, task.item.name, kind, detail, None))
+
+
+def _run_batch_fanout(  # noqa: PLR0913 - driver wiring bundle
+    *,
+    queue: list[QueueItem],
+    hardware: HardwareProfile,
+    config: Config,
+    run: RunConfig,
+    ffmpeg_path: str,
+    output_override: str | None,
+    root: Path,
+    reporter: Reporter,
+    num_streams: int | None,
+    no_color: bool,
+    no_tty: bool,
+) -> int:
+    """
+    Dispatch mode: one spawned worker per GPU over a shared dynamic queue.
+
+    Canon (load-dist §1/§4): episode-level tasks, process-per-GPU, explicit
+    spawn context (Windows-mandatory; CUDA fork-unsafe). Children pin their
+    card via CUDA_VISIBLE_DEVICES and re-detect hardware (one visible device
+    at cuda:0), so stage device resolution is untouched. The feed/collect
+    policy lives in ``_drive_fanout_queue``; the summary tail below is the
+    sequential driver's, byte-for-byte (results re-sorted by queue ordinal,
+    pipeline failure outranks upload failure). KeyboardInterrupt in the
+    parent (Ctrl-C) returns 130; the daemonized workers are torn down with it.
+    """
+    gpu_indexes = [gpu.index for gpu in hardware.gpus]
+    usable = usable_cpu_count(reporter)
+    lanes = max(1, usable // len(gpu_indexes))
+    # L2 contract untouched: active_encoders stays per-child = 1; this note is
+    # informational only (the encoder-lane budget a fan-out run divides into).
+    reporter.note(
+        f"Мульти-GPU fan-out: {len(gpu_indexes)} процесса-воркера (по одному на GPU), "
+        "эпизоды из общей динамической очереди. Бюджет CPU: "
+        f"{usable} ядер(а) / {len(gpu_indexes)} воркера ≈ "
+        f"{lanes} поток(ов) на энкодер-полосу "
+        "(информационно — каждый воркер кодирует одну серию)."
+    )
+
+    mp_ctx = multiprocessing.get_context("spawn")
+    task_queue: multiprocessing.Queue[_FanoutTask | None] = mp_ctx.Queue()
+    result_queue: multiprocessing.Queue[_FanoutResult] = mp_ctx.Queue()
+    spec = _FanoutSpec(
+        config=config,
+        run=run,
+        root=root,
+        ffmpeg_path=ffmpeg_path,
+        output_override=output_override,
+        upload_enabled=run.upload,
+        auto_repair=not bool(config.tools.ffmpeg),
+        delete_after_upload=config.upload.gofile.delete_after_upload,
+        total=len(queue),
+        num_streams=num_streams,
+        no_color=no_color,
+        no_tty=no_tty,
+    )
+    workers = [
+        mp_ctx.Process(
+            target=_fanout_worker,
+            args=(gpu_index, task_queue, result_queue, spec),
+            daemon=True,
+        )
+        for gpu_index in gpu_indexes
+    ]
+    for worker in workers:
+        worker.start()
+
+    results, failures, _batch_folder_id, batch_album_link = _drive_fanout_queue(
+        queue=queue,
+        task_queue=task_queue,
+        result_queue=result_queue,
+        workers=workers,
+        upload_mode=config.upload.gofile.mode,
+        reporter=reporter,
+        album_hold=config.upload.gofile.mode == "album" and run.upload,
+    )
+
+    for worker in workers:
+        worker.join()
+
+    results.sort(key=lambda entry: entry.ordinal)
+    reporter.batch_summary(
+        [(entry.name, entry.failure_kind is None, entry.detail) for entry in results]
+    )
+    if config.upload.gofile.mode == "album" and run.upload and batch_album_link is not None:
+        reporter.link(batch_album_link)
+    if failures["pipeline"]:
+        return EXIT_FAILURE
+    if failures["upload"]:
+        return EXIT_UPLOAD
+    return EXIT_OK
+
+
+def _drive_fanout_queue(  # noqa: PLR0913 - driver wiring bundle
+    *,
+    queue: list[QueueItem],
+    task_queue: multiprocessing.Queue[_FanoutTask | None],
+    result_queue: multiprocessing.Queue[_FanoutResult],
+    workers: Sequence[multiprocessing.process.BaseProcess],
+    upload_mode: str,
+    reporter: Reporter,
+    album_hold: bool,
+) -> tuple[list[_FanoutResult], dict[str, bool], str | None, str | None]:
+    """
+    Feed the task queue and collect one result per entry (the parent's loop).
+
+    Feeding: without album chaining the whole queue is pre-loaded up front
+    (depth = N ≥ 2×GPU for real batches — the canon idle-prevention rule);
+    workers pull dynamically, so a fast card takes more entries. In album
+    mode with upload enabled the head entry is fed alone and the rest are
+    released only after its upload result sets the album folder (or leaves
+    it unset — the exact chain the sequential driver produces), so every
+    entry still lands in ONE album. Sentinels (one per worker) follow the
+    last task; workers exit after the drain.
+
+    Returns (results in arrival order, failure flags, album folder, album link).
+    """
+    batch_folder_id: str | None = None
+    batch_album_link: str | None = None
+    results: list[_FanoutResult] = []
+    failures = {"pipeline": False, "upload": False}
+    released = not album_hold
+
+    def feed_sentinels() -> None:
+        """One exit sentinel per worker, ordered AFTER every task (FIFO drain)."""
+        for _ in workers:
+            task_queue.put(None)
+
+    if released:
+        for ordinal, item in enumerate(queue, start=1):
+            task_queue.put(_FanoutTask(ordinal, item, None))
+        feed_sentinels()
+    else:
+        # Album mode + upload: the head entry alone decides the album folder;
+        # entries 2..N (plus sentinels) are released after its result arrives.
+        task_queue.put(_FanoutTask(1, queue[0], None))
+
+    collected = 0
+    while collected < len(queue):
+        result = result_queue.get()
+        collected += 1
+        if result.failure_kind is None:
+            batch_folder_id, batch_album_link = _update_album_tracking(
+                result.upload_info,
+                batch_folder_id,
+                batch_album_link,
+                upload_mode,
+            )
+        else:
+            failures[result.failure_kind] = True
+        results.append(result)
+        reporter.note(f"Fan-out: завершено {collected}/{len(queue)}")
+        if not released:
+            released = True
+            # The head entry decided the album state (folder set, or its
+            # upload/pipeline failed → later entries chain None, exactly like
+            # the sequential driver's first-wins tracking).
+            for ordinal, item in enumerate(queue[1:], start=2):
+                task_queue.put(_FanoutTask(ordinal, item, batch_folder_id))
+            feed_sentinels()
+    return results, failures, batch_folder_id, batch_album_link
 
 
 def _resolve_output_override(output: str | None, queue_len: int) -> str | None:
