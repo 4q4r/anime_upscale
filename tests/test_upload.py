@@ -123,11 +123,32 @@ class TestUploadFile:
         assert fake.post_kwargs["cookies"] == {"accountToken": "guest"}
         assert "store-eu-par-1.gofile.io" in fake.pins
         assert "headers" in fake.post_kwargs
-        assert "Content-Length" in fake.post_kwargs["headers"]
+        assert "Content-Type" in fake.post_kwargs["headers"]
+        assert "Content-Length" not in fake.post_kwargs["headers"]  # F11: requests derives it
         assert "multipart/form-data; boundary=" in fake.post_kwargs["headers"]["Content-Type"]
         assert isinstance(fake.post_kwargs["data"], bytes)
         # Check that file content is in the streamed multipart body
         assert file.read_bytes() in fake.post_kwargs["data"]
+
+    def test_manual_content_length_header_absent(self, tmp_path: Path) -> None:
+        """F11: requests overrides a manual Content-Length, so we must not send one."""
+        file, fake = _setup(tmp_path)
+        client = _client(fake)
+        client.token = "g"
+        upload_file(file, client)
+        assert fake.post_kwargs is not None
+        assert "Content-Length" not in fake.post_kwargs["headers"]
+
+    def test_missing_parent_folder_is_loud(self, tmp_path: Path) -> None:
+        """F12: official gofile contract always carries parentFolder; absence = loud."""
+        file, fake = _setup(tmp_path)
+        fake.post_response = _Response(
+            {"status": "ok", "data": {"downloadPage": "https://gofile.io/d/AA1"}}
+        )
+        client = _client(fake)
+        client.token = "g"
+        with pytest.raises(UploadError, match="альбом невозможен"):
+            upload_file(file, client)
 
     def test_account_token_cookie_attached(self, tmp_path: Path) -> None:
         file, fake = _setup(tmp_path)
@@ -275,3 +296,88 @@ class TestAdaptiveStreamingMultipart:
         chunk_sizes = [len(c) for c in file_chunks]
         # At least one chunk should be larger than 1 MiB
         assert any(size > 1 * 1024 * 1024 for size in chunk_sizes)
+
+
+class TestMultipartToctou:
+    """F1 regression: length and bytes come from one pinned handle; parity is enforced."""
+
+    def test_grow_streams_declared_prefix_with_valid_boundary(self, tmp_path: Path) -> None:
+        content = b"A" * 1000
+        file = tmp_path / "grow.mkv"
+        file.write_bytes(content)
+
+        streamer = AdaptiveStreamingMultipart(file, boundary="BND2")
+        declared = len(streamer)
+        with file.open("ab") as fh:  # concurrent writer after construction
+            fh.write(b"B" * 500)
+
+        payload = b"".join(streamer)
+        assert len(payload) == declared  # exactly the declared length, not the grown size
+        assert payload.endswith(b"\r\n--BND2--\r\n")  # body ends with a valid boundary
+        assert content in payload
+        assert b"B" * 500 not in payload  # grown tail is never streamed
+
+    def test_shrink_raises_loud_runtime_error(self, tmp_path: Path) -> None:
+        content = b"C" * 1000
+        file = tmp_path / "shrink.mkv"
+        file.write_bytes(content)
+
+        streamer = AdaptiveStreamingMultipart(file, boundary="BND3")
+        with file.open("wb") as fh:  # concurrent truncation after construction
+            fh.write(content[:400])
+
+        with pytest.raises(RuntimeError, match="усечённое"):
+            b"".join(streamer)
+
+    def test_stream_closes_handle_after_iteration(self, tmp_path: Path) -> None:
+        file = tmp_path / "close.mkv"
+        file.write_bytes(b"D" * 10)
+        streamer = AdaptiveStreamingMultipart(file, boundary="BND4")
+        list(streamer)
+        assert streamer._file_handle is None  # handle released (Windows unlink safety)
+        streamer.close()  # idempotent after full iteration
+
+    def test_second_iteration_is_loud(self, tmp_path: Path) -> None:
+        file = tmp_path / "once.mkv"
+        file.write_bytes(b"E" * 10)
+        streamer = AdaptiveStreamingMultipart(file, boundary="BND5")
+        list(streamer)
+        with pytest.raises(RuntimeError, match="использован"):
+            list(streamer)
+
+    def test_upload_file_closes_streamer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        file, fake = _setup(tmp_path)
+        client = _client(fake)
+        client.token = "g"
+        closed: list[bool] = []
+        original_close = AdaptiveStreamingMultipart.close
+
+        def spying_close(self: AdaptiveStreamingMultipart) -> None:
+            closed.append(True)
+            original_close(self)
+
+        monkeypatch.setattr(AdaptiveStreamingMultipart, "close", spying_close)
+        upload_file(file, client)
+        assert closed
+
+
+class TestContentTypeBySuffix:
+    """F11: file part Content-Type follows the filename suffix."""
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("video.mkv", "video/x-matroska"),
+            ("video.mp4", "video/mp4"),
+            ("video.ts", "video/mp2t"),
+            ("video.bin", "application/octet-stream"),
+        ],
+    )
+    def test_content_type_follows_suffix(self, tmp_path: Path, name: str, expected: str) -> None:
+        file = tmp_path / name
+        file.write_bytes(b"data")
+        streamer = AdaptiveStreamingMultipart(file, boundary="B")
+        payload = b"".join(streamer)
+        assert f"Content-Type: {expected}\r\n".encode() in payload
