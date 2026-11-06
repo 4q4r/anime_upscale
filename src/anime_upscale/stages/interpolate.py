@@ -5,6 +5,11 @@ vsrife 5.7.0, model 4.25: fps_num/fps_den give the ABSOLUTE target fps in one
 pass (23.976 → 59.94 needs ×2.5 — impossible by stacking ×2, natively supported).
 Weights are wrapper-managed (auto-download into vsrife/models); TRT engines
 cache under the configured trt_cache_dir.
+
+`num_streams_per_gpu` feeds VS prefetch depth, not GPU inference concurrency:
+vsrife 5.7.0 exposes no stream knob (TRT path executes one frame per engine
+call; the PyTorch path serializes forwards behind per-phase locks — one
+forward in flight). See the verdict notes in anime_upscale.hardware.
 """
 
 from pathlib import Path

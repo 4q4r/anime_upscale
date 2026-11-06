@@ -78,6 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-fps", help="Целевой fps: 60, 23.976 или 60000/1001.")
     parser.add_argument("--descale-height", type=int, help="Целевая высота стадии descale.")
     parser.add_argument(
+        "--num-streams",
+        type=int,
+        metavar="N",
+        help=(
+            "Глубина префетча VapourSynth (кадров в полёте на GPU). НЕ управляет "
+            "параллелизмом GPU-инференса: vsrife его не предоставляет. "
+            "Приоритет: флаг > [hardware] > замер > формула."
+        ),
+    )
+    parser.add_argument(
         "--upload", action="store_true", help="Загрузить результат на gofile.io после прогона."
     )
     parser.add_argument("--no-color", action="store_true", help="Отключить цветной вывод.")
@@ -202,7 +212,7 @@ def _resolve_batch_inputs(
     )
     nn_selected = bool({"upscale", "interpolate"} & set(run.stages))
     hardware = detect_hardware(
-        config.hardware, cli_num_streams=None, nn_stages_selected=nn_selected
+        config.hardware, cli_num_streams=args.num_streams, nn_stages_selected=nn_selected
     )
     ffmpeg_path = resolve_tool("ffmpeg", config.tools.ffmpeg)
     entries = args.inputs or _default_inputs(root / "input")

@@ -88,7 +88,7 @@ v1.1 folds in five resolved owner decisions (A1–A5) and integrates three new r
 
 - New `hardware.py` module builds a **frozen `HardwareProfile`** on every run (GPU models, per-GPU VRAM, GPU count, CPU cores) consumed read-only by stage builders; user supplies only uv + the project folder.
 - Precedence: CLI flag > `[hardware]` override in config.toml > detected values > built-in defaults — same single-merge discipline as the rest of the config.
-- `num_streams` per GPU from an explicit VRAM budget math (RIFE TRT fp16 ≈0.75–2.6 GB/GPU by stream count; compact upscale ≈1–2.5 GB; ≈0.5–1 GB context/engine overhead) — anchors from the vs-mlrt wiki, approximations flagged for the first `benchmarks/RTX5080` entry.
+- `num_streams` per GPU = VS output-loop **prefetch depth** (frames in flight), budgeted from VRAM with frozen fallback constants (16 GB → 2, 24 GB → 3) and refinable by a measured anchor (`benchmarks/<gpu-slug>/anchor.json`, freshness-checked). It does NOT control GPU inference concurrency: vsrife 5.7.0 exposes no stream knob (the TRT path executes one frame per engine call; the PyTorch path serializes forwards behind per-phase locks — one forward in flight). The original wiki-per-stream anchor math was recalibrated away (plan-b-streams §2.5); see `hardware.py` for the verdict notes.
 - Multi-GPU v1 strategy: **one worker process per GPU** (segment fan-out + overlap frames + global-index timesteps + final concat/mux), chosen over in-graph device pinning — §9.3 explains why and the seam-correctness argument. Single-GPU runs keep the exact v1.0 design.
 - Detected profile is reported in the Russian colored run banner (`--no-color` aware).
 
@@ -289,8 +289,11 @@ order = ["descale", "deband", "upscale", "interpolate", "encode"]
 
 [hardware]                        # (v1.1) ЯВНЫЕ override'ы автодетекта — приоритет: CLI > [hardware] > детект > встроенный дефолт.
 # Всё опционально: пустая секция = полностью автодетект (§9).
-# num_streams = 3                 # потоков инференса на GPU (иначе: VRAM-бюджет, §9.2)
-# gpus = [0]                      # какие GPU использовать (иначе: ВСЕ обнаруженные — мульти-GPU fan-out по умолчанию)
+# num_streams = 3                 # VS prefetch depth in frames per GPU (NOT GPU inference
+#                                 #   concurrency: vsrife 5.7.0 has no stream knob; otherwise:
+#                                 #   measured anchor > frozen VRAM formula, §9.2)
+# gpus = [0]                      # which GPUs to use (otherwise: ALL detected; in practice v1
+#                                 #   uses the first — multi-GPU fan-out is NOT implemented, §9.3/v1.3)
 # encode_threads = 12             # потоков libx265 (иначе: все логические ядра / число активных кодировщиков)
 
 [stages.descale]

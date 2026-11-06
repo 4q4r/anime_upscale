@@ -12,6 +12,7 @@ from anime_upscale.hardware import (
     HardwareProfile,
     _cgroup_v2_cpu_quota,
     detect_hardware,
+    resolve_prefetch_from_anchor,
     streams_for_vram,
     usable_cpu_count,
 )
@@ -46,8 +47,63 @@ class TestVramBudget:
     def test_24gb_yields_3_streams_per_plan(self) -> None:
         assert streams_for_vram(24564) == 3
 
+    def test_t4_15gb_yields_1_stream(self) -> None:
+        """Kaggle/Colab T4 (15360 MB): floor((12288 − 4274)/4096) = 1 — frozen fallback pin."""
+        assert streams_for_vram(15360) == 1
+
     def test_4gb_yields_1_stream(self) -> None:
         assert streams_for_vram(4096) == 1
+
+
+def _sweep_anchor(streams_peaks: list[tuple[int, float]], saturation: int | None) -> dict:
+    """Minimal anchor-shaped dict for resolve_prefetch_from_anchor unit tests."""
+    return {
+        "streams_sweep": [
+            {"streams": streams, "vram_peak_mb": peak} for streams, peak in streams_peaks
+        ],
+        "saturation_streams": saturation,
+    }
+
+
+class TestPrefetchAnchorResolution:
+    """Measured prefetch depth: per-slot VRAM from sweep deltas, saturation clamp."""
+
+    def test_slot_from_deltas_and_saturation_clamp(self) -> None:
+        # Slope: (2228 − 2100) / (2 − 1) = 128 MB/slot; budget = 9083.2 → 70 slots → clamp 4.
+        anchor = _sweep_anchor([(1, 2100.0), (2, 2228.0)], saturation=4)
+        assert resolve_prefetch_from_anchor(anchor, 16384) == 4
+
+    def test_no_saturation_caps_at_16(self) -> None:
+        anchor = _sweep_anchor([(1, 2100.0), (2, 2228.0)], saturation=None)
+        assert resolve_prefetch_from_anchor(anchor, 16384) == 16
+
+    def test_saturation_above_cap_is_capped(self) -> None:
+        # Slope over 1..32 = (6068 − 2100) / 31 = 128; saturation 32 still caps at 16.
+        anchor = _sweep_anchor([(1, 2100.0), (32, 6068.0)], saturation=32)
+        assert resolve_prefetch_from_anchor(anchor, 16384) == 16
+
+    def test_single_point_uses_canonical_slot(self) -> None:
+        # No deltas derivable → canonical 128 MB/slot; depth 4 ≠ formula's 2 at 16 GB.
+        anchor = _sweep_anchor([(1, 2100.0)], saturation=4)
+        assert resolve_prefetch_from_anchor(anchor, 16384) == 4
+
+    def test_flat_deltas_fall_back_to_canonical_slot(self) -> None:
+        anchor = _sweep_anchor([(1, 2100.0), (2, 2100.0)], saturation=None)
+        assert resolve_prefetch_from_anchor(anchor, 16384) == 16
+
+    def test_depth_floors_never_rounds(self) -> None:
+        # VRAM 5632 → budget 481.6 MB → floor(481.6 / 128) = 3 (rounding would give 4).
+        anchor = _sweep_anchor([(1, 2100.0), (8, 3008.0)], saturation=8)
+        assert resolve_prefetch_from_anchor(anchor, 5632) == 3
+
+    def test_depth_never_below_one(self) -> None:
+        # GTX 1650 class: negative measured budget still clamps to 1.
+        anchor = _sweep_anchor([(1, 2100.0)], saturation=4)
+        assert resolve_prefetch_from_anchor(anchor, 4096) == 1
+
+    def test_empty_sweep_uses_canonical_slot(self) -> None:
+        anchor = _sweep_anchor([], saturation=4)
+        assert resolve_prefetch_from_anchor(anchor, 16384) == 4
 
 
 class TestDetect:
@@ -554,3 +610,148 @@ class TestEncodeBudgetDivision:
         # formula branch would be 32//2 = 16; the measured anchor saturates at 8.
         assert profile.encode_threads_source == "measured"
         assert profile.encode_threads == min(8, 32 // 2)
+
+
+def _full_valid_anchor(
+    streams_peaks: list[tuple[int, float]], saturation_streams: int | None
+) -> dict:
+    """Schema-valid anchor for detect_hardware tests; streams points carry peaks."""
+    return {
+        "schema_version": 1,
+        "date": "2026-11-06",
+        "gpu_name": "NVIDIA GeForce RTX 5080",
+        "gpu_vram_mb": 16384,
+        "driver": "580.88",
+        "cuda": "12.9",
+        "torch": "2.14.1+cu126",
+        "pipeline_commit": "bfd9b5f",
+        "run_config": {
+            "preset": "medium",
+            "crf": 16,
+            "interp_format": "rgbs",
+            "trt": False,
+            "chains": {"streams": "full-chain", "pools": "encode-only"},
+        },
+        "clip": {
+            "file": "sample.mkv",
+            "frames_in": 1440,
+            "src_fps": "24000/1001",
+            "height": 1080,
+            "seconds": 60.0,
+        },
+        "streams_sweep": [
+            {
+                "streams": streams,
+                "fps": 8.4,
+                "fps_repeats": [8.2, 8.4, 8.6],
+                "vram_peak_mb": peak,
+                "torch_reserved_mb": 1450.0,
+                "smi_delta_mb": peak,
+            }
+            for streams, peak in streams_peaks
+        ],
+        "pools_sweep": [
+            {
+                "pools": p,
+                "fps": 22.0,
+                "fps_repeats": [21.8, 22.0, 22.2],
+                "wall_s": 60.0,
+                "rss_peak_mb": 1000.0,
+            }
+            for p in (4, 8)
+        ],
+        "saturation_streams": saturation_streams,
+        "saturation_pools": 8,
+        "notes": "",
+    }
+
+
+class TestMeasuredPrefetchBranch:
+    """Anchor-tier streams: depth from sweep deltas; CLI outranks the anchor."""
+
+    def _detect_with_anchor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        cli_num_streams: int | None,
+    ):
+        streams_peaks = [(1, 2100.0), (4, 2484.0)]  # slope = 128 MB/slot
+        anchor = _full_valid_anchor(streams_peaks, saturation_streams=4)
+        path = tmp_path / "benchmarks" / "GeForceRTX5080" / "anchor.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(anchor), encoding="utf-8")
+        monkeypatch.setattr("anime_upscale.hardware._probe_torch_gpus", lambda: [_gpu()])
+        monkeypatch.setattr("anime_upscale.hardware._nvidia_smi_cross_check", lambda _d: None)
+        monkeypatch.setattr("anime_upscale.hardware.query_driver_version", lambda: "580.88")
+        monkeypatch.setattr("anime_upscale.hardware.usable_cpu_count", lambda reporter=None: 32)
+        return detect_hardware(
+            overrides=HardwareOverrides(),
+            cli_num_streams=cli_num_streams,
+            nn_stages_selected=True,
+            active_encoders=2,
+            project_root=tmp_path,
+            encode_preset="medium",
+        )
+
+    def test_measured_anchor_sets_prefetch_depth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        profile = self._detect_with_anchor(monkeypatch, tmp_path, cli_num_streams=None)
+        # Formula would give 2; the measured sweep (128 MB/slot, saturation 4) gives 4.
+        assert profile.num_streams_per_gpu == 4
+        assert profile.streams_source == "measured"
+
+    def test_cli_override_beats_measured_anchor(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        profile = self._detect_with_anchor(monkeypatch, tmp_path, cli_num_streams=2)
+        assert profile.num_streams_per_gpu == 2
+        assert profile.streams_source == "config"
+
+    def test_useless_sweep_degradation_is_loud(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """S2: canonical-slot substitution is loud, like every other anchor degradation."""
+        anchor = _full_valid_anchor([(1, 2100.0)], saturation_streams=None)
+        path = tmp_path / "benchmarks" / "GeForceRTX5080" / "anchor.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(anchor), encoding="utf-8")
+        monkeypatch.setattr("anime_upscale.hardware._probe_torch_gpus", lambda: [_gpu()])
+        monkeypatch.setattr("anime_upscale.hardware._nvidia_smi_cross_check", lambda _d: None)
+        monkeypatch.setattr("anime_upscale.hardware.query_driver_version", lambda: "580.88")
+        monkeypatch.setattr("anime_upscale.hardware.usable_cpu_count", lambda reporter=None: 32)
+        capture = _NoteCapture()
+        profile = detect_hardware(
+            overrides=HardwareOverrides(),
+            cli_num_streams=None,
+            nn_stages_selected=True,
+            project_root=tmp_path,
+            encode_preset="medium",
+            reporter=capture,
+        )
+        assert profile.streams_source == "measured"  # substitution, not wholesale fallback
+        assert any("свип" in note for note in capture.notes)
+
+    def test_derived_slope_emits_no_degradation_note(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A sweep with a usable slope must not trigger the canonical-slot note."""
+        path = tmp_path / "benchmarks" / "GeForceRTX5080" / "anchor.json"
+        path.parent.mkdir(parents=True)
+        anchor = _full_valid_anchor([(1, 2100.0), (4, 2484.0)], saturation_streams=4)
+        path.write_text(json.dumps(anchor), encoding="utf-8")
+        monkeypatch.setattr("anime_upscale.hardware._probe_torch_gpus", lambda: [_gpu()])
+        monkeypatch.setattr("anime_upscale.hardware._nvidia_smi_cross_check", lambda _d: None)
+        monkeypatch.setattr("anime_upscale.hardware.query_driver_version", lambda: "580.88")
+        monkeypatch.setattr("anime_upscale.hardware.usable_cpu_count", lambda reporter=None: 32)
+        capture = _NoteCapture()
+        profile = detect_hardware(
+            overrides=HardwareOverrides(),
+            cli_num_streams=None,
+            nn_stages_selected=True,
+            project_root=tmp_path,
+            encode_preset="medium",
+            reporter=capture,
+        )
+        assert profile.streams_source == "measured"
+        assert not any("свип" in note for note in capture.notes)
