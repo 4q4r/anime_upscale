@@ -688,6 +688,17 @@ Semantics (owner requirement: «подача списка файлов на па
 
 ---
 
+## 13. Notebook deployment surface (v1.x) — addendum 2026-11-06
+
+Kaggle Notebooks and Google Colab are an **additional runtime mode** for the pipeline, not a new primary target: the Windows Server RTX 5080 deployment remains primary and untouched, and no primary-runtime behavior, config key, or manifest entry changes.
+
+- **Single reference:** the compatibility matrix (project × Kaggle × Colab, with per-row source + date stamps), design notes, DoD, local-validation contract, risk register, and the fixed owner decisions live in [notebooks.md](notebooks.md). This section only fixes the architectural position.
+- **Detection, not configuration:** a read-only `runtime_env.py` identifies `local`/`kaggle`/`colab` and resolves default project roots; the app still reads settings exclusively from config.toml (no env-var configuration — owner invariant §0 holds). T4 (Turing sm_75) is already classified correctly by [hardware.py](../src/anime_upscale/hardware.py) (`rgbh` FP16 + `recommended_trt=True`); the degrade ladder for notebooks is TRT → PyTorch CUDA FP16 RGBH → loud error, reusing the existing [stages/interpolate.py](../src/anime_upscale/stages/interpolate.py) TRT-off path.
+- **Adaptation lives in bootstrap cells, not the repo:** the committed manifest stays cu130; the Colab driver probe + cu126/`<2.15` torch-index swap mutates only the ephemeral clone ([pyproject.toml](../pyproject.toml) untouched). No Docker, no SSH/remote-control patterns, no env-var app config — platform-ToS and project anti-goals both preserved (§3 anti-goals list).
+- **Fixed owner decisions (2026-11-06):** encode preset `medium` everywhere (honest multi-session session-budget math); gofile guest token stays per-session (no `state_file` config key); input = gofile URL with Kaggle Datasets documented as a symlink recipe; live platform runs are owner acceptance steps.
+
+---
+
 ## Provenance
 
 ### Provenance (v1.1 addendum)
