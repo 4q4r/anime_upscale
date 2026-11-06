@@ -248,9 +248,13 @@ class TestDetectIntegration:
     def test_valid_anchor_gives_measured_streams(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # L3 recalibration: depth = clamp(floor(budget / slot_slope), 1, saturation).
+        # Slot slope = (3300 − 2100) / (4 − 1) = 400 MB/slot; measured budget
+        # = 9083.2 MB → 22 slots → clamped to saturation_streams = 3.
+        # (The pre-L3 fps-gain rule chose the 4-stream point instead.)
         _write_anchor(tmp_path, _anchor())
         profile = _detect(tmp_path, monkeypatch)
-        assert profile.num_streams_per_gpu == 4
+        assert profile.num_streams_per_gpu == 3
         assert profile.streams_source == "measured"
 
     def test_valid_anchor_gives_measured_pools(

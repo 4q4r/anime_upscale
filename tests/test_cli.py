@@ -44,6 +44,48 @@ class TestParser:
         assert args.target_fps == "60"
         assert args.descale_height == 720
 
+    def test_num_streams_flag_parses_and_defaults_to_none(self) -> None:
+        args = build_parser().parse_args(["--profile", "full", "--num-streams", "3"])
+        assert args.num_streams == 3
+        assert build_parser().parse_args(["--profile", "full"]).num_streams is None
+
+
+class TestNumStreamsPassthrough:
+    """W6: --num-streams → cli_num_streams → detect_hardware, приоритет флага."""
+
+    def test_flag_reaches_detect_hardware(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from anime_upscale import cli
+        from anime_upscale.cli import _resolve_batch_inputs
+        from anime_upscale.config import load_config
+        from anime_upscale.hardware import HardwareProfile
+
+        repo = Path(__file__).resolve().parent.parent
+        config = load_config(repo / "config.toml")
+        args = build_parser().parse_args(
+            ["--stages", "encode", "-i", "a.mkv", "--num-streams", "2"]
+        )
+        seen: dict[str, object] = {}
+        fake = HardwareProfile(
+            gpus=(),
+            gpu_count=0,
+            cpu_logical_cores=1,
+            num_streams_per_gpu=5,
+            encode_threads=1,
+            precision="fp16",
+        )
+
+        def _spy(overrides: object, cli_num_streams: int | None, **_kw: object):
+            seen["cli_num_streams"] = cli_num_streams
+            seen["nn_stages_selected"] = _kw.get("nn_stages_selected")
+            return fake
+
+        monkeypatch.setattr(cli, "detect_hardware", _spy)
+        _, hardware, _ffmpeg, entries = _resolve_batch_inputs(args, config, Path.cwd())
+        assert seen["cli_num_streams"] == 2
+        assert seen["nn_stages_selected"] is False  # encode-only: no NN stage
+        assert entries == ["a.mkv"]
+        assert hardware.num_streams_per_gpu == 5  # the detected profile flows through
+
 
 class TestProfileResolutionViaCli:
     def test_profile_not_found_lists_available(self) -> None:

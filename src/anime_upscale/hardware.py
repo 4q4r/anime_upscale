@@ -18,16 +18,44 @@ from pathlib import Path
 from anime_upscale.config import HardwareOverrides
 from anime_upscale.reporting import Reporter
 
-# VRAM budget constants (plan §9.2). Calibrated so the plan's stated anchors
-# hold exactly: 16 GB → 2 streams/GPU, 24 GB → 3 streams/GPU. These constants
-# are the FALLBACK tier: a valid measured anchor (benchmarks/<gpu-slug>/
-# anchor.json) outranks them; explicit config overrides outrank both.
+# VRAM budget constants (plan §9.2, recalibrated per the plan-b-streams §2.5
+# verdict). What the number controls: the VapourSynth output-loop prefetch
+# depth (frames in flight per GPU, consumed at pipeline.py) — NOT GPU
+# inference concurrency. vsrife 5.7.0 exposes no stream knob: the TRT path
+# builds via torch_tensorrt and executes one frame per call, the PyTorch path
+# serializes forwards behind per-phase locks, so the legacy "streams" reading
+# was a misnomer. These are the FALLBACK-tier values, frozen so the stated
+# anchors hold byte-identically: 16 GB → 2, 24 GB → 3, T4 15 GB → 1,
+# GTX 1650 4 GB → 1. A schema-valid measured anchor
+# (benchmarks/<gpu-slug>/anchor.json) outranks them; explicit CLI/[hardware]
+# overrides outrank both.
 _BUDGET_FRACTION = 0.8
+# Legacy pre-2020 CUDA context figure (discuss.pytorch.org #79976: "used to
+# take 750MB in previous versions"). Modern canon is ~300–500 MB per process
+# (same thread; pytorch/serve #2128) — the measured branch below uses it.
 _CONTEXT_RESERVE_MB = 750
 _UPSCALE_RESERVE_MB = 2500
 _SLACK_MB = 1024
-_RIFE_STREAM_BUDGET_MB = 4096
+# Frozen legacy placeholder, renamed to state the mechanism it actually
+# budgets: VS prefetch frame buffering per slot, not hypothetical GPU
+# inference streams (none exist — see the verdict note above). Value frozen
+# for byte-identical fallback outputs.
+_PREFETCH_SLOT_BUDGET_MB = 4096
 _STREAM_CLAMP = (1, 4)
+
+# Measured-branch constants (applied only when a schema-valid anchor matches
+# gpu_name + driver + run_config): modern CUDA-context canon upper bound
+# (discuss.pytorch #79976 / pytorch/serve #2128) and the conservative
+# canonical per-prefetch-slot budget (frame buffers + staging) used when the
+# anchor's own sweep cannot yield a per-slot slope. The anchor's measured
+# deltas always outrank the canonical slot figure.
+_CONTEXT_RESERVE_MB_MEASURED = 500
+_PREFETCH_SLOT_MB_MEASURED = 128
+# Upper sane prefetch depth when the anchor names no saturation_streams.
+_PREFETCH_DEPTH_CAP = 16
+# A slope needs at least two swept points (schema forbids duplicates; points
+# are strictly increasing, so first/last give the widest, most robust delta).
+_SLOPE_MIN_POINTS = 2
 
 # Measured anchors: streams are worth their VRAM only if a point adds ≥5%
 # over the single-stream baseline (plan §3, resolution rule).
@@ -357,11 +385,69 @@ def _resolve_streams_rule(points: list[dict], vram_mb: int) -> int | None:
 
 
 def resolve_streams_from_anchor(anchor: dict, vram_mb: int) -> int | None:
-    """Measured num_streams for a GPU with vram_mb from a schema-valid anchor."""
+    """
+    Measured num_streams for a GPU with vram_mb from a schema-valid anchor.
+
+    Retained for scripts/benchmark.py (anchor-template display); live
+    detection resolves prefetch depth via resolve_prefetch_from_anchor.
+    """
     points = anchor.get("streams_sweep")
     if not isinstance(points, list):
         return None
     return _resolve_streams_rule([p for p in points if isinstance(p, dict)], vram_mb)
+
+
+def resolve_prefetch_from_anchor(anchor: dict, vram_mb: int) -> int:
+    """
+    Measured prefetch depth from a schema-valid anchor (plan-b-streams §4).
+
+    The number budgets VS prefetch slots, not GPU inference streams (vsrife
+    5.7.0 exposes no concurrency knob — verified from installed source).
+    Per-slot VRAM cost = the vram_peak_mb slope across the streams sweep
+    ((peak_last − peak_first) / (streams_last − streams_first)); a single
+    point, an empty sweep, or a non-positive slope (allocator jitter) falls
+    back to the canonical _PREFETCH_SLOT_MB_MEASURED figure — no value is
+    ever invented beyond that documented constant. The clamp top is
+    saturation_streams (capped at _PREFETCH_DEPTH_CAP); without one the cap
+    applies directly. Budget: modern measured context canon (500 MB) in
+    place of the legacy 750 MB fallback figure.
+    """
+    points = [p for p in anchor.get("streams_sweep", []) if isinstance(p, dict)]
+    slot_mb = _prefetch_slot_from_sweep(points)
+    saturation = anchor.get("saturation_streams")
+    max_depth = (
+        min(saturation, _PREFETCH_DEPTH_CAP)
+        if isinstance(saturation, int) and not isinstance(saturation, bool) and saturation >= 1
+        else _PREFETCH_DEPTH_CAP
+    )
+    budget = (
+        _BUDGET_FRACTION * vram_mb - _CONTEXT_RESERVE_MB_MEASURED - _UPSCALE_RESERVE_MB - _SLACK_MB
+    )
+    raw = int(budget // slot_mb)
+    return max(1, min(max_depth, raw))
+
+
+def _prefetch_slot_from_sweep(points: list[dict]) -> float:
+    """Per-slot MB from the sweep's peak slope; canonical figure when un-derivable."""
+    if len(points) >= _SLOPE_MIN_POINTS:
+        first, last = points[0], points[-1]
+        streams_first, streams_last = first.get("streams"), last.get("streams")
+        peak_first, peak_last = first.get("vram_peak_mb"), last.get("vram_peak_mb")
+        numeric = (
+            isinstance(streams_first, int)
+            and not isinstance(streams_first, bool)
+            and isinstance(streams_last, int)
+            and not isinstance(streams_last, bool)
+            and isinstance(peak_first, (int, float))
+            and not isinstance(peak_first, bool)
+            and isinstance(peak_last, (int, float))
+            and not isinstance(peak_last, bool)
+        )
+        if numeric and streams_last > streams_first:
+            slope = (float(peak_last) - float(peak_first)) / (streams_last - streams_first)
+            if slope > 0:
+                return slope
+    return _PREFETCH_SLOT_MB_MEASURED
 
 
 def resolve_pools_from_anchor(anchor: dict, cores: int, active_encoders: int) -> int | None:
@@ -444,6 +530,9 @@ class HardwareProfile:
     gpus: tuple[GPUInfo, ...]
     gpu_count: int
     cpu_logical_cores: int
+    # VS prefetch depth (frames in flight per GPU), consumed at pipeline.py.
+    # NOT GPU inference concurrency: vsrife 5.7.0 exposes no stream knob
+    # (TRT path = one frame per engine call; PyTorch path = lock-serialized).
     num_streams_per_gpu: int
     encode_threads: int
     precision: str
@@ -473,9 +562,16 @@ class HardwareProfile:
 
 
 def streams_for_vram(vram_mb: int) -> int:
-    """VRAM budget math (plan §9.2): clamp(floor((0.8·VRAM − reserves) / stream), 1, 4)."""
+    """
+    Fallback prefetch depth (plan §9.2): clamp(floor((0.8·VRAM − reserves) / slot), 1, 4).
+
+    The result feeds the VapourSynth output-loop prefetch only — it never
+    reaches GPU inference concurrency, because vsrife 5.7.0 provides no
+    stream knob (TRT: one frame per engine call; PyTorch: forwards
+    serialized by locks). Constants are frozen; see the block comment above.
+    """
     budget = _BUDGET_FRACTION * vram_mb - _CONTEXT_RESERVE_MB - _UPSCALE_RESERVE_MB - _SLACK_MB
-    raw = int(budget // _RIFE_STREAM_BUDGET_MB)
+    raw = int(budget // _PREFETCH_SLOT_BUDGET_MB)
     return max(_STREAM_CLAMP[0], min(_STREAM_CLAMP[1], raw))
 
 
@@ -672,7 +768,7 @@ def _consult_anchor(  # noqa: PLR0913 - mirrors the precedence contract inputs
         if reporter is not None:
             reporter.note(f"Якорь {anchor_path} проигнорирован: {reason} — откат на формулу.")
         return None, None
-    measured_streams = resolve_streams_from_anchor(anchor, vram)
+    measured_streams = resolve_prefetch_from_anchor(anchor, vram)
     measured_pools = resolve_pools_from_anchor(anchor, cores, active_encoders)
     return measured_streams, measured_pools
 
