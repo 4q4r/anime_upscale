@@ -74,7 +74,7 @@ class InterpolateConfig:
 class EncodeConfig:
     """[stages.encode] — лист флагов libx265 (research/05)."""
 
-    crf: int = 16
+    crf: int | float = 16
     preset: str = "slow"
     pix_fmt: str = "yuv420p10le"
     profile: str = "main10"
@@ -258,6 +258,24 @@ _GRAIN_LEN = 2
 # x265's hard frame-thread ceiling (X265_MAX_FRAME_THREADS); 0 lets x265 decide.
 _X265_MAX_FRAME_THREADS = 16
 
+# Official x265 rate-control range: --crf <0..51.0> (float values are legal).
+_X265_CRF_MIN = 0.0
+_X265_CRF_MAX = 51.0
+
+# Official x265 --preset names (x265 CLI documentation), speed → quality.
+_X265_PRESETS: tuple[str, ...] = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+)
+
 _STAGE_KEYS: dict[str, set[str]] = {
     dataclass_type.__name__.removesuffix("Config").lower(): {f.name for f in fields(dataclass_type)}
     for dataclass_type in (DescaleConfig, DebandConfig, UpscaleConfig, InterpolateConfig)
@@ -296,6 +314,8 @@ def _validate_profile_table(name: str, table: dict[str, Any]) -> Profile:
             allowed = {f.name for f in fields(EncodeConfig)} - {"x265_params"}
         where = f"profiles.{name}.overrides.{stage_name}"
         _reject_unknown(params, allowed, where)
+        if stage_name == "encode":
+            _validate_encode_values(params, where)
         stage_overrides[stage_name] = dict(params)
     descale_height = table.get("descale_height")
     bad_height = descale_height is not None and (
@@ -336,6 +356,7 @@ def _validate_stages(table: dict[str, Any]) -> StagesConfig:
     encode_extra = encode.pop("x265_params", {})
     encode_allowed = {f.name for f in fields(EncodeConfig)} - {"x265_params"}
     _reject_unknown(encode, encode_allowed, "stages.encode")
+    _validate_encode_values(encode, "stages.encode")
     if not isinstance(encode_extra, dict):
         msg = "[stages.encode.x265_params]: ожидается таблица параметров x265."
         raise ConfigError(msg)
@@ -417,6 +438,32 @@ def validate_x265_params(pairs: tuple[tuple[str, str], ...]) -> None:
             f"(0..{_X265_MAX_FRAME_THREADS}). Уменьшите frame-threads в config.toml; "
             "бюджет CPU задаётся pools=<N>."
         )
+        raise ConfigError(msg)
+
+
+def _validate_encode_values(params: dict[str, Any], where: str) -> None:
+    """
+    Validate libx265 scalar values so bad ones fail at config load, not at encode.
+
+    ``crf`` accepts integers and floats within the official x265 range
+    ``--crf <0..51.0>`` (bool is rejected despite being an int subclass);
+    ``preset`` must be one of the ten official x265 preset names.
+    """
+    crf = params.get("crf")
+    if crf is not None:
+        if isinstance(crf, bool) or not isinstance(crf, (int, float)):
+            msg = f"[{where}]: crf должен быть числом (целым или дробным), получено {crf!r}."
+            raise ConfigError(msg)
+        if not _X265_CRF_MIN <= crf <= _X265_CRF_MAX:
+            msg = (
+                f"[{where}]: crf={crf} вне допустимого диапазона x265 "
+                f"({_X265_CRF_MIN:g}..{_X265_CRF_MAX:g})."
+            )
+            raise ConfigError(msg)
+    preset = params.get("preset")
+    if preset is not None and (not isinstance(preset, str) or preset not in _X265_PRESETS):
+        shown = preset if isinstance(preset, str) else repr(preset)
+        msg = f"[{where}]: недопустимый пресет {shown}. Разрешены: {', '.join(_X265_PRESETS)}."
         raise ConfigError(msg)
 
 
