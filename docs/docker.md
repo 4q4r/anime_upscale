@@ -209,7 +209,9 @@ scripts/docker-smoke.sh    # needs a toolkit-enabled GPU host for the full run;
                            # SMOKE_SKIP_GPU=1 skips the GPU-dependent steps explicitly
 ```
 
-**Build on the target device** (owner decision) — the image is
+**Build on the target device** — owner decision (2026-11-06): build where the
+image will run; if that network's TLS interception breaks the build, use the
+`docker save` fallback below. The image is
 GPU-architecture-agnostic (weights and wheels are universal; TensorRT engines
 are built at first run and cached), so there is no cross-machine image constraint.
 

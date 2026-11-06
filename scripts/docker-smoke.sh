@@ -97,7 +97,7 @@ else
 
 # ---- Шаг 7/8: сквозной прогон пайплайна ------------------------------------
   log "[ШАГ 7/8] Сквозной прогон (interp-only, контейнер без --rm для docker diff)…"
-  if $COMPOSE run --name "$SMOKE_NAME" "$SERVICE" --profile interp-only -i "${SMOKE_SRC%.mkv}"; then
+  if $COMPOSE run --name "$SMOKE_NAME" "$SERVICE" --profile interp-only -i "$SMOKE_SRC"; then
     ok "пайплайн завершился с нулевым кодом"
   else
     fail "пайплайн упал (см. вывод выше)"
@@ -105,9 +105,17 @@ else
 fi
 
 # ---- Шаг 8/8: выходной файл в маунте + гигиена слоя -------------------------
+if [ "${SMOKE_SKIP_GPU:-0}" = "1" ]; then
+  log "[SKIP]  Шаг 8/8: assert выходного файла пропущен явно (SMOKE_SKIP_GPU=1)"
+  log "[SKIP]  Шаг 8/8: docker diff пропущен явно (SMOKE_SKIP_GPU=1)"
+  log ""
+  log "=== СМОУК ЗАВЕРШЁН — SKIPPED (GPU-часть 5–8 пропущена явно; полный прогон на GPU-хосте) ==="
+  exit 0
+fi
+
 log "[ШАГ 8/8] Проверка результата и гигиены слоя…"
-if [ -f "output/${SMOKE_SRC%.mkv}.mkv" ]; then
-  ok "выходной файл появился на хосте: output/${SMOKE_SRC%.mkv}.mkv"
+if [ -f "output/$SMOKE_SRC" ]; then
+  ok "выходной файл появился на хосте: output/$SMOKE_SRC"
 else
   fail "выходного файла нет в output/ — маунт-контракт нарушен"
 fi
@@ -117,9 +125,21 @@ fi
 # (bestsource index cache lives in ~/bsindex by design), /tmp scratch, and
 # the bare mount-parent directory nodes (/app, /home) whose inodes are
 # touched by mount activity. Anything else pollutes the image layer — fail.
-dirty="$(docker diff "$SMOKE_NAME" | awk '{print $2}' \
-  | grep -v -e '^/app/input' -e '^/app/output' -e '^/app/config.toml' -e '^/app$' \
-            -e '^/home/app' -e '^/home$' -e '^/tmp' || true)"
+# docker diff itself must succeed (loud failure: the smoke container vanished);
+# only the allowlist filtering is non-failing (awk exits 0 on empty input).
+if ! diff_output="$(docker diff "$SMOKE_NAME")"; then
+  fail "docker diff не выполнился — контейнер смока $SMOKE_NAME не найден"
+fi
+dirty="$(printf '%s\n' "$diff_output" | awk '
+  { path = $2 }
+  path ~ /^\/app\/input/   { next }
+  path ~ /^\/app\/output/  { next }
+  path == "/app/config.toml" || path == "/app" { next }
+  path ~ /^\/home\/app/    { next }
+  path == "/home"          { next }
+  path ~ /^\/tmp/          { next }
+  { print path }
+')"
 if [ -z "$dirty" ]; then
   ok "docker diff чист вне маунтов (кроме /tmp-скретча)"
 else
