@@ -707,3 +707,51 @@ class TestMeasuredPrefetchBranch:
         profile = self._detect_with_anchor(monkeypatch, tmp_path, cli_num_streams=2)
         assert profile.num_streams_per_gpu == 2
         assert profile.streams_source == "config"
+
+    def test_useless_sweep_degradation_is_loud(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """S2: canonical-slot substitution is loud, like every other anchor degradation."""
+        anchor = _full_valid_anchor([(1, 2100.0)], saturation_streams=None)
+        path = tmp_path / "benchmarks" / "GeForceRTX5080" / "anchor.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(anchor), encoding="utf-8")
+        monkeypatch.setattr("anime_upscale.hardware._probe_torch_gpus", lambda: [_gpu()])
+        monkeypatch.setattr("anime_upscale.hardware._nvidia_smi_cross_check", lambda _d: None)
+        monkeypatch.setattr("anime_upscale.hardware.query_driver_version", lambda: "580.88")
+        monkeypatch.setattr("anime_upscale.hardware.usable_cpu_count", lambda reporter=None: 32)
+        capture = _NoteCapture()
+        profile = detect_hardware(
+            overrides=HardwareOverrides(),
+            cli_num_streams=None,
+            nn_stages_selected=True,
+            project_root=tmp_path,
+            encode_preset="medium",
+            reporter=capture,
+        )
+        assert profile.streams_source == "measured"  # substitution, not wholesale fallback
+        assert any("свип" in note for note in capture.notes)
+
+    def test_derived_slope_emits_no_degradation_note(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A sweep with a usable slope must not trigger the canonical-slot note."""
+        path = tmp_path / "benchmarks" / "GeForceRTX5080" / "anchor.json"
+        path.parent.mkdir(parents=True)
+        anchor = _full_valid_anchor([(1, 2100.0), (4, 2484.0)], saturation_streams=4)
+        path.write_text(json.dumps(anchor), encoding="utf-8")
+        monkeypatch.setattr("anime_upscale.hardware._probe_torch_gpus", lambda: [_gpu()])
+        monkeypatch.setattr("anime_upscale.hardware._nvidia_smi_cross_check", lambda _d: None)
+        monkeypatch.setattr("anime_upscale.hardware.query_driver_version", lambda: "580.88")
+        monkeypatch.setattr("anime_upscale.hardware.usable_cpu_count", lambda reporter=None: 32)
+        capture = _NoteCapture()
+        profile = detect_hardware(
+            overrides=HardwareOverrides(),
+            cli_num_streams=None,
+            nn_stages_selected=True,
+            project_root=tmp_path,
+            encode_preset="medium",
+            reporter=capture,
+        )
+        assert profile.streams_source == "measured"
+        assert not any("свип" in note for note in capture.notes)

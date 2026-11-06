@@ -397,7 +397,11 @@ def resolve_streams_from_anchor(anchor: dict, vram_mb: int) -> int | None:
     return _resolve_streams_rule([p for p in points if isinstance(p, dict)], vram_mb)
 
 
-def resolve_prefetch_from_anchor(anchor: dict, vram_mb: int) -> int:
+def resolve_prefetch_from_anchor(
+    anchor: dict,
+    vram_mb: int,
+    reporter: Reporter | None = None,
+) -> int:
     """
     Measured prefetch depth from a schema-valid anchor (plan-b-streams §4).
 
@@ -407,13 +411,22 @@ def resolve_prefetch_from_anchor(anchor: dict, vram_mb: int) -> int:
     ((peak_last − peak_first) / (streams_last − streams_first)); a single
     point, an empty sweep, or a non-positive slope (allocator jitter) falls
     back to the canonical _PREFETCH_SLOT_MB_MEASURED figure — no value is
-    ever invented beyond that documented constant. The clamp top is
-    saturation_streams (capped at _PREFETCH_DEPTH_CAP); without one the cap
-    applies directly. Budget: modern measured context canon (500 MB) in
-    place of the legacy 750 MB fallback figure.
+    ever invented beyond that documented constant, and the substitution is
+    reported loudly (same RU-note doctrine as the other anchor degradations).
+    The clamp top is saturation_streams (capped at _PREFETCH_DEPTH_CAP);
+    without one the cap applies directly. Budget: modern measured context
+    canon (500 MB) in place of the legacy 750 MB fallback figure.
     """
     points = [p for p in anchor.get("streams_sweep", []) if isinstance(p, dict)]
     slot_mb = _prefetch_slot_from_sweep(points)
+    if slot_mb is None:
+        slot_mb = _PREFETCH_SLOT_MB_MEASURED
+        if reporter is not None:
+            reporter.note(
+                f"Якорь не содержит полезных точек свипа (пусто/одна точка/нулевая дельта) — "
+                f"стоимость слота префетча взята из канона "
+                f"({_PREFETCH_SLOT_MB_MEASURED} МБ), а не из замера."
+            )
     saturation = anchor.get("saturation_streams")
     max_depth = (
         min(saturation, _PREFETCH_DEPTH_CAP)
@@ -427,8 +440,8 @@ def resolve_prefetch_from_anchor(anchor: dict, vram_mb: int) -> int:
     return max(1, min(max_depth, raw))
 
 
-def _prefetch_slot_from_sweep(points: list[dict]) -> float:
-    """Per-slot MB from the sweep's peak slope; canonical figure when un-derivable."""
+def _prefetch_slot_from_sweep(points: list[dict]) -> float | None:
+    """Per-slot MB from the sweep's peak slope; None when un-derivable."""
     if len(points) >= _SLOPE_MIN_POINTS:
         first, last = points[0], points[-1]
         streams_first, streams_last = first.get("streams"), last.get("streams")
@@ -447,7 +460,7 @@ def _prefetch_slot_from_sweep(points: list[dict]) -> float:
             slope = (float(peak_last) - float(peak_first)) / (streams_last - streams_first)
             if slope > 0:
                 return slope
-    return _PREFETCH_SLOT_MB_MEASURED
+    return None
 
 
 def resolve_pools_from_anchor(anchor: dict, cores: int, active_encoders: int) -> int | None:
@@ -768,7 +781,7 @@ def _consult_anchor(  # noqa: PLR0913 - mirrors the precedence contract inputs
         if reporter is not None:
             reporter.note(f"Якорь {anchor_path} проигнорирован: {reason} — откат на формулу.")
         return None, None
-    measured_streams = resolve_prefetch_from_anchor(anchor, vram)
+    measured_streams = resolve_prefetch_from_anchor(anchor, vram, reporter)
     measured_pools = resolve_pools_from_anchor(anchor, cores, active_encoders)
     return measured_streams, measured_pools
 
