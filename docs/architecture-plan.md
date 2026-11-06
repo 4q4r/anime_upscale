@@ -13,7 +13,7 @@ The implementation (branch `feature/full-pipeline-v1`, 13 commits, parity PASSED
 
 1. **Batch failure policy (§8 decision #7): RESOLVED = option 2** — continue-and-summarize with non-zero exit at batch end; pre-flight failures abort before entry 1; upload failures use dedicated exit code 3.
 2. **§11.4 gofile FOLDER SUPPORT (owner addendum 1)** — folder links expand in place: recursive children walk, order folders-first-then-files (alphabetical), video whitelist `.mkv .mp4 .avi .webm .mov .m4v .ts .m2ts` (case-insensitive), non-video children = printed skip note, empty-after-filter = loud error, banners use the expanded queue, idempotence+collisions per child. LIVE API fact: folder `children` is a **dict keyed by child id** (not a list); every share link resolves to a folder wrapper — normalizer handles both shapes.
-3. **§9.3 multi-GPU fan-out: NOT IMPLEMENTED in v1 (honest scope cut)** — vsrife's public API has no global-frame-offset parameter (verified from installed source), so the seam-bit-identity segment design is unachievable as written. v1 ships single-GPU (detection reports devices; no fake driver). Amendment options for a future plan: vsmlrt `RIFEMerge`-based path with explicit global offset, per-chunk boundary re-interpolation, or an upstream vsrife feature request.
+3. **§9.3 multi-GPU fan-out — AS-BUILT (L4, 2026-11-06): episode-level distribution shipped** — one spawned worker process per GPU (`CUDA_VISIBLE_DEVICES` pin, explicit `spawn` context), episodes pulled from a shared dynamic queue (fast card takes more). The original segment-seam design below (chunk split + global-index timesteps + concat) remains unimplemented and is NOT needed at episode level: vsrife's missing global frame-offset parameter only ever blocked the segment variant (a whole episode never crosses GPUs). Single-GPU and zero-GPU runs keep the exact sequential v1 driver (pinned by tests).
 4. **Machine reality: NVIDIA GeForce GTX 1650 4 GB** (not the RTX 5080 assumed in early research context). Everything runs on it (CUDA 13.0 supports sm_75; TRT builds/infers; VRAM budget → 1 stream). First benchmark entry records the REAL GPU; 5080-class figures remain formula-derived until run on such hardware.
 5. **§4 profiles**: `[profiles.X.stages.Y]` was invalid TOML (key redefinition) → implemented as `[profiles.X.overrides.Y]`; `[profiles.full]` gained the required `descale_height = 1080`.
 6. **§5 engines as actually shipped**: `misc.SCDetect` no longer exists in VS R81/PyPI → `scripts/build_misc_plugin.sh` compiles it into `.venv` (re-run after `uv sync`; Windows: manual misc.dll per README); vsdeband PyPI 1.3.3 is an empty stub → dependency pinned from JET git, API = `vsdeband.f3k_deband()` over vszip; descale v12 = per-kernel `Debicubic`/`Debilinear` requiring float32 input (stage converts to 444PS).
@@ -87,9 +87,9 @@ v1.1 folds in five resolved owner decisions (A1–A5) and integrates three new r
 ### C. Hardware detection & auto-configuration — new §9
 
 - New `hardware.py` module builds a **frozen `HardwareProfile`** on every run (GPU models, per-GPU VRAM, GPU count, CPU cores) consumed read-only by stage builders; user supplies only uv + the project folder.
-- Precedence: CLI flag > `[hardware]` override in config.toml > detected values > built-in defaults — same single-merge discipline as the rest of the config.
+- Precedence: CLI flag > `[hardware]` override in config.toml > measured anchor (`benchmarks/<gpu-slug>/anchor.json`, strictly invalidated by gpu_name + driver + run_config) > detected (VRAM formula constants) > built-in defaults — same single-merge discipline as the rest of the config.
 - `num_streams` per GPU = VS output-loop **prefetch depth** (frames in flight), budgeted from VRAM with frozen fallback constants (16 GB → 2, 24 GB → 3) and refinable by a measured anchor (`benchmarks/<gpu-slug>/anchor.json`, freshness-checked). It does NOT control GPU inference concurrency: vsrife 5.7.0 exposes no stream knob (the TRT path executes one frame per engine call; the PyTorch path serializes forwards behind per-phase locks — one forward in flight). The original wiki-per-stream anchor math was recalibrated away (plan-b-streams §2.5); see `hardware.py` for the verdict notes.
-- Multi-GPU v1 strategy: **one worker process per GPU** (segment fan-out + overlap frames + global-index timesteps + final concat/mux), chosen over in-graph device pinning — §9.3 explains why and the seam-correctness argument. Single-GPU runs keep the exact v1.0 design.
+- Multi-GPU strategy (as-built L4): **one spawned worker process per GPU over a shared dynamic episode queue** (no clip splitting — RIFE temporal consistency; fast cards pull more entries), chosen over in-graph device pinning — §9.3 explains why. Single-GPU and zero-GPU runs keep the exact v1.0 sequential design.
 - Detected profile is reported in the Russian colored run banner (`--no-color` aware).
 
 ### D. Optional gofile.io upload post-step — new §10
@@ -292,8 +292,10 @@ order = ["descale", "deband", "upscale", "interpolate", "encode"]
 # num_streams = 3                 # VS prefetch depth in frames per GPU (NOT GPU inference
 #                                 #   concurrency: vsrife 5.7.0 has no stream knob; otherwise:
 #                                 #   measured anchor > frozen VRAM formula, §9.2)
-# gpus = [0]                      # which GPUs to use (otherwise: ALL detected; in practice v1
-#                                 #   uses the first — multi-GPU fan-out is NOT implemented, §9.3/v1.3)
+# gpus = [0]                      # which GPUs to use (otherwise: ALL detected). Two or more cards =
+#                                 #   multi-GPU fan-out: one spawned worker per GPU, episodes pulled
+#                                 #   from a shared dynamic queue (§9.3 as-built). One card / empty
+#                                 #   list = the sequential v1 driver, unchanged.
 # encode_threads = 12             # потоков libx265 (иначе: все логические ядра / число активных кодировщиков)
 
 [stages.descale]
@@ -486,22 +488,24 @@ models/
 |---|---|---|
 | `gpus: tuple[GPUInfo, …]` (`index`, `name`, `vram_mb`) | `torch.cuda.device_count()` + `torch.cuda.get_device_properties(i)` (`.name`, `.total_memory`) | torch is already a hard dependency (vsrife/trt) — no new deps. `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits` is a **cross-check for diagnostics only** (torch reports 0 GPUs but the driver sees N → the error names the mismatch); it is not a second config/detection path. |
 | `gpu_count` | derived | 0 is a valid result — see below. |
-| `cpu_logical_cores` | `os.cpu_count()` | Feeds `encode_threads`. |
-| `num_streams_per_gpu` | VRAM budget math (§9.2) or `[hardware] num_streams` override | Consumed by the frame-loop prefetch and stored for the TRT escape hatch (§9.2). |
-| `encode_threads` | logical cores ÷ active encoders (§9.4) or override | Passed to the ffmpeg/libx265 builder. |
+| `cpu_logical_cores` | `os.cpu_count()` | Informational (banner/diagnosis): system size, NOT the encode budget. |
+| `num_streams_per_gpu` | CLI `--num-streams` > `[hardware] num_streams` > measured anchor (§9.2) > VRAM fallback formula | Consumed by the frame-loop prefetch and stored for the TRT escape hatch (§9.2). |
+| `encode_threads` | usable CPU count (`usable_cpu_count()`: affinity- then cgroup-aware) ÷ active encoders (§9.4), measured-anchor saturation tier, or override | Passed to the ffmpeg/libx265 builder as the x265 pool. |
 | `precision` | constant `fp16` on any RTX-class GPU | Research corpus: fp16 is the ecosystem default; no auto-fp32 path (YAGNI). |
 
 **Zero-GPU behavior:** if the selected stage subset contains `upscale` or `interpolate` and `gpu_count == 0` → loud Russian error naming the missing prerequisite and suggesting either the driver/CUDA check or an encode-only `--stages` subset. A GPU-less machine may still run `--stages descale,deband,encode`.
 
-**Override precedence** (same discipline as the rest of the config, merged in `config.py`): CLI flag > `[hardware]` section in config.toml > detected value > built-in default. The frozen profile is built **after** the merge, so builders see exactly one object and never re-probe.
+**Override precedence** (same discipline as the rest of the config, merged in `config.py`): CLI flag > `[hardware]` section in config.toml > measured anchor (schema-validated, strictly invalidated by gpu_name + driver + would-be run_config) > detected value (VRAM formula constants) > built-in default. The frozen profile is built **after** the merge, so builders see exactly one object and never re-probe.
 
 ### 9.2 `num_streams` — VRAM budget math (assumptions stated)
 
-Per-GPU anchors from the research corpus (vs-mlrt wiki, RTX 4090, TRT fp16 1080p): RIFE v4.7+ ≈ **0.75 GB at 1 stream → ~2.0 GB at 3 → 2.6 GB at 5**. The 2x_AnimeJaNai HD V3 **Compact** (SRVGG, 4.8 MB) is compact-class: **≈1–2.5 GB at 1080p** including workspace — an approximation pending the first `benchmarks/RTX5080` entry (flagged; the budget formula reads the reserve from a single constant that the benchmark entry will refine). Per-process CUDA context + TRT engine + Torch-TensorRT runtime ≈ **0.5–1 GB**.
+Per-GPU anchors from the research corpus (vs-mlrt wiki, RTX 4090, TRT fp16 1080p): RIFE v4.7+ ≈ **0.75 GB at 1 stream → ~2.0 GB at 3 → 2.6 GB at 5** (saturates ~4 streams). The 2x_AnimeJaNai HD V3 **Compact** (SRVGG, 4.8 MB) is compact-class: **≈1–2.5 GB at 1080p** including workspace. Per-process CUDA context: modern canon ≈ **300–500 MB** (discuss.pytorch #79976 / pytorch/serve #2128).
 
-Budget formula (per GPU): `streams = clamp(floor((0.8 × VRAM − context − upscale_reserve − slack) / rife_per_stream), 1, 4)` with `slack ≈ 1 GB`. On the 16 GB target (5080) this evaluates to **2 streams/GPU** — the same value the wiki examples use; the formula exists so a 24 GB card bumps to 3 without a config edit. Honest scope note: vsrife's `trt=True` exposes **no stream knob** [UNVERIFIED whether Torch-TensorRT's internal stream count is tunable from Python]; in v1 the value drives the VS frame-loop `prefetch` depth (concurrent frame pipeline) and is stored for the vsmlrt `BackendV2.TRT(num_streams=…)` escape hatch (§1) so the swap inherits it without redesign.
+**As-built (post plan-b-streams recalibration):** the value budgets the VS output-loop **prefetch depth** (frames in flight per GPU), NOT GPU inference concurrency — vsrife 5.7.0 exposes **no stream knob** (verified from installed source; the TRT path executes one frame per engine call, the PyTorch path serializes forwards behind per-phase locks). Tiers, highest first: CLI `--num-streams` > `[hardware] num_streams` > **measured anchor** (`benchmarks/<gpu-slug>/anchor.json`: per-slot VRAM cost from the sweep's `vram_peak_mb` slope, canonical 128 MB/slot fallback reported loudly; clamp top = `saturation_streams`, capped at 16; measured context 500 MB) > frozen fallback constants (16 GB → 2, 24 GB → 3, T4 15 GB → 1, GTX 1650 4 GB → 1). The value is stored for the vsmlrt `BackendV2.TRT(num_streams=…)` escape hatch (§1) so a future swap inherits it without redesign. The x265 pool budget has the matching measured tier (`saturation_pools`) on top of `usable_cpu_count() ÷ active_encoders`.
 
 ### 9.3 Multi-GPU fan-out — v1 strategy
+
+> **As-built amendment (L4, 2026-11-06):** shipped as EPISODE-level fan-out instead of the segment design below — one spawned worker process per GPU (explicit `spawn` context; `CUDA_VISIBLE_DEVICES` pin at child start), episodes pulled from a shared dynamic `multiprocessing` queue (fast card takes more; queue pre-loaded, depth ≥ 2×GPU), parent collects results and prints the sequential-identical batch summary (album chaining preserved via a head-entry hold-back in album mode). The segment mechanics below remain the unshipped design for a future chunked-single-episode case; §9.4's per-segment encoder budget applies per WORKER in the episode-level world only as the informational encoder-lane note (per-child `active_encoders` stays 1).
 
 **Requirement:** more than one GPU → the pipeline uses **ALL** GPUs at maximum by default (config `[hardware] gpus` may pin a subset). **Chosen strategy: one worker process per GPU** (segment fan-out), not in-graph device pinning.
 
@@ -575,7 +579,7 @@ gofile applies client-side hardening on some endpoints — the owner's `gofile-d
 
 ## 11. Input ingestion, gofile download client, batch driver (v1.2)
 
-**Owner requirements (2026-10-27):** (a) a **list of files** can be given to the pipeline and they execute one by one; (b) **direct links and gofile links** are downloaded into `input/` preserving original names, then processed; (c) the gofile download client uses a **guest token with an explicit save/reuse lifecycle** — frequent guest regeneration is rate-limited by gofile (owner's explicit reason for a saved-credential state file). Sequential batch only; parallel batch is out of v1.2 scope (the §9 fan-out machinery is per-file and untouched).
+**Owner requirements (2026-10-27):** (a) a **list of files** can be given to the pipeline and they execute one by one; (b) **direct links and gofile links** are downloaded into `input/` preserving original names, then processed; (c) the gofile download client uses a **guest token with an explicit save/reuse lifecycle** — frequent guest regeneration is rate-limited by gofile (owner's explicit reason for a saved-credential state file). As of L4 (2026-11-06) a batch on two or more GPUs runs through the §9.3 episode-level fan-out; single-GPU batches stay strictly sequential (the v1.2 driver contract).
 
 Design shape: one new module for input-entry resolution (`fetch_input.py`, §11.1), one new module for the gofile API (`gofile.py`, §11.2–11.4, shared by `fetch_input.py` and `upload.py`), and a thin batch loop in the driver (§11.5). The v1.1 single-file semantics remain the inner loop — a batch is N sequential runs of exactly that loop, nothing more.
 

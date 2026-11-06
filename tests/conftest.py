@@ -26,6 +26,7 @@ VAPOURSYNTH_TEST_MODULES = (
     "test_pipeline.py",
     "test_stages.py",
     "test_batch.py",
+    "test_batch_fanout.py",
     "test_benchmark.py",
 )
 

@@ -110,13 +110,15 @@ class TestVsCollectionGate:
         conftest = _load_conftest()
         assert conftest.vs_ignored_modules(vapoursynth_available=True) == []
         ignored = conftest.vs_ignored_modules(vapoursynth_available=False)
-        # test_batch/test_benchmark join the matrix (PR1-review Minor): they
-        # patch/import the pipeline module at RUNTIME, so VS-less machines
-        # would otherwise hit ModuleNotFoundError mid-test, not at collection.
+        # test_batch/test_batch_fanout/test_benchmark join the matrix
+        # (PR1-review Minor): they patch/import the pipeline module at RUNTIME,
+        # so VS-less machines would otherwise hit ModuleNotFoundError mid-test,
+        # not at collection.
         assert {
             "test_pipeline.py",
             "test_stages.py",
             "test_batch.py",
+            "test_batch_fanout.py",
             "test_benchmark.py",
         } == set(ignored)
 
