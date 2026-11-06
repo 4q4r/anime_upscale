@@ -16,7 +16,7 @@ import multiprocessing
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -389,12 +389,12 @@ def _run_batch_sequential(  # noqa: PLR0913 - driver wiring bundle
 # away from fork, so the context is always requested explicitly.
 #
 # TRT engine sharing (canon §2): every child reads the same
-# [stages.interpolate] trt_cache_dir (default ~/.cache/vsrife); vsrife keys
-# engines by GPU model, so a same-SKU farm (e.g. Kaggle 2×T4) shares ONE
-# engine — the first child to need it builds it, the rest load it cached.
-# Known limitation (documented, deliberately no invented write-guard): on the
-# FIRST parallel run over brand-new cards two children can race the engine
-# build and build it twice — safe, costs only time.
+# [stages.interpolate] trt_cache_dir (default ~/.cache/vsrife); vsrife is
+# EXPECTED to key engines by GPU model (unverified live), so a same-SKU farm
+# (e.g. Kaggle 2×T4) shares ONE engine — the first child to need it builds
+# it, the rest load it cached. Known limitation (documented, deliberately no
+# invented write-guard): on the FIRST parallel run over brand-new cards two
+# children can race the engine build and build it twice — safe, only time.
 #
 # Progress: children inherit the parent's stdout, so per-entry lines from
 # concurrent workers can interleave on a TTY (accepted for Kaggle/Compose
@@ -433,7 +433,13 @@ class _FanoutTask:
 
 @dataclass(frozen=True)
 class _FanoutResult:
-    """One processed entry, reported back for the parent's batch summary."""
+    """
+    One processed entry, reported back for the parent's batch summary.
+
+    ``ordinal == 0`` marks a WORKER-START FAILURE (F1 guard): the worker died
+    before its queue loop — ``name`` carries the GPU label, ``detail`` the
+    cause. Markers are loud parent-side events, never counted as entries.
+    """
 
     ordinal: int
     name: str
@@ -476,30 +482,35 @@ def _fanout_worker(
     Hardware: the child re-runs detect_hardware itself — with the pin from
     ``_pin_visible_gpu`` the probe sees exactly one card at index 0, so
     ``interpolate``/``upscale`` keep their unchanged ``gpus[0]`` device
-    resolution (cuda:0 == the pinned physical card).
+    resolution (cuda:0 == the pinned physical card). The parent's
+    ``[hardware] gpus`` override is STRIPPED for this call (F1): the list
+    enumerates the parent's devices and is meaningless inside a pinned
+    single-card child — detect_hardware would reject the only visible card
+    and kill the worker before any result.
+
+    The entire start sequence (pin → reporter → detection → stage context →
+    client factory) sits inside the start guard: any exception pushes an
+    ordinal-0 ``_FanoutResult`` marker and returns, so a start-time death
+    surfaces loudly in the parent instead of hanging its collector (F1).
     """
-    _pin_visible_gpu(gpu_index)
-    reporter = Reporter(resolve_mode(no_color=spec.no_color, no_tty=spec.no_tty))
-    input_dir = spec.root / "input"
-    output_dir = spec.root / "output"
-    nn_stages_selected = bool({"upscale", "interpolate"} & set(spec.run.stages))
-    hardware = detect_hardware(
-        spec.config.hardware,
-        cli_num_streams=spec.num_streams,
-        nn_stages_selected=nn_stages_selected,
-    )
-    ctx = _stage_context(spec.config, spec.run, hardware, spec.root, reporter)
-
-    def client_factory() -> GofileClient:
-        return GofileClient(
-            account_token=spec.config.upload.gofile.token,
-            user_agent=spec.config.fetch.gofile.user_agent,
-            language=spec.config.fetch.gofile.language,
-            wt_salt=spec.config.fetch.gofile.wt_salt,
-            strict_tls=spec.config.network.strict_tls,
-        )
-
     ffmpeg_path = spec.ffmpeg_path
+    try:
+        _pin_visible_gpu(gpu_index)
+        reporter = Reporter(resolve_mode(no_color=spec.no_color, no_tty=spec.no_tty))
+        input_dir = spec.root / "input"
+        output_dir = spec.root / "output"
+        nn_stages_selected = bool({"upscale", "interpolate"} & set(spec.run.stages))
+        child_overrides = replace(spec.config.hardware, gpus=None)
+        hardware = detect_hardware(
+            child_overrides,
+            cli_num_streams=spec.num_streams,
+            nn_stages_selected=nn_stages_selected,
+        )
+        ctx = _stage_context(spec.config, spec.run, hardware, spec.root, reporter)
+        client_factory = _make_client_factory(spec.config)
+    except Exception as exc:  # noqa: BLE001 - F1: start-time death must surface, never hang
+        result_queue.put(_FanoutResult(0, f"GPU {gpu_index}", "pipeline", str(exc), None))
+        return
     while True:
         task = task_queue.get()
         if task is None:  # sentinel: the queue is fully drained
@@ -554,15 +565,19 @@ def _run_batch_fanout(  # noqa: PLR0913 - driver wiring bundle
 
     Canon (load-dist §1/§4): episode-level tasks, process-per-GPU, explicit
     spawn context (Windows-mandatory; CUDA fork-unsafe). Children pin their
-    card via CUDA_VISIBLE_DEVICES and re-detect hardware (one visible device
-    at cuda:0), so stage device resolution is untouched. The feed/collect
-    policy lives in ``_drive_fanout_queue``; the summary tail below is the
-    sequential driver's, byte-for-byte (results re-sorted by queue ordinal,
-    pipeline failure outranks upload failure). KeyboardInterrupt in the
-    parent (Ctrl-C) returns 130; the daemonized workers are torn down with it.
+    card via CUDA_VISIBLE_DEVICES, detect WITHOUT the parent's
+    ``[hardware] gpus`` override (its list describes the parent's devices;
+    the pinned child's card is cuda:0), and re-detect hardware themselves —
+    stage device resolution stays untouched. The feed/collect policy lives
+    in ``_drive_fanout_queue``. Album folder_id is resolved at RELEASE time
+    from the latest successful upload — semantics identical to the
+    sequential driver (F2). The summary tail below is the sequential
+    driver's, byte-for-byte (results re-sorted by queue ordinal, pipeline
+    failure outranks upload failure). KeyboardInterrupt in the parent
+    (Ctrl-C) returns 130; the daemonized workers are torn down with it.
     """
     gpu_indexes = [gpu.index for gpu in hardware.gpus]
-    usable = usable_cpu_count(reporter)
+    usable = usable_cpu_count()
     lanes = max(1, usable // len(gpu_indexes))
     # L2 contract untouched: active_encoders stays per-child = 1; this note is
     # informational only (the encoder-lane budget a fan-out run divides into).
@@ -628,6 +643,68 @@ def _run_batch_fanout(  # noqa: PLR0913 - driver wiring bundle
     return EXIT_OK
 
 
+def _feed_initial(
+    *,
+    queue: list[QueueItem],
+    task_queue: multiprocessing.Queue[_FanoutTask | None],
+    album_hold: bool,
+    feed_sentinels_once: Callable[[], None],
+) -> int:
+    """
+    Feed the initial tasks; return the next unfed ordinal (total+1 = all fed).
+
+    Without album chaining the whole queue is pre-loaded up front (depth =
+    N ≥ 2×GPU for real batches — the canon idle-prevention rule). In album
+    mode only the head entry anchors the album first; later releases are
+    stamped at release time (F2).
+    """
+    total = len(queue)
+    if not album_hold:
+        for ordinal, item in enumerate(queue, start=1):
+            task_queue.put(_FanoutTask(ordinal, item, None))
+        feed_sentinels_once()
+        return total + 1
+    task_queue.put(_FanoutTask(1, queue[0], None))
+    next_unfed = 2
+    if next_unfed > total:
+        feed_sentinels_once()
+    return next_unfed
+
+
+def _feed_after_result(  # noqa: PLR0913 - feed-state bundle
+    *,
+    queue: list[QueueItem],
+    task_queue: multiprocessing.Queue[_FanoutTask | None],
+    next_unfed: int,
+    batch_folder_id: str | None,
+    album_hold: bool,
+    feed_sentinels_once: Callable[[], None],
+) -> int:
+    """
+    F2 progressive album release; returns the updated next unfed ordinal.
+
+    folder_id is resolved at RELEASE time from the latest successful upload —
+    identical stamps to the sequential driver's per-entry recompute. While
+    the album folder is unknown exactly ONE next entry is in flight (its
+    success anchors the album, its failure chains None); once the folder
+    exists all remaining entries are released with it at full parallelism
+    (first-wins keeps the folder stable, so the shared stamp stays correct).
+    """
+    total = len(queue)
+    if not album_hold or next_unfed > total:
+        return next_unfed
+    if batch_folder_id is not None:
+        for ordinal in range(next_unfed, total + 1):
+            task_queue.put(_FanoutTask(ordinal, queue[ordinal - 1], batch_folder_id))
+        feed_sentinels_once()
+        return total + 1
+    task_queue.put(_FanoutTask(next_unfed, queue[next_unfed - 1], None))
+    next_unfed += 1
+    if next_unfed > total:
+        feed_sentinels_once()
+    return next_unfed
+
+
 def _drive_fanout_queue(  # noqa: PLR0913 - driver wiring bundle
     *,
     queue: list[QueueItem],
@@ -641,40 +718,58 @@ def _drive_fanout_queue(  # noqa: PLR0913 - driver wiring bundle
     """
     Feed the task queue and collect one result per entry (the parent's loop).
 
-    Feeding: without album chaining the whole queue is pre-loaded up front
-    (depth = N ≥ 2×GPU for real batches — the canon idle-prevention rule);
-    workers pull dynamically, so a fast card takes more entries. In album
-    mode with upload enabled the head entry is fed alone and the rest are
-    released only after its upload result sets the album folder (or leaves
-    it unset — the exact chain the sequential driver produces), so every
-    entry still lands in ONE album. Sentinels (one per worker) follow the
-    last task; workers exit after the drain.
+    Workers pull from the shared queue dynamically — a fast card takes more
+    entries, no round-robin. Album chaining: folder_id is resolved at
+    RELEASE time from the latest successful upload — semantics identical to
+    the sequential driver (F2; the feeding policy is ``_feed_after_result``).
+
+    Worker-start failures arrive as ordinal-0 markers (F1 guard): printed
+    loudly and NOT counted as entries — survivors keep draining. When EVERY
+    worker died at start the loop breaks and the parent names every
+    unprocessed entry as failed: the run can never hang on a start-time
+    death. Sentinels (one per worker) follow the last task; workers exit
+    after the drain.
 
     Returns (results in arrival order, failure flags, album folder, album link).
     """
+    total = len(queue)
     batch_folder_id: str | None = None
     batch_album_link: str | None = None
     results: list[_FanoutResult] = []
     failures = {"pipeline": False, "upload": False}
-    released = not album_hold
+    markers = 0
+    last_marker_detail = ""
+    sentinels_fed = False
 
-    def feed_sentinels() -> None:
+    def feed_sentinels_once() -> None:
         """One exit sentinel per worker, ordered AFTER every task (FIFO drain)."""
+        nonlocal sentinels_fed
+        if sentinels_fed:
+            return
+        sentinels_fed = True
         for _ in workers:
             task_queue.put(None)
 
-    if released:
-        for ordinal, item in enumerate(queue, start=1):
-            task_queue.put(_FanoutTask(ordinal, item, None))
-        feed_sentinels()
-    else:
-        # Album mode + upload: the head entry alone decides the album folder;
-        # entries 2..N (plus sentinels) are released after its result arrives.
-        task_queue.put(_FanoutTask(1, queue[0], None))
+    next_unfed = _feed_initial(
+        queue=queue,
+        task_queue=task_queue,
+        album_hold=album_hold,
+        feed_sentinels_once=feed_sentinels_once,
+    )
 
     collected = 0
-    while collected < len(queue):
+    while collected < total:
         result = result_queue.get()
+        if result.ordinal == 0:
+            # F1: a worker died BEFORE its queue loop. Loud, and NOT counted
+            # as an entry — survivors keep draining; when every worker is
+            # down the loop breaks and the parent drains the summary itself.
+            markers += 1
+            last_marker_detail = result.detail
+            reporter.error(f"Воркер {result.name} не стартовал: {result.detail}")
+            if markers == len(workers):
+                break
+            continue
         collected += 1
         if result.failure_kind is None:
             batch_folder_id, batch_album_link = _update_album_tracking(
@@ -686,15 +781,25 @@ def _drive_fanout_queue(  # noqa: PLR0913 - driver wiring bundle
         else:
             failures[result.failure_kind] = True
         results.append(result)
-        reporter.note(f"Fan-out: завершено {collected}/{len(queue)}")
-        if not released:
-            released = True
-            # The head entry decided the album state (folder set, or its
-            # upload/pipeline failed → later entries chain None, exactly like
-            # the sequential driver's first-wins tracking).
-            for ordinal, item in enumerate(queue[1:], start=2):
-                task_queue.put(_FanoutTask(ordinal, item, batch_folder_id))
-            feed_sentinels()
+        reporter.note(f"Fan-out: завершено {collected}/{total}")
+        next_unfed = _feed_after_result(
+            queue=queue,
+            task_queue=task_queue,
+            next_unfed=next_unfed,
+            batch_folder_id=batch_folder_id,
+            album_hold=album_hold,
+            feed_sentinels_once=feed_sentinels_once,
+        )
+
+    if markers == len(workers) and collected < total:
+        # Every worker died before its loop: no entry result will ever come —
+        # the parent drains the summary itself (loud, complete, exit 1).
+        detail = f"воркер не стартовал: {last_marker_detail}"
+        for ordinal in range(collected + 1, total + 1):
+            results.append(
+                _FanoutResult(ordinal, queue[ordinal - 1].name, "pipeline", detail, None)
+            )
+            failures["pipeline"] = True
     return results, failures, batch_folder_id, batch_album_link
 
 
