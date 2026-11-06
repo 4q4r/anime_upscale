@@ -171,6 +171,8 @@ class _FakeSession:
         self.pins: list[str] = []
         self.responses: dict[str, list[_FakeResponse]] = {}
         self.calls: list[tuple[str, str]] = []
+        # Query params per GET call (pagination assertions); None when absent.
+        self.get_params: list[object] = []
 
     def pin(self, hostname: str) -> str:
         self.pins.append(hostname)
@@ -180,8 +182,9 @@ class _FakeSession:
         response = payload if isinstance(payload, _FakeResponse) else _FakeResponse(payload)
         self.responses.setdefault(key, []).append(response)
 
-    def get(self, url: str, **_kw: object) -> _FakeResponse:
+    def get(self, url: str, **kw: object) -> _FakeResponse:
         self.calls.append(("GET", url))
+        self.get_params.append(kw.get("params"))
         for key, bucket in self.responses.items():
             if key in url and bucket:
                 return bucket.pop(0)
@@ -728,16 +731,120 @@ class TestFolderExpansion:
         assert "Пропуск (пустая папка): ghost" in reporter.notes
 
 
+def _page_payload(
+    children: list[dict],
+    *,
+    page: int,
+    has_next: bool,
+    total: int,
+    password_status: str = "passwordOk",
+) -> dict:
+    """One page of the official paginated /contents shape (gofile.io/api,
+    fetched 2026-11-06): children keyed by id (live shape) + a `metadata`
+    object next to `data` carrying hasNextPage/totalCount."""
+    children_dict = {child.get("id", f"child-{i}"): child for i, child in enumerate(children)}
+    return {
+        "status": "ok",
+        "data": {"type": "folder", "children": children_dict, "passwordStatus": password_status},
+        "metadata": {"page": page, "pageSize": 1000, "hasNextPage": has_next, "totalCount": total},
+    }
+
+
+class TestContentsPagination:
+    """F6 (adversarial review 2026-11-06): /contents paginates via page/pageSize
+    and totals live in metadata.next to data. The old single-shot request with
+    pageSize=1000 silently dropped every child beyond page 1."""
+
+    def test_multi_page_album_collects_all_children(self, tmp_path: Path) -> None:
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue(
+            "contents/x",
+            _page_payload([_file("ep01.mkv"), _file("ep02.mkv")], page=1, has_next=True, total=3),
+        )
+        fake._queue(
+            "contents/x",
+            _page_payload([_file("ep03.mkv")], page=2, has_next=False, total=3),
+        )
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        children = client.expand_entries("x")
+        assert [c.name for c in children] == ["ep01.mkv", "ep02.mkv", "ep03.mkv"]
+        assert len(fake.calls) == 2
+        assert [p["page"] for p in fake.get_params] == [1, 2]  # ty: ignore[index-type]
+
+    def test_total_count_mismatch_is_loud(self, tmp_path: Path) -> None:
+        """metadata.totalCount vs accumulated children disagree = loud error
+        (insurance against a silent contract change), never silent truncation."""
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue(
+            "contents/x",
+            _page_payload([_file("a.mkv"), _file("b.mkv")], page=1, has_next=False, total=5),
+        )
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        with pytest.raises(GofileError, match="totalCount"):
+            client.expand_entries("x")
+
+    def test_legacy_response_without_metadata_works_as_before(self, tmp_path: Path) -> None:
+        """A response without the metadata object (legacy shape) = single page,
+        returned untouched — one request, no crash, same children."""
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue("contents/x", _folder_payload([_file("a.mkv")]))
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        children = client.expand_entries("x")
+        assert [c.name for c in children] == ["a.mkv"]
+        assert len(fake.calls) == 1
+
+    def test_subfolder_listing_paginates(self, tmp_path: Path) -> None:
+        """Pagination applies at EVERY listing level (walk calls the same
+        fetch path): a 2-page subfolder contributes all of its children."""
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue(
+            "contents/root",
+            _folder_payload([_file("top.mkv"), {"type": "folder", "name": "s", "id": "sid"}]),
+        )
+        fake._queue(
+            "contents/sid",
+            _page_payload([_file("s1.mkv"), _file("s2.mkv")], page=1, has_next=True, total=3),
+        )
+        fake._queue(
+            "contents/sid",
+            _page_payload([_file("s3.mkv")], page=2, has_next=False, total=3),
+        )
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        children = client.expand_entries("root")
+        # Folders first (subfolder pages merged), then top-level files.
+        assert [c.name for c in children] == ["s1.mkv", "s2.mkv", "s3.mkv", "top.mkv"]
+        assert len(fake.calls) == 3
+
+    def test_metadata_vanishing_mid_stream_is_loud(self, tmp_path: Path) -> None:
+        """Page 1 carries metadata, page 2 does not = inconsistent listing;
+        silently returning page-1 children would reintroduce the truncation."""
+        save_guest("g", tmp_path / "g.toml")
+        fake = _FakeSession()
+        fake._queue(
+            "contents/x",
+            _page_payload([_file("a.mkv")], page=1, has_next=True, total=2),
+        )
+        fake._queue("contents/x", _folder_payload([_file("b.mkv")]))
+        client = _client(fake, state_path=tmp_path / "g.toml")
+        with pytest.raises(GofileError, match="metadata"):
+            client.expand_entries("x")
+
+
 def _doh_script(script: list[object]) -> tuple[object, list[str]]:
     """
-    Build a requests.get fake serving `script` items in call order.
+    Build a requests.Session.get fake serving `script` items in call order.
 
     Items are payload dicts (HTTP 200) or exceptions (transport failures);
     the fake logs every requested endpoint URL for ladder-order assertions.
+    Patch target is Session.get since resolve_doh runs on a dedicated session.
     """
     calls: list[str] = []
 
-    def fake_get(url: str, *a: object, **kw: object) -> object:
+    def fake_get(session_self: object, url: str, *a: object, **kw: object) -> object:
         calls.append(url)
         step = script[len(calls) - 1]
         if isinstance(step, Exception):
@@ -757,7 +864,7 @@ class TestDoH:
                 }
             ]
         )
-        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         assert resolve_doh("api.gofile.io") == ["203.0.113.1"]
         # First endpoint answered — the ladder never advances.
         assert calls == [gofile.DOH_ENDPOINTS[0]]
@@ -765,7 +872,7 @@ class TestDoH:
     def test_status_not_zero_loud(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A valid answer with Status!=0 is final — no ladder advance (protocol answer)."""
         fake_get, calls = _doh_script([{"Status": 3}])
-        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         with pytest.raises(GofileError, match="Status=3"):
             resolve_doh("nope.example")
         assert calls == [gofile.DOH_ENDPOINTS[0]]
@@ -780,7 +887,7 @@ class TestDoH:
                 {"Status": 0, "Answer": [{"type": 1, "data": "203.0.113.1"}]},
             ]
         )
-        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         assert resolve_doh("api.gofile.io") == ["203.0.113.1"]
         assert calls == [gofile.DOH_ENDPOINTS[0], gofile.DOH_ENDPOINTS[1]]
 
@@ -795,7 +902,7 @@ class TestDoH:
                 {"Status": 0, "Answer": [{"type": 1, "data": "198.51.100.9"}]},
             ]
         )
-        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         assert resolve_doh("api.gofile.io") == ["198.51.100.9"]
         assert calls == list(gofile.DOH_ENDPOINTS)
 
@@ -810,7 +917,7 @@ class TestDoH:
                 requests.exceptions.Timeout("timed out"),
             ]
         )
-        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         with pytest.raises(GofileError) as excinfo:
             resolve_doh("api.gofile.io")
         text = str(excinfo.value)
@@ -831,10 +938,44 @@ class TestDoH:
         fake_get, calls = _doh_script(
             [requests.exceptions.SSLError("handshake failed"), {"Status": 3}]
         )
-        monkeypatch.setattr(gofile.requests, "get", fake_get)
+        monkeypatch.setattr(requests.Session, "get", fake_get)
         with pytest.raises(GofileError, match="Status=3"):
             resolve_doh("api.gofile.io")
         assert calls == [gofile.DOH_ENDPOINTS[0], gofile.DOH_ENDPOINTS[1]]
+
+    def test_doh_session_ignores_proxy_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """F7: the ladder runs on a dedicated Session with trust_env=False —
+        the same policy as PinnedSession. An env proxy would resolve hostnames
+        itself and would route the DoH first hop away from the pinning policy."""
+        monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+        observed: dict[str, object] = {}
+
+        def fake_get(session_self: requests.Session, url: str, **_kw: object) -> object:
+            observed["trust_env"] = session_self.trust_env
+            return _FakeResponse({"Status": 0, "Answer": [{"type": 1, "data": "203.0.113.1"}]})
+
+        monkeypatch.setattr(requests.Session, "get", fake_get)
+        assert resolve_doh("api.gofile.io") == ["203.0.113.1"]
+        assert observed["trust_env"] is False
+
+    def test_doh_prepared_request_carries_no_env_proxies(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F7 mock-transport proof: with https_proxy in the environment the
+        session's merged send settings still carry NO proxies (trust_env=False
+        semantics verified against requests' merge_environment_settings)."""
+        monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+        observed: dict[str, object] = {}
+
+        def fake_send(session_self: requests.Session, request: object, **kw: object) -> object:
+            observed["proxies"] = kw.get("proxies")
+            return _FakeResponse({"Status": 0, "Answer": [{"type": 1, "data": "203.0.113.1"}]})
+
+        monkeypatch.setattr(requests.Session, "send", fake_send)
+        assert resolve_doh("api.gofile.io") == ["203.0.113.1"]
+        assert observed["proxies"] == {}
 
 
 class TestDownloadFile:

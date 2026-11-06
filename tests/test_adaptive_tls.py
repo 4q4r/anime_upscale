@@ -202,4 +202,6 @@ class TestDoHStaysStrict:
     def test_resolve_doh_never_routes_through_adaptive_helper(self) -> None:
         source = inspect.getsource(gofile.resolve_doh)
         assert "adaptive_tls_request" not in source
-        assert "requests.get(" in source  # the ladder still talks via plain verified gets
+        # F7: the ladder still talks via plain verified gets — now on a dedicated
+        # trust_env=False session (env proxies would bypass the pinning policy).
+        assert "session.get(" in source

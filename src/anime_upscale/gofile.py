@@ -20,7 +20,7 @@ import time
 import tomllib
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -67,6 +67,10 @@ DOH_ENDPOINTS: tuple[str, ...] = (
 )
 _HTTP_OK = 200
 _MAX_FOLDER_DEPTH = 10
+# Pagination runaway guard (official /contents contract): a page budget well
+# beyond any real album (50 × pageSize 1000 = 50k entries); exceeding it means
+# the server never stops claiming hasNextPage — treated as an API malfunction.
+_MAX_CONTENTS_PAGES = 50
 
 
 class GofileError(Exception):
@@ -161,34 +165,43 @@ def resolve_doh(hostname: str, timeout: float = 15.0) -> list[str]:
     implementation. Timeout, headers and proxy handling are identical for every
     endpoint. Bare-IP endpoints never touch the system resolver: requests
     verifies their certificates natively via the IP SANs.
+
+    The ladder runs on a dedicated Session with ``trust_env = False`` (the same
+    policy as PinnedSession): an environment proxy would resolve hostnames by
+    itself and would route the DoH first hop away from the pinned endpoints.
     """
     failures: list[str] = []
-    for endpoint in DOH_ENDPOINTS:
-        try:
-            response = requests.get(
-                endpoint,
-                params={"name": hostname, "type": "A"},
-                timeout=timeout,
-                headers={"accept": "application/dns-json"},
-            )
-            payload = response.json()
-        except requests.RequestException as exc:
-            failures.append(f"{endpoint} — {exc}")
-            continue
-        if response.status_code != _HTTP_OK:
-            msg = (
-                f"DoH вернул HTTP {response.status_code} для «{hostname}» — "
-                "системный резолвер не используется."
-            )
-            raise GofileError(msg)
-        if payload.get("Status") != 0:
-            msg = f"DoH вернул Status={payload.get('Status')} для «{hostname}» — хост не разрешён."
-            raise GofileError(msg)
-        answers = [a for a in payload.get("Answer", []) if a.get("type") == 1]
-        if not answers:
-            msg = f"DoH не вернул A-записей для «{hostname}»."
-            raise GofileError(msg)
-        return [str(a["data"]) for a in answers]
+    with requests.Session() as session:
+        session.trust_env = False  # a proxy would resolve hostnames itself — bypasses the ladder
+        for endpoint in DOH_ENDPOINTS:
+            try:
+                response = session.get(
+                    endpoint,
+                    params={"name": hostname, "type": "A"},
+                    timeout=timeout,
+                    headers={"accept": "application/dns-json"},
+                )
+                payload = response.json()
+            except requests.RequestException as exc:
+                failures.append(f"{endpoint} — {exc}")
+                continue
+            if response.status_code != _HTTP_OK:
+                msg = (
+                    f"DoH вернул HTTP {response.status_code} для «{hostname}» — "
+                    "системный резолвер не используется."
+                )
+                raise GofileError(msg)
+            if payload.get("Status") != 0:
+                msg = (
+                    f"DoH вернул Status={payload.get('Status')} для «{hostname}» — "
+                    "хост не разрешён."
+                )
+                raise GofileError(msg)
+            answers = [a for a in payload.get("Answer", []) if a.get("type") == 1]
+            if not answers:
+                msg = f"DoH не вернул A-записей для «{hostname}»."
+                raise GofileError(msg)
+            return [str(a["data"]) for a in answers]
     details = "\n".join(f"  • {failure}" for failure in failures)
     msg = (
         f"DoH-разрешение «{hostname}» не удалось ни на одном из {len(DOH_ENDPOINTS)} "
@@ -437,6 +450,24 @@ class _FetchState:
     not_premium_stage: int = 0
 
 
+@dataclass
+class _ListingState:
+    """Pagination accumulator for one /contents listing (official contract)."""
+
+    page: int = 1
+    base_payload: dict[str, Any] | None = None
+    accumulated: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _children_values(children: Any) -> list[dict[str, Any]]:  # noqa: ANN401 - live payload
+    """Children entries of one /contents page: dict (live shape) or list (legacy)."""
+    if isinstance(children, dict):
+        return [child for child in children.values() if isinstance(child, dict)]
+    if isinstance(children, list):
+        return [child for child in children if isinstance(child, dict)]
+    return []
+
+
 class GofileClient:
     """gofile API client consumed by fetch_input.py (downloads) and upload.py (uploads)."""
 
@@ -593,13 +624,29 @@ class GofileClient:
         raise self._not_premium_error(response, refreshed=state.refreshed)
 
     def fetch_contents(self, content_id: str) -> dict[str, Any]:
-        """GET /contents/{id}: JSON first, then status (live 401 recovery, 2026-11-02)."""
+        """
+        GET /contents/{id}: JSON first, then status (live 401 recovery, 2026-11-02).
+
+        Official listing contract (gofile.io/api, fetched 2026-11-06): folder
+        listings paginate via ``page``/``pageSize`` and every page carries a
+        ``metadata`` object next to ``data`` with ``hasNextPage``/``totalCount``.
+        Children are accumulated across pages until ``hasNextPage`` is falsy;
+        the collected total is then cross-checked against ``totalCount``
+        (mismatch = loud error — insurance against a silent API change). A
+        response without ``metadata`` is treated as the legacy single-page
+        shape and returned untouched. Retry/recovery state (rate limit
+        backoff, guest refresh, notPremium ladder) applies per page and is
+        bounded by the same budgets as the single-page implementation.
+        """
         self.ensure_token()
         self.session.pin("api.gofile.io")
         url = f"https://api.gofile.io/contents/{content_id}"
         max_attempts = 4
         state = _FetchState()
-        for attempt in range(1, max_attempts + 1):
+        listing = _ListingState()
+        attempts = 0
+        while True:
+            attempts += 1
             try:
                 response = adaptive_tls_request(
                     self.session.get,
@@ -612,23 +659,26 @@ class GofileClient:
                         salt=self.wt_salt,
                         window_offset=state.window_offset,
                     ),
-                    params=CONTENTS_QUERY_PARAMS,
+                    params={**CONTENTS_QUERY_PARAMS, "page": listing.page},
                     timeout=60,
                 )
             except requests.RequestException as exc:
                 # §11.3: connection reset etc. = loud error quoting the diagnosis.
                 msg = (
                     f"Сетевая ошибка при запросе gofile /contents/{content_id} "
-                    f"(попытка {attempt}/{max_attempts}): {exc}"
+                    f"(страница {listing.page}, попытка {attempts}/{max_attempts}): {exc}"
                 )
                 raise GofileError(msg) from exc
             payload = self._parse_contents_response(response, content_id)
             status = payload.get("status")
             if status == "ok":
-                return payload
+                final = self._advance_listing(payload, content_id, listing)
+                if final is not None:
+                    return final
+                continue
             if status == "error-rateLimit":
-                if attempt < max_attempts:
-                    time.sleep(3 * attempt)  # linear backoff 3 s × attempt (run.py:631-639)
+                if attempts < max_attempts:
+                    time.sleep(3 * attempts)  # linear backoff 3 s × attempt (run.py:631-639)
                     continue
                 msg = (
                     "gofile ограничил частоту запросов (error-rateLimit после всех попыток). "
@@ -649,8 +699,70 @@ class GofileClient:
                 f"(HTTP {response.status_code})."
             )
             raise GofileError(msg)
-        msg = f"gofile /contents/{content_id}: исчерпаны попытки."
-        raise GofileError(msg)
+
+    def _advance_listing(
+        self,
+        payload: dict[str, Any],
+        content_id: str,
+        listing: _ListingState,
+    ) -> dict[str, Any] | None:
+        """
+        Accumulate one ``ok`` page into the listing state.
+
+        Returns the final merged payload (single-page shape or fully collected
+        listing) or None when the server says there is a next page. Loud on
+        pagination-contract violations: metadata vanishing mid-stream,
+        totalCount/collected mismatch, runaway hasNextPage.
+        """
+        data = payload.get("data") or {}  # live API may send explicit `"data": null`
+        children = data.get("children")
+        if listing.base_payload is None and not isinstance(children, (dict, list)):
+            # A file (children absent) or a broken payload: not a listing,
+            # pagination does not apply — return the single page as is.
+            return payload
+        listing.accumulated.extend(_children_values(children))
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            if listing.base_payload is None:
+                # Legacy single-page shape (no pagination object): return
+                # untouched — byte-for-byte the pre-pagination behavior.
+                return payload
+            msg = (
+                f"gofile /contents/{content_id}: страница {listing.page} ответила без metadata "
+                "внутри пагинированного листинга — листинг неполный, продолжение запрещено."
+            )
+            raise GofileError(msg)
+        if listing.base_payload is None:
+            listing.base_payload = payload
+        if not metadata.get("hasNextPage"):
+            self._check_listing_total(content_id, metadata, len(listing.accumulated))
+            (listing.base_payload.get("data") or {})["children"] = listing.accumulated
+            return listing.base_payload
+        listing.page += 1
+        if listing.page > _MAX_CONTENTS_PAGES:
+            msg = (
+                f"gofile /contents/{content_id}: сервер не остановил пагинацию "
+                f"за {_MAX_CONTENTS_PAGES} страниц (hasNextPage всегда true) — "
+                "остановлено как защита от зацикливания API."
+            )
+            raise GofileError(msg)
+        return None
+
+    @staticmethod
+    def _check_listing_total(
+        content_id: str,
+        metadata: dict[str, Any],
+        collected: int,
+    ) -> None:
+        """Cross-check metadata.totalCount against the accumulated children."""
+        total = metadata.get("totalCount")
+        if isinstance(total, int) and not isinstance(total, bool) and total != collected:
+            msg = (
+                f"gofile /contents/{content_id}: metadata.totalCount={total}, "
+                f"собрано {collected} детей — листинг неполный "
+                "(расхождение с контрактом API). Продолжение запрещено."
+            )
+            raise GofileError(msg)
 
     # -- folder expansion (spec addendum 1) --------------------------------
     def expand_entries(
