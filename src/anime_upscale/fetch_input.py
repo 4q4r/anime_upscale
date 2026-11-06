@@ -546,7 +546,12 @@ def fetch_queue_item(
     client_factory: Callable[[], GofileClient],
     reporter: Reporter,
 ) -> Path:
-    """Per-entry download step with smart cache, size/MD5 integrity and delta downloads."""
+    """
+    Per-entry download step with smart cache and size/MD5 integrity.
+
+    When cache re-verification fails, the file is deleted and re-downloaded
+    in full; there is no partial/Range (HTTP 206) resume support.
+    """
     target = input_dir / item.name
     cache = FetchCache(input_dir / ".fetch_cache.json", reporter)
 
