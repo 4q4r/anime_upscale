@@ -1,15 +1,20 @@
-"""ffmpeg encode/mux subprocess: argv builder + y4m stdin wiring (plan §1, §12.3)."""
+"""ffmpeg encode/mux subprocess: argv builder + rawvideo stdin wiring (plan §1, §12.3)."""
 
+import json
+import os
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from anime_upscale.tools import resolve_tool
+from anime_upscale.reporting import Reporter, resolve_mode
+from anime_upscale.tools import ToolError, resolve_tool
 
 _FFMPEG = "ffmpeg"
+_FFPROBE = "ffprobe"
 
 
 def resolve_ffmpeg(override: str | None = None) -> str:
@@ -17,7 +22,144 @@ def resolve_ffmpeg(override: str | None = None) -> str:
     return resolve_tool(_FFMPEG, override)
 
 
-def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_args, ffmpeg, geometry/fps
+# Matroska-portable subtitle codecs (F8; probe7b on ffmpeg 9.0.2: an MP4 with
+# mov_text + ``-c:s copy`` into matroska dies at mux — "Subtitle codec mov_text
+# (94213) is not supported", rc=218, undiagnosed). mov_text/tx3g are MP4-native
+# and transcode to srt (live probe: mov_text→srt muxes clean into subrip);
+# Matroska-native codecs stream-copy as-is — text ASS/SSA/SRT (subrip; the
+# anime-release standard, ffprobe names: ass/ssa/subrip/srt) plus bitmap
+# PGS/VobSub/DVB (pgssub/dvdsub/dvbsub). Anything outside this closed set
+# drops with a warning.
+_SUBTITLE_TRANSCODE_TO_SRT = {"mov_text", "tx3g"}
+_SUBTITLE_COPY_AS_IS = {"subrip", "srt", "ass", "ssa", "pgssub", "dvdsub", "dvbsub"}
+
+
+def subtitle_verdict(
+    codecs: list[str],
+) -> tuple[Literal["copy", "transcode", "drop"], str | None]:
+    """
+    Pre-mux verdict for the source's subtitle codecs: (args mode, warning).
+
+    copy = keep ``-c:s copy``; transcode = ``-c:s srt``; drop = ``-sn``. A set
+    mixing MP4-native text (mov_text/tx3g) with Matroska-native codecs also
+    drops: one ``-c:s`` serves every subtitle stream, and converting the
+    Matroska-native members would restyle text (ass→srt) or fail outright
+    (bitmap→text cannot convert, ffmpeg docs).
+    """
+    names = set(codecs)
+    if not names:
+        return "copy", None
+    unknown = sorted(names - _SUBTITLE_TRANSCODE_TO_SRT - _SUBTITLE_COPY_AS_IS)
+    if unknown:
+        return "drop", f"Субтитры типа {', '.join(unknown)} не переносятся в MKV — отброшены."
+    has_mp4_text = bool(names & _SUBTITLE_TRANSCODE_TO_SRT)
+    has_matroska_native = bool(names & _SUBTITLE_COPY_AS_IS)
+    if has_mp4_text and has_matroska_native:
+        mixed = ", ".join(sorted(names))
+        return "drop", f"Субтитры типа {mixed} не переносятся в MKV единым кодеком — отброшены."
+    if has_mp4_text:
+        return "transcode", None
+    return "copy", None
+
+
+def _resolve_ffprobe(ffmpeg: str) -> str | None:
+    """
+    Locate ffprobe next to the resolved ffmpeg, then on PATH.
+
+    ffprobe ships side-by-side with ffmpeg in every packaging (winget/Gyan
+    zip, distro packages), so the sibling rule also covers [tools] ffmpeg
+    overrides. None = binary absent: the subtitle preflight never blocks
+    (plan F8 — no ffprobe means today's copy behavior).
+    """
+    suffix = ".exe" if os.name == "nt" else ""
+    sibling = Path(ffmpeg).with_name(_FFPROBE + suffix)
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    try:
+        return resolve_tool(_FFPROBE, None)
+    except ToolError:
+        return None
+
+
+def _ffprobe_subtitle_codecs(
+    ffprobe: str,
+    source: str | Path,
+    runner: Any,  # noqa: ANN401 - subprocess.run-shaped callable
+) -> list[str] | None:
+    """
+    Subtitle codec names in the source (read-only ffprobe JSON query).
+
+    None on any failure (spawn error, timeout, nonzero exit, bad JSON) — the
+    preflight then keeps today's copy behavior instead of blocking the mux.
+    """
+    args = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "s",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "json",
+        str(source),
+    ]
+    try:
+        completed = runner(args, capture_output=True, timeout=_PROBE_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(_decode(completed.stdout))
+    except ValueError:
+        return None
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    if not isinstance(streams, list):
+        return None
+    return [
+        str(entry["codec_name"])
+        for entry in streams
+        if isinstance(entry, dict) and isinstance(entry.get("codec_name"), str)
+    ]
+
+
+def _warn(text: str) -> None:
+    """
+    User-facing warning through the reporting layer (Russian, ⚠, TTY-aware).
+
+    The mux path passes no reporter (pipeline builds argv without one), so
+    the preflight resolves its own output mode. Explicit CLI flags
+    (--no-color/--no-tty) are not visible here; TTY detection and NO_COLOR are.
+    """
+    Reporter(mode=resolve_mode(stream=sys.stdout)).warn(text)
+
+
+def _subtitle_preflight(source: str | Path, ffmpeg: str, runner: Any) -> list[str]:  # noqa: ANN401
+    """
+    Subtitle argv segment from a pre-mux ffprobe verdict (plan F8).
+
+    copy = today's behavior; transcode = ``-c:s srt`` for MP4 text subs;
+    drop = ``-sn``. Every failure path degrades to copy — the preflight
+    never blocks or alters a mux it cannot classify.
+    """
+    ffprobe = _resolve_ffprobe(ffmpeg)
+    if ffprobe is None:
+        return ["-c:s", "copy"]
+    codecs = _ffprobe_subtitle_codecs(ffprobe, source, runner)
+    if not codecs:
+        return ["-c:s", "copy"]
+    mode, warning = subtitle_verdict(codecs)
+    if warning is not None:
+        _warn(warning)
+    if mode == "transcode":
+        return ["-c:s", "srt"]
+    if mode == "drop":
+        return ["-sn"]
+    return ["-c:s", "copy"]
+
+
+def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_args, ffmpeg, geometry/fps, probe runner
     source: str | Path,
     output: str | Path,
     video_args: list[str],
@@ -27,6 +169,7 @@ def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_a
     height: int | None = None,
     fps_num: int | None = None,
     fps_den: int | None = None,
+    subtitle_probe_runner: Any | None = None,  # noqa: ANN401 - subprocess.run-shaped callable
 ) -> list[str]:
     """
     Full ffmpeg argv: rawvideo on stdin + source streams → MKV.
@@ -67,10 +210,21 @@ def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_a
            for sparse subtitle/font packets.
         4. `-max_muxing_queue_size 4096`: Extends muxer packet buffer capacity to safely
            handle slower libx265 processing intervals without buffer overruns.
+
+    Subtitle preflight (F8): before the mux, ffprobe reads the source's
+    subtitle codecs and the argv picks a Matroska-portable verdict —
+    mov_text/tx3g → ``-c:s srt``, Matroska-native codecs (ass/ssa/subrip/srt,
+    pgssub/dvdsub/dvbsub) → copy as-is, anything else → ``-sn`` with a Russian
+    warning. Every probe failure (no ffprobe, no subtitles, unreadable JSON)
+    keeps ``-c:s copy`` so the preflight can never block a mux that works
+    today. Tests inject a subprocess.run-shaped callable via
+    subtitle_probe_runner.
     """
     if width is None or height is None or fps_num is None or fps_den is None:
         msg = "build_mux_args требует width, height, fps_num, fps_den для rawvideo-входа."
         raise ValueError(msg)
+    run = subtitle_probe_runner if subtitle_probe_runner is not None else subprocess.run
+    subtitle_args = _subtitle_preflight(source, ffmpeg or _FFMPEG, run)
     return [
         ffmpeg or _FFMPEG,
         "-y",
@@ -108,8 +262,7 @@ def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_a
         "1",
         "-c:a",
         "copy",
-        "-c:s",
-        "copy",
+        *subtitle_args,
         "-c:t",
         "copy",
         "-max_interleave_delta",
@@ -132,7 +285,7 @@ class Encoder:
 
     @property
     def stdin(self) -> Any:  # noqa: ANN401 - Popen.stdin is IO[bytes] | None
-        """The y4m write end (clip.output target)."""
+        """The rawvideo write end (clip.output target; y4m is forbidden — see spawn_encoder)."""
         return self.process.stdin
 
 
@@ -339,7 +492,15 @@ def diagnose_encoder(
 
 def spawn_encoder(args: list[str]) -> Encoder:
     """
-    Start ffmpeg reading y4m on stdin; the caller feeds clip.output(enc.stdin, y4m=True).
+    Start ffmpeg reading rawvideo (yuv420p10le) on stdin for the caller's graph.
+
+    The caller feeds ``graph.output(encoder.stdin, ...)`` RAW frames with NO
+    y4m flag anywhere (the pipeline mux path). NEVER enable y4m here (no
+    ``clip.output(encoder.stdin, y4m=True)``): VapourSynth's y4m writer emits
+    a C420p10 header that ffmpeg's y4m demuxer misreads as 8-bit, and the
+    demuxer's timestamp handling breaks PTS — the violet-square kaleidoscope
+    + broken picture/audio bug fixed in PR #16. The rawvideo argv instead
+    carries width/height/framerate explicitly (build_mux_args).
 
     A daemon thread drains stderr continuously: without it, ``-stats`` progress
     fills the 64 KiB pipe buffer, ffmpeg blocks on its own stderr write and the
