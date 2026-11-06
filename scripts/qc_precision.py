@@ -24,6 +24,11 @@ separate decision after reading this verdict (docs/qc-precision.md).
 
 The clip is NEVER split (vsrife has no global frame offset — canon): both
 runs interpolate each fixture whole.
+
+Measurement honesty: the fixture's numpy content is regenerated inside the
+timed drain (identically on both sides), so ABSOLUTE fps figures are lower
+than production decode-fed throughput — only the A/B delta is decision-
+grade; never compare the absolutes with benchmark.py anchors.
 """
 
 from __future__ import annotations
@@ -56,6 +61,8 @@ CUT_RISK_FRAMES = 5
 
 QC_SCHEMA_VERSION = 1
 QC_FILENAME = "qc_rgbh.json"
+# Display precision per candidate format (vsrife: RGBH = fp16, RGBS = fp32).
+_FORMAT_PRECISION = {"rgbh": "fp16", "rgbs": "fp32"}
 
 # --- fixture plan constants --------------------------------------------------
 FIXTURE_NAMES = ("hard_cuts", "pan_motion", "mixed")
@@ -273,7 +280,28 @@ def decide_verdict(
     PASS needs ALL of: global >= 35 dB, worst-frame >= 28 dB, gain >= 10%.
     A quality miss is FAIL regardless of speed; quality-safe but slow is
     INSUFFICIENT-GAIN. Boundaries are inclusive.
+
+    Total function: any non-finite input (NaN from broken pixels/metrics,
+    inf from zero-deviation comparisons) yields ("ERROR", reason) — never
+    PASS. NaN bypasses every `<` comparison in Python (all False), so an
+    unguarded NaN path silently lands in PASS; a decision instrument that
+    can flip a production precision rule must refuse verdicts on numbers
+    it cannot trust.
     """
+    values = {
+        "глобальный PSNR": global_psnr_db,
+        "worst-кадр PSNR": worst_psnr_db,
+        "выигрыш fps": fps_gain_pct,
+    }
+    non_finite = [name for name, value in values.items() if not math.isfinite(value)]
+    if non_finite:
+        listed = ", ".join(f"{name}={value}" for name, value in values.items())
+        reason = (
+            "Некорректные метрики (NaN/inf) в: "
+            + ", ".join(non_finite)
+            + f" — прогон недостоверен ({listed}). Правило не переключать."
+        )
+        return "ERROR", reason
     if global_psnr_db < PASS_GLOBAL_PSNR_DB or worst_psnr_db < PASS_WORST_PSNR_DB:
         reason = (
             f"Качество ниже порога: глобальный PSNR {global_psnr_db:.2f} дБ "
@@ -296,15 +324,34 @@ def decide_verdict(
     return "PASS", reason
 
 
+def _poisoned_min(values: list[float]) -> float:
+    """
+    min() that poisons deterministically: any non-finite input → NaN.
+
+    Plain ``min`` with NaN is order-dependent (comparisons with NaN are all
+    False), which would let a single broken fixture select a healthy value
+    on one axis and poison another — the aggregate must be predictable so
+    the verdict guard can refuse the whole run.
+    """
+    if any(not math.isfinite(value) for value in values):
+        return math.nan
+    return min(values)
+
+
 def worst_case_aggregate(fixtures: list[dict]) -> tuple[float, float, float]:
-    """Honest worst case across fixtures: (min global PSNR, min worst, min gain)."""
+    """
+    Honest worst case across fixtures: (min global PSNR, min worst, min gain).
+
+    NaN/inf anywhere on an axis poisons that axis to NaN deterministically
+    (see _poisoned_min) — decide_verdict then refuses the verdict loudly.
+    """
     if not fixtures:
         msg = "Вердикт: нет ни одной фикстуры"
         raise ValueError(msg)
     return (
-        min(fixture["global_psnr_db"] for fixture in fixtures),
-        min(fixture["worst_frame"]["psnr_db"] for fixture in fixtures),
-        min(fixture["fps_delta_pct"] for fixture in fixtures),
+        _poisoned_min([fixture["global_psnr_db"] for fixture in fixtures]),
+        _poisoned_min([fixture["worst_frame"]["psnr_db"] for fixture in fixtures]),
+        _poisoned_min([fixture["fps_delta_pct"] for fixture in fixtures]),
     )
 
 
@@ -563,6 +610,12 @@ def measure_speed(
     A fresh rife node per pass keeps VS frame caches from leaking between
     passes; the torch peak is reset immediately before each measured pass
     (benchmark.py canon). Returns (median_fps, fps_repeats, vram_peak_mb).
+
+    Honesty note: the fixture content is numpy-regenerated inside every
+    timed drain (ModifyFrame recomputes it per frame) — the same overhead
+    on both sides, so the A/B fps DELTA is decision-grade while ABSOLUTE
+    fps understates production decode-fed throughput and must NOT be
+    compared with benchmark.py anchors.
     """
     for _ in range(warmup):
         drain_wall_seconds(build_graph())
@@ -756,6 +809,10 @@ def run_qc(args: argparse.Namespace, root: Path, reporter: object) -> int:
         )
     elif verdict == "INSUFFICIENT-GAIN":
         reporter.warn(f"ВЕРДИКТ: INSUFFICIENT-GAIN — {reason}")
+    elif verdict == "ERROR":
+        reporter.error(f"ВЕРДИКТ: ERROR — {reason}")
+        reporter.success(f"Результат записан: {out_path}")
+        return 1
     else:
         reporter.warn(f"ВЕРДИКТ: FAIL — {reason}")
     reporter.success(f"Результат записан: {out_path}")
@@ -772,9 +829,10 @@ def main(argv: list[str] | None = None) -> int:
     reporter = Reporter(resolve_mode(no_color=True, no_tty=True))
     if args.dry_run:
         frames_src = seconds_to_frames(args.seconds)
+        precision = _FORMAT_PRECISION[args.format]
         reporter.note("План QC (без выполнения):")
         reporter.note(
-            f"  кандидат: {args.format.upper()} fp16 vs референс RGBS fp32, "
+            f"  кандидат: {args.format.upper()} {precision} vs референс RGBS fp32, "
             f"фикстуры {len(FIXTURE_NAMES)} × {frames_src} исходных кадров "
             f"({args.seconds} с, {SOURCE_FPS[0]}/{SOURCE_FPS[1]} fps)"
         )

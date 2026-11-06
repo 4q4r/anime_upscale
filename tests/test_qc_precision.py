@@ -269,9 +269,29 @@ class TestVerdict:
         verdict, _ = qc.decide_verdict(20.0, 20.0, 1.0)
         assert verdict == "FAIL"
 
-    def test_infinite_psnr_passes(self, qc: ModuleType) -> None:
-        verdict, _ = qc.decide_verdict(math.inf, math.inf, 25.0)
-        assert verdict == "PASS"
+    def test_nan_metrics_are_error_never_pass(self, qc: ModuleType) -> None:
+        verdict, reason = qc.decide_verdict(math.nan, math.nan, 10.0)
+        assert verdict == "ERROR"
+        assert "PASS" not in verdict
+        assert "Некорректн" in reason  # loud Russian, names the problem
+
+    def test_single_nan_metric_is_error(self, qc: ModuleType) -> None:
+        verdict, _ = qc.decide_verdict(38.0, math.nan, 10.0)
+        assert verdict == "ERROR"
+        verdict, _ = qc.decide_verdict(math.nan, 30.0, 12.0)
+        assert verdict == "ERROR"
+
+    def test_infinite_psnr_is_not_pass(self, qc: ModuleType) -> None:
+        # identical frames give PSNR=inf: suspicious for an fp16 candidate and
+        # untrustworthy as a decision input — must never auto-PASS
+        verdict, reason = qc.decide_verdict(math.inf, math.inf, 25.0)
+        assert verdict == "ERROR"
+        assert "PASS" not in verdict
+        assert "Некорректн" in reason
+
+    def test_infinite_gain_is_error(self, qc: ModuleType) -> None:
+        verdict, _ = qc.decide_verdict(38.0, 30.0, math.inf)
+        assert verdict == "ERROR"
 
 
 class TestWorstCaseAggregate:
@@ -286,6 +306,24 @@ class TestWorstCaseAggregate:
     def test_empty_fixtures_is_loud(self, qc: ModuleType) -> None:
         with pytest.raises(ValueError, match="фикстур"):
             qc.worst_case_aggregate([])
+
+    def test_nan_in_any_fixture_poisons_deterministically(self, qc: ModuleType) -> None:
+        # min() with NaN is order-dependent in Python — the aggregate must
+        # poison the axis deterministically so the verdict can see it
+        fixtures = [
+            {"global_psnr_db": 40.0, "worst_frame": {"psnr_db": 30.0}, "fps_delta_pct": 20.0},
+            {"global_psnr_db": math.nan, "worst_frame": {"psnr_db": 29.0}, "fps_delta_pct": 12.0},
+        ]
+        global_psnr, _, _ = qc.worst_case_aggregate(fixtures)
+        assert math.isnan(global_psnr)
+
+    def test_inf_in_any_fixture_poisons_deterministically(self, qc: ModuleType) -> None:
+        fixtures = [
+            {"global_psnr_db": math.inf, "worst_frame": {"psnr_db": 30.0}, "fps_delta_pct": 20.0},
+            {"global_psnr_db": 36.0, "worst_frame": {"psnr_db": 29.0}, "fps_delta_pct": 12.0},
+        ]
+        global_psnr, _, _ = qc.worst_case_aggregate(fixtures)
+        assert math.isnan(global_psnr)
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +480,17 @@ class TestReportSchema:
         assert payload["fixtures"][0]["global_psnr_db"] is None
         assert payload["fixtures"][0]["worst_frame"]["psnr_db"] == pytest.approx(29.4)
 
+    def test_nan_metrics_yield_error_verdict_in_report(self, qc: ModuleType) -> None:
+        fixture = self._fixture_record()
+        fixture["global_psnr_db"] = math.nan
+        report = qc.build_qc_report(gpu_name="GPU", fixtures=[fixture], run_config={}, notes=[])
+        assert report["verdict"] == "ERROR"
+        assert "PASS" not in report["verdict"]
+        assert "Некорректн" in report["verdict_reason"]
+        payload = json.loads(qc.serialize_qc_report(report))
+        assert payload["verdict"] == "ERROR"
+        assert payload["fixtures"][0]["global_psnr_db"] is None  # nan → null, valid JSON
+
 
 # ---------------------------------------------------------------------------
 # CLI surface
@@ -468,6 +517,45 @@ class TestCli:
             qc.parse_qc_args(["--seconds", "30"])
         with pytest.raises(SystemExit):
             qc.parse_qc_args(["--seconds", "2"])
+
+
+# ---------------------------------------------------------------------------
+# CLI dry-run path (F2): the plan prints without any GPU/hardware probe
+# ---------------------------------------------------------------------------
+
+
+class TestDryRun:
+    def test_dry_run_prints_plan_and_exits_zero(
+        self, qc: ModuleType, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc = qc.main(["--dry-run"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "План QC" in out
+        for name in ("hard_cuts", "pan_motion", "mixed"):
+            assert name in out
+        assert "35.0" in out and "28.0" in out and "10.0" in out  # thresholds shown
+        assert "RGBH fp16" in out  # candidate format named
+        assert "qc_rgbh.json" in out  # output path named
+
+    def test_dry_run_honors_seconds(
+        self, qc: ModuleType, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc = qc.main(["--dry-run", "--seconds", "8"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "192 исходных кадров" in out  # 8 s at 24000/1001
+
+    def test_dry_run_honors_format(
+        self, qc: ModuleType, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # the printed precision must follow the chosen candidate format,
+        # not a hardcoded fp16 (rgbs candidate is fp32)
+        rc = qc.main(["--dry-run", "--format", "rgbs"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "кандидат: RGBS fp32" in out
+        assert "кандидат: RGBS fp16" not in out
 
 
 # ---------------------------------------------------------------------------
