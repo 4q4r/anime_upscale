@@ -104,6 +104,8 @@ _MOV_TEXT_JSON = b'{"streams": [{"codec_name": "mov_text"}]}'
 _TX3G_JSON = b'{"streams": [{"codec_name": "tx3g"}]}'
 _PGSSUB_JSON = b'{"streams": [{"codec_name": "pgssub"}]}'
 _XSUB_JSON = b'{"streams": [{"codec_name": "xsub"}]}'
+_SUBRIP_JSON = b'{"streams": [{"codec_name": "subrip"}]}'
+_ASS_JSON = b'{"streams": [{"codec_name": "ass"}]}'
 _NO_SUBS_JSON = b'{"streams": []}'
 
 
@@ -156,6 +158,39 @@ class TestSubtitlePreflight:
         payload = b'{"streams": [{"codec_name": "dvdsub"}, {"codec_name": "dvbsub"}]}'
         args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(payload))
         assert args[args.index("-c:s") + 1] == "copy"
+
+    def test_mkv_ass_subtitles_keep_stream_copy(self, ffprobe_pinned: None) -> None:
+        """F-REV-1: ASS is the anime-release standard and Matroska-native."""
+        args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(_ASS_JSON))
+        assert args[args.index("-c:s") + 1] == "copy"
+
+    def test_mkv_subrip_subtitles_keep_stream_copy(self, ffprobe_pinned: None) -> None:
+        """F-REV-1: ffprobe names SubRip ``subrip`` on plain MKV inputs."""
+        args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(_SUBRIP_JSON))
+        assert args[args.index("-c:s") + 1] == "copy"
+
+    def test_matroska_native_text_never_warns(
+        self, ffprobe_pinned: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F-REV-1 regression pin: the «не переносятся в MKV» drop-warning must
+        never fire for the Matroska-native text codecs (ass/ssa/subrip/srt)."""
+        warnings: list[str] = []
+        monkeypatch.setattr(ffmpeg_mod, "_warn", warnings.append)
+        for codec in ("srt", "ass", "ssa", "subrip"):
+            payload = f'{{"streams": [{{"codec_name": "{codec}"}}]}}'.encode()
+            args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(payload))
+            assert args[args.index("-c:s") + 1] == "copy", codec
+        assert warnings == []
+
+    def test_probe_timeout_degrades_to_copy(self, ffprobe_pinned: None) -> None:
+        """N1 coverage pin: a hung ffprobe must not block the mux."""
+
+        def _hang(_args: list[str], **_kw: Any) -> Any:
+            raise subprocess.TimeoutExpired(cmd="ffprobe", timeout=60)
+
+        args = self._mux(subtitle_probe_runner=_hang)
+        assert args[args.index("-c:s") + 1] == "copy"
+        assert "-sn" not in args
 
     def test_xsub_drops_subtitles_with_warning(
         self, ffprobe_pinned: None, monkeypatch: pytest.MonkeyPatch

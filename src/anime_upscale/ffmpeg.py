@@ -26,10 +26,12 @@ def resolve_ffmpeg(override: str | None = None) -> str:
 # mov_text + ``-c:s copy`` into matroska dies at mux — "Subtitle codec mov_text
 # (94213) is not supported", rc=218, undiagnosed). mov_text/tx3g are MP4-native
 # and transcode to srt (live probe: mov_text→srt muxes clean into subrip);
-# pgssub/dvdsub/dvbsub are Matroska-native and stream-copy as-is. Anything
-# outside this closed set drops with a warning.
+# Matroska-native codecs stream-copy as-is — text ASS/SSA/SRT (subrip; the
+# anime-release standard, ffprobe names: ass/ssa/subrip/srt) plus bitmap
+# PGS/VobSub/DVB (pgssub/dvdsub/dvbsub). Anything outside this closed set
+# drops with a warning.
 _SUBTITLE_TRANSCODE_TO_SRT = {"mov_text", "tx3g"}
-_SUBTITLE_COPY_AS_IS = {"pgssub", "dvdsub", "dvbsub"}
+_SUBTITLE_COPY_AS_IS = {"subrip", "srt", "ass", "ssa", "pgssub", "dvdsub", "dvbsub"}
 
 
 def subtitle_verdict(
@@ -38,9 +40,11 @@ def subtitle_verdict(
     """
     Pre-mux verdict for the source's subtitle codecs: (args mode, warning).
 
-    copy = keep ``-c:s copy``; transcode = ``-c:s srt``; drop = ``-sn``. A
-    mixed text+bitmap set also drops: one ``-c:s`` serves every subtitle
-    stream and bitmap→text conversion cannot succeed (ffmpeg docs).
+    copy = keep ``-c:s copy``; transcode = ``-c:s srt``; drop = ``-sn``. A set
+    mixing MP4-native text (mov_text/tx3g) with Matroska-native codecs also
+    drops: one ``-c:s`` serves every subtitle stream, and converting the
+    Matroska-native members would restyle text (ass→srt) or fail outright
+    (bitmap→text cannot convert, ffmpeg docs).
     """
     names = set(codecs)
     if not names:
@@ -48,14 +52,12 @@ def subtitle_verdict(
     unknown = sorted(names - _SUBTITLE_TRANSCODE_TO_SRT - _SUBTITLE_COPY_AS_IS)
     if unknown:
         return "drop", f"Субтитры типа {', '.join(unknown)} не переносятся в MKV — отброшены."
-    has_text = bool(names & _SUBTITLE_TRANSCODE_TO_SRT)
-    has_bitmap = bool(names & _SUBTITLE_COPY_AS_IS)
-    if has_text and has_bitmap:
-        # One -c:s serves every subtitle stream, and bitmap→text conversion
-        # cannot succeed (ffmpeg docs) — drop rather than die at mux.
+    has_mp4_text = bool(names & _SUBTITLE_TRANSCODE_TO_SRT)
+    has_matroska_native = bool(names & _SUBTITLE_COPY_AS_IS)
+    if has_mp4_text and has_matroska_native:
         mixed = ", ".join(sorted(names))
         return "drop", f"Субтитры типа {mixed} не переносятся в MKV единым кодеком — отброшены."
-    if has_text:
+    if has_mp4_text:
         return "transcode", None
     return "copy", None
 
@@ -211,11 +213,12 @@ def build_mux_args(  # noqa: PLR0913 - driver signature: source, output, video_a
 
     Subtitle preflight (F8): before the mux, ffprobe reads the source's
     subtitle codecs and the argv picks a Matroska-portable verdict —
-    mov_text/tx3g → ``-c:s srt``, pgssub/dvdsub/dvbsub → copy as-is, anything
-    else → ``-sn`` with a Russian warning. Every probe failure (no ffprobe,
-    no subtitles, unreadable JSON) keeps ``-c:s copy`` so the preflight can
-    never block a mux that works today. Tests inject a subprocess.run-shaped
-    callable via subtitle_probe_runner.
+    mov_text/tx3g → ``-c:s srt``, Matroska-native codecs (ass/ssa/subrip/srt,
+    pgssub/dvdsub/dvbsub) → copy as-is, anything else → ``-sn`` with a Russian
+    warning. Every probe failure (no ffprobe, no subtitles, unreadable JSON)
+    keeps ``-c:s copy`` so the preflight can never block a mux that works
+    today. Tests inject a subprocess.run-shaped callable via
+    subtitle_probe_runner.
     """
     if width is None or height is None or fps_num is None or fps_den is None:
         msg = "build_mux_args требует width, height, fps_num, fps_den для rawvideo-входа."
