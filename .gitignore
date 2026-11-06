@@ -34,3 +34,6 @@ models/rife/
 benchmarks/*.mkv
 benchmarks/*.mp4
 benchmarks/*.y4m
+
+# --- Docker runtime caches (TensorRT engines persist via the ./cache/trt bind mount) ---
+cache/

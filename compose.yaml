@@ -1,0 +1,33 @@
+# anime-upscale pipeline — run-once CLI container.
+#
+# Everything version-specific lives inside the image (docs/docker.md); only
+# three host paths cross the boundary as bind mounts, plus the optional
+# TensorRT engine cache. GPUs are injected automatically by `gpus: all`
+# (Compose Specification: every host GPU, zero pinning — the pipeline's own
+# hardware autodetect picks the device).
+#
+# Usage: docker compose run --rm anime-pipeline --profile interp-only --upload
+# Never `docker compose up -d`: this is a CLI tool, not a service.
+
+services:
+  anime-pipeline:
+    build: .
+    image: anime-upscale:local
+    # Allocate all host GPUs (service-level Compose attribute, no device
+    # pinning). On WSL2 hosts `--gpus all` is the only supported form anyway.
+    gpus: all
+    # Interactive CLI: Russian TTY progress bars when attached to a terminal,
+    # plain-percent form under `docker logs` / pipes.
+    stdin_open: true
+    tty: true
+    # Run-once semantics: explicit Compose default (no restart policy).
+    restart: "no"
+    volumes:
+      # The CLI resolves everything from CWD (/app): config.toml, input/, output/.
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./config.toml:/app/config.toml
+      # Persistent TensorRT engine cache (config: trt_cache_dir = ~/.cache/vsrife).
+      # Pre-create on the host first: mkdir -p cache/trt (a Docker auto-created
+      # bind dir is root-owned, and the container runs as uid 1000).
+      - ./cache/trt:/home/app/.cache/vsrife
