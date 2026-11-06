@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import anime_upscale.ffmpeg as ffmpeg_mod
 from anime_upscale.ffmpeg import (
     Encoder,
     build_mux_args,
@@ -82,6 +83,134 @@ class TestMuxArgs:
             fps_den=1001,
         )
         assert "-stats" in args
+
+
+class _ScriptedFfprobe:
+    """Duck-typed subprocess.run returning one canned ffprobe JSON payload."""
+
+    def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: list[str], **_kwargs: Any) -> Any:
+        self.calls.append(list(args))
+        return subprocess.CompletedProcess(
+            args=args, returncode=self.returncode, stdout=self.stdout, stderr=b""
+        )
+
+
+_MOV_TEXT_JSON = b'{"streams": [{"codec_name": "mov_text"}]}'
+_TX3G_JSON = b'{"streams": [{"codec_name": "tx3g"}]}'
+_PGSSUB_JSON = b'{"streams": [{"codec_name": "pgssub"}]}'
+_XSUB_JSON = b'{"streams": [{"codec_name": "xsub"}]}'
+_NO_SUBS_JSON = b'{"streams": []}'
+
+
+@pytest.fixture
+def ffprobe_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ffprobe resolution so the arg-builder tests never need the binary."""
+    monkeypatch.setattr(ffmpeg_mod, "_resolve_ffprobe", lambda _ffmpeg: "/usr/bin/ffprobe")
+
+
+class TestSubtitlePreflight:
+    """F8: MP4/TS mov_text dies at mux (rc=218, undiagnosed) — the preflight
+    must pick a Matroska-portable verdict BEFORE the mux starts."""
+
+    def _mux(self, **kwargs: Any) -> list[str]:
+        return build_mux_args(
+            source="src.mp4",
+            output="out.mkv",
+            video_args=["-c:v", "libx265", "-crf", "16"],
+            width=1280,
+            height=720,
+            fps_num=24000,
+            fps_den=1001,
+            **kwargs,
+        )
+
+    def test_mov_text_transcodes_to_srt(self, ffprobe_pinned: None) -> None:
+        runner = _ScriptedFfprobe(_MOV_TEXT_JSON)
+        args = self._mux(subtitle_probe_runner=runner)
+        assert args[args.index("-c:s") + 1] == "srt"
+
+    def test_tx3g_transcodes_to_srt(self, ffprobe_pinned: None) -> None:
+        args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(_TX3G_JSON))
+        assert args[args.index("-c:s") + 1] == "srt"
+
+    def test_probe_uses_ffprobe_json_contract(self, ffprobe_pinned: None) -> None:
+        """The probe argv must be exactly the documented read-only ffprobe call."""
+        runner = _ScriptedFfprobe(_MOV_TEXT_JSON)
+        self._mux(subtitle_probe_runner=runner)
+        (call,) = runner.calls
+        assert call[0] == "/usr/bin/ffprobe"
+        assert call[1:5] == ["-v", "error", "-select_streams", "s"]
+        assert call[call.index("-show_entries") + 1] == "stream=codec_name"
+        assert call[call.index("-of") + 1] == "json"
+
+    def test_pgssub_keeps_stream_copy(self, ffprobe_pinned: None) -> None:
+        args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(_PGSSUB_JSON))
+        assert args[args.index("-c:s") + 1] == "copy"
+
+    def test_dvdsub_and_dvbsub_keep_stream_copy(self, ffprobe_pinned: None) -> None:
+        payload = b'{"streams": [{"codec_name": "dvdsub"}, {"codec_name": "dvbsub"}]}'
+        args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(payload))
+        assert args[args.index("-c:s") + 1] == "copy"
+
+    def test_xsub_drops_subtitles_with_warning(
+        self, ffprobe_pinned: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        warnings: list[str] = []
+        monkeypatch.setattr(ffmpeg_mod, "_warn", warnings.append)
+        args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(_XSUB_JSON))
+        assert "-sn" in args
+        assert "-c:s" not in args
+        assert warnings == ["Субтитры типа xsub не переносятся в MKV — отброшены."]
+
+    def test_mixed_text_and_bitmap_drops_subtitles(
+        self, ffprobe_pinned: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single -c:s serves every subtitle stream; bitmap→text conversion
+        cannot succeed (ffmpeg docs), so a mov_text+pgssub mix must drop."""
+        payload = b'{"streams": [{"codec_name": "mov_text"}, {"codec_name": "pgssub"}]}'
+        warnings: list[str] = []
+        monkeypatch.setattr(ffmpeg_mod, "_warn", warnings.append)
+        args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(payload))
+        assert "-sn" in args
+        assert warnings and "отброшены" in warnings[0]
+
+    def test_no_subtitles_leaves_args_unchanged(self, ffprobe_pinned: None) -> None:
+        args = self._mux(subtitle_probe_runner=_ScriptedFfprobe(_NO_SUBS_JSON))
+        assert args[args.index("-c:s") + 1] == "copy"
+        assert "-sn" not in args
+
+    def test_missing_ffprobe_leaves_args_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No ffprobe anywhere = today's behavior, the preflight never blocks."""
+        monkeypatch.setattr(ffmpeg_mod, "_resolve_ffprobe", lambda _ffmpeg: None)
+        runner = _ScriptedFfprobe(_MOV_TEXT_JSON)
+        args = self._mux(subtitle_probe_runner=runner)
+        assert runner.calls == []
+        assert args[args.index("-c:s") + 1] == "copy"
+
+    def test_failing_ffprobe_degrades_to_copy(self, ffprobe_pinned: None) -> None:
+        runner = _ScriptedFfprobe(b"", returncode=1)
+        args = self._mux(subtitle_probe_runner=runner)
+        assert args[args.index("-c:s") + 1] == "copy"
+
+    def test_garbage_probe_json_degrades_to_copy(self, ffprobe_pinned: None) -> None:
+        runner = _ScriptedFfprobe(b"<not json>")
+        args = self._mux(subtitle_probe_runner=runner)
+        assert args[args.index("-c:s") + 1] == "copy"
+
+    def test_probe_oserror_degrades_to_copy(self, ffprobe_pinned: None) -> None:
+        """A dead binary (FileNotFoundError on spawn) must not change the argv."""
+
+        def _boom(_args: list[str], **_kw: Any) -> Any:
+            msg = "ffprobe vanished"
+            raise FileNotFoundError(msg)
+
+        args = self._mux(subtitle_probe_runner=_boom)
+        assert args[args.index("-c:s") + 1] == "copy"
 
 
 class TestEncoderOpenFailure:
@@ -338,3 +467,53 @@ class TestFinishEncoderWithDiagnosis:
         with pytest.raises(RuntimeError, match="ДИАГНОСТИКА") as exc_info:
             finish_encoder(encoder)
         assert "libx265" in str(exc_info.value)
+
+
+@pytest.mark.skipif(
+    not HAVE_FFMPEG or shutil.which("ffprobe") is None,
+    reason="ffmpeg/ffprobe not on PATH",
+)
+class TestSubtitlePreflightLive:
+    """Live verdict against the machine's real ffmpeg 9 build (probe7b parity).
+
+    probe7b evidence: an MP4 with mov_text + ``-c:s copy`` into matroska dies
+    with "Subtitle codec mov_text (94213) is not supported", rc=218."""
+
+    def test_real_mov_text_source_transcodes_to_srt(self, tmp_path: Any) -> None:
+        clip = tmp_path / "in.mp4"
+        subs = tmp_path / "sub.srt"
+        subs.write_text("1\n00:00:00,000 --> 00:00:01,000\nТестовая реплика.\n", encoding="utf-8")
+        make = subprocess.run(  # noqa: S603 - fixed argv, resolved binary
+            [
+                FFMPEG_BIN,
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=10",
+                "-i",
+                str(subs),
+                "-map",
+                "0:v",
+                "-map",
+                "1:s",
+                "-c:s",
+                "mov_text",
+                str(clip),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        assert make.returncode == 0, make.stderr.decode("utf-8", "replace")
+        args = build_mux_args(
+            source=clip,
+            output=tmp_path / "out.mkv",
+            video_args=["-c:v", "copy"],
+            width=320,
+            height=240,
+            fps_num=10,
+            fps_den=1,
+        )
+        assert args[args.index("-c:s") + 1] == "srt"
