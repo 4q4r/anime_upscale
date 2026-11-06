@@ -257,7 +257,7 @@ class TestDetectIntegration:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _write_anchor(tmp_path, _anchor())
-        monkeypatch.setattr("anime_upscale.hardware.os.cpu_count", lambda: 32)
+        monkeypatch.setattr("anime_upscale.hardware.usable_cpu_count", lambda reporter=None: 32)
         profile = _detect(tmp_path, monkeypatch, encode_preset="medium")
         assert profile.encode_threads == 24
         assert profile.encode_threads_source == "measured"
@@ -322,7 +322,7 @@ class TestDetectIntegration:
         anchor = _anchor()
         anchor["run_config"]["preset"] = "slow"
         _write_anchor(tmp_path, anchor)
-        monkeypatch.setattr("anime_upscale.hardware.os.cpu_count", lambda: 32)
+        monkeypatch.setattr("anime_upscale.hardware.usable_cpu_count", lambda reporter=None: 32)
         profile = _detect(tmp_path, monkeypatch, encode_preset="medium")
         assert profile.num_streams_per_gpu == 2
         assert profile.streams_source == "formula"
@@ -333,7 +333,7 @@ class TestDetectIntegration:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _write_anchor(tmp_path, _anchor())
-        monkeypatch.setattr("anime_upscale.hardware.os.cpu_count", lambda: 32)
+        monkeypatch.setattr("anime_upscale.hardware.usable_cpu_count", lambda reporter=None: 32)
         profile = _detect(tmp_path, monkeypatch, encode_preset=None)
         assert profile.streams_source == "formula"
         assert profile.encode_threads_source == "formula"

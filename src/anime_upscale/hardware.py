@@ -479,6 +479,90 @@ def streams_for_vram(vram_mb: int) -> int:
     return max(_STREAM_CLAMP[0], min(_STREAM_CLAMP[1], raw))
 
 
+_CGROUP_V2_CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
+
+# cpu.max is exactly "<quota> <period>"; anything else is malformed (loud fallback).
+_CGROUP_CPU_MAX_FIELDS = 2
+# x265 canon auto-table: ≥4 cores per encoder → ≥2 frame threads; below that
+# preset medium starves (plan D1) — the loud-advise threshold.
+_MIN_THREADS_PER_ENCODER = 4
+
+
+def _cgroup_v2_cpu_quota(reporter: Reporter | None = None) -> int | None:
+    """
+    CFS CPU quota of this process's own cgroup v2, in whole CPUs (ceiling).
+
+    ``/sys/fs/cgroup/cpu.max`` holds ``"<quota> <period>"`` in microseconds
+    (``"200000 100000"`` = 2.0 CPUs) or ``"max <period>"`` when no quota
+    applies. The ceiling matches coreutils ``nproc`` (gnulib round-up, the
+    behavior thread of CPython gh-149452). Returns None when no quota
+    applies or the file is absent (Windows/WSL2/bare metal). A malformed or
+    non-positive quota is reported loudly through the reporter and treated
+    as unlimited — detection never crashes on a bad cgroup file.
+
+    Documented limitation: only the process's OWN cgroup v2 file is read.
+    cgroup v1 hosts and quotas nested in parent cgroups are NOT resolved —
+    container runtimes (Docker/Kaggle/Colab) place the limit in this file.
+    """
+    try:
+        raw = _CGROUP_V2_CPU_MAX.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError: undecodable bytes = malformed file.
+        return None
+    parts = raw.split()
+    if not parts or parts[0] == "max":
+        return None
+    if len(parts) == _CGROUP_CPU_MAX_FIELDS and all(part.isdigit() for part in parts):
+        quota_us, period_us = int(parts[0]), int(parts[1])
+        if quota_us > 0 and period_us > 0:
+            return -(-quota_us // period_us)
+    if reporter is not None:
+        reporter.note(
+            f"Не удалось разобрать {_CGROUP_V2_CPU_MAX} («{raw}») — "
+            "CPU-квота контейнера не учтена, бюджет считается по числу ядер."
+        )
+    return None
+
+
+def usable_cpu_count(reporter: Reporter | None = None) -> int:
+    """
+    CPUs actually usable by this process: affinity/quota-aware, at least 1.
+
+    Basis ladder (first available API wins):
+    1. ``os.process_cpu_count()`` (Python 3.13+; honors PYTHON_CPU_COUNT /
+       ``-X cpu_count`` — the operator override) — reads the scheduler
+       affinity mask;
+    2. ``len(os.sched_getaffinity(0))`` (POSIX affinity; the documented
+       usable-CPU recipe pre-3.13);
+    3. ``os.cpu_count()`` (system logical CPUs; the only count API on
+       Windows, which has no stdlib affinity getter).
+
+    The basis is clamped by the own-cgroup v2 CFS quota: ``min(basis,
+    ceil(quota))``. CPython gh-149452 (2026-05-06, still open) is the canon
+    proof that the quota reader is mandatory: ``os.process_cpu_count()``
+    reads affinity only, NOT cpu.max — under ``docker --cpus=2`` it still
+    reports the host's logical cores (verbatim probe in the issue: a
+    2-CPU container on a 20-core host prints 20), so the quota leg is what
+    makes container encode budgets honest. No cgroup file (Windows/WSL2
+    guest) → the basis stands as is; a quota clamp is reported loudly.
+    """
+    if hasattr(os, "process_cpu_count"):
+        base = os.process_cpu_count()
+    elif hasattr(os, "sched_getaffinity"):
+        base = len(os.sched_getaffinity(0))
+    else:
+        base = os.cpu_count() or 1
+    quota = _cgroup_v2_cpu_quota(reporter)
+    if quota is not None and quota < base:
+        if reporter is not None:
+            reporter.note(
+                f"Cgroup v2 CPU-квота {quota} ядра меньше доступных {base} — "
+                "процессорный бюджет кодирования = квоте."
+            )
+        base = quota
+    return max(1, base)
+
+
 def _probe_torch_gpus() -> list[GPUInfo]:
     """Torch CUDA probe. torch is a hard dependency (vsrife/TensorRT) — no new deps."""
     try:
@@ -558,7 +642,9 @@ def _consult_anchor(  # noqa: PLR0913 - mirrors the precedence contract inputs
     (None, None) = the anchor is ignored (any reason is reported loudly).
     Measured values that could not be derived (e.g. no qualifying streams
     point) come back as None too — the caller keeps the formula value for
-    that lever only.
+    that lever only. ``cores`` is the USABLE CPU budget (usable_cpu_count),
+    not the system size — the measured division must share the formula's
+    basis.
     """
     anchor = load_anchor(anchor_path, reporter)
     if anchor is None:
@@ -639,11 +725,26 @@ def detect_hardware(  # noqa: PLR0913 - optional anchor tiers mirror the precede
     streams_source = (
         _SOURCE_CONFIG if (has_cli_override or has_config_override) else _SOURCE_FORMULA
     )
+    usable = usable_cpu_count(reporter)
+    # Informational only (banner/diagnosis): system size, NOT the encode budget.
     cores = os.cpu_count() or 1
     has_pools_override = overrides.encode_threads is not None
     encode_threads = (
-        overrides.encode_threads if has_pools_override else max(1, cores // max(1, active_encoders))
+        overrides.encode_threads
+        if has_pools_override
+        else max(1, usable // max(1, active_encoders))
     )
+    if (
+        not has_pools_override
+        and encode_threads < _MIN_THREADS_PER_ENCODER
+        and reporter is not None
+    ):
+        reporter.note(
+            f"На энкодер приходится {encode_threads} поток(а) из {usable} доступных CPU "
+            f"({active_encoders} параллельных энкодеров) — x265 на preset medium голодает "
+            "ниже 4 потоков на энкодер; уменьшите число параллельных энкодеров "
+            "или задайте [hardware] encode_threads явно."
+        )
     encode_threads_source = _SOURCE_CONFIG if has_pools_override else _SOURCE_FORMULA
 
     # Measured-anchor tier: consulted only when wired (project_root) and the
@@ -664,7 +765,7 @@ def detect_hardware(  # noqa: PLR0913 - optional anchor tiers mirror the precede
                 anchor_path=anchor_path,
                 detected=detected,
                 vram=vram,
-                cores=cores,
+                cores=usable,
                 active_encoders=active_encoders,
                 encode_preset=encode_preset,
                 reporter=reporter,
