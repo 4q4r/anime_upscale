@@ -37,3 +37,6 @@ benchmarks/*.y4m
 
 # --- Docker runtime caches (TensorRT engines persist via the ./cache/trt bind mount) ---
 cache/
+
+# --- Archives: deploy snapshots and any zips never enter git (no-backup-zips canon) ---
+*.zip
