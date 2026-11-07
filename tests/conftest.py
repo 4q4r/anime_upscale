@@ -28,6 +28,7 @@ VAPOURSYNTH_TEST_MODULES = (
     "test_batch.py",
     "test_batch_fanout.py",
     "test_benchmark.py",
+    "test_memory_watchdog.py",
 )
 
 
