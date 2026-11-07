@@ -159,6 +159,15 @@ class NetworkConfig:
 
 
 @dataclass(frozen=True)
+class BatchConfig:
+    """[batch] — поведение очереди батча."""
+
+    # Серия с готовым output/<имя>.mkv не ставится в очередь (экономит
+    # скачивание и GPU). false = прежнее поведение (warn + перезапись).
+    skip_existing_output: bool = True
+
+
+@dataclass(frozen=True)
 class ToolsConfig:
     """External tool overrides (plan §12.3); None = PATH lookup."""
 
@@ -193,6 +202,7 @@ class Config:
     stages: StagesConfig = field(default_factory=StagesConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
+    batch: BatchConfig = field(default_factory=BatchConfig)
     upload: UploadConfig = field(default_factory=UploadConfig)
     fetch: FetchConfig = field(default_factory=FetchConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
@@ -512,6 +522,16 @@ def _validate_network(table: dict[str, Any]) -> NetworkConfig:
     return NetworkConfig(strict_tls=strict_tls)
 
 
+def _validate_batch(table: dict[str, Any]) -> BatchConfig:
+    """[batch] — очередь батча: скип серий с существующим выводом."""
+    _reject_unknown(table, {"skip_existing_output"}, "batch")
+    skip_existing_output = table.get("skip_existing_output", True)
+    if not isinstance(skip_existing_output, bool):
+        msg = "[batch]: skip_existing_output должен быть булевым значением (true/false)."
+        raise ConfigError(msg)
+    return BatchConfig(skip_existing_output=skip_existing_output)
+
+
 def _validate_memory_fraction(raw: dict[str, Any]) -> float:
     """
     Validate [hardware] memory_fraction: allocator cap share of VRAM.
@@ -558,6 +578,7 @@ def load_config(path: Path) -> Config:
         "stages",
         "models",
         "network",
+        "batch",
         "upload",
         "fetch",
         "tools",
@@ -600,6 +621,7 @@ def load_config(path: Path) -> Config:
     )
 
     network = _validate_network(raw.get("network", {}))
+    batch = _validate_batch(raw.get("batch", {}))
     upload = _validate_upload(raw.get("upload", {}))
 
     fetch_raw = raw.get("fetch", {})
@@ -632,6 +654,7 @@ def load_config(path: Path) -> Config:
         stages=_validate_stages(raw.get("stages", {})),
         models=models,
         network=network,
+        batch=batch,
         upload=upload,
         fetch=fetch,
         tools=tools,

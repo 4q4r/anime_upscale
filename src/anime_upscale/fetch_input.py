@@ -10,6 +10,8 @@ disambiguate as <stem>-2<ext> with a printed note (plan §11.6).
 
 import hashlib
 import json
+import random
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -309,7 +311,6 @@ def build_queue(  # noqa: PLR0913
 
 
 _HTTP_OK = 200
-_PERCENT = 100
 
 
 _PROBED_CONTENT_LENGTHS: dict[str, int | None] = {}
@@ -540,17 +541,27 @@ def _verify_existing_remote(
     return True
 
 
-def fetch_queue_item(
+def fetch_queue_item(  # noqa: PLR0913
     item: QueueItem,
     input_dir: Path,
     client_factory: Callable[[], GofileClient],
     reporter: Reporter,
+    *,
+    verify_attempts: int = 3,
+    backoff_base: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    jitter: Callable[[], float] = random.random,
 ) -> Path:
     """
     Per-entry download step with smart cache and size/MD5 integrity.
 
-    When cache re-verification fails, the file is deleted and re-downloaded
-    in full; there is no partial/Range (HTTP 206) resume support.
+    Existing-file re-verification failing means a full re-download. Every FRESH
+    download is verified against expected_size/expected_md5 immediately; a
+    mismatch deletes the bad file and re-downloads (up to ``verify_attempts``),
+    failing loudly only after the last attempt — a corrupt file never stays
+    under the valid name and never reaches the pipeline. Within each attempt,
+    transient network failures resume via HTTP Range/206 (gofile store servers
+    honor Range — see GofileClient.download_file) with the shared retry ladder.
     """
     target = input_dir / item.name
     cache = FetchCache(input_dir / ".fetch_cache.json", reporter)
@@ -568,19 +579,38 @@ def fetch_queue_item(
 
     client = client_factory()
     input_dir.mkdir(parents=True, exist_ok=True)
-    last_note = [0]
 
-    def progress(done: int, total: int) -> None:
-        if total <= 0:
-            return
-        percent = int(done * _PERCENT / total)
-        if percent >= last_note[0] + 10 or percent == _PERCENT:  # ≤10% intervals (§10.4)
-            last_note[0] = percent
-            reporter.progress_bytes("Загрузка", done, total)
+    for attempt in range(1, verify_attempts + 1):
+        target = input_dir / item.name
+        with reporter.download_progress_bar(
+            total=item.expected_size or 0, filename=item.name
+        ) as bar:
+            client.download_file(
+                item.url,
+                target,
+                progress=bar.callback(),
+                on_retry=lambda attempt_no, total, reason: reporter.warn(
+                    f"Попытка {attempt_no}/{total} скачивания не удалась ({reason}) — повторяю..."
+                ),
+            )
+        problem = _integrity_problem(item, target)
+        if problem is None:
+            break
+        target.unlink(missing_ok=True)
+        if attempt == verify_attempts:
+            msg = (
+                f"Скачивание {item.name}: целостность не подтверждена после "
+                f"{verify_attempts} попыток ({problem}). Файл удалён."
+            )
+            raise EntryError(msg)
+        reporter.warn(
+            f"Скачанный файл «{item.name}» не прошёл проверку целостности "
+            f"({problem}) — перекачиваю (попытка {attempt + 1}/{verify_attempts})..."
+        )
+        sleep(backoff_base * 2 ** (attempt - 1) + jitter())
 
-    client.download_file(item.url, target, progress=progress)
-
-    # After download, record to cache if target exists
+    target = input_dir / item.name
+    # After verified download, record to cache.
     if target.is_file():
         stat = target.stat()
         local_md5 = compute_file_md5(target) if item.expected_md5 else None
@@ -594,3 +624,24 @@ def fetch_queue_item(
         )
 
     return target
+
+
+def _integrity_problem(item: QueueItem, path: Path) -> str | None:
+    """
+    Post-download integrity check: None when the bytes match expectations.
+
+    Size is checked when the source declared it; MD5 whenever a digest is
+    known (always computed from the disk, never assumed). The reason string is
+    Russian and names the mismatch for both the warn and the loud final error.
+    """
+    if not path.is_file():
+        return "файл не создан"
+    local_size = path.stat().st_size
+    if item.expected_size is not None and local_size != item.expected_size:
+        return f"размер {local_size} байт вместо ожидаемых {item.expected_size}"
+    if item.expected_md5:
+        expected_clean = item.expected_md5.lower().strip()
+        local_md5 = compute_file_md5(path)
+        if local_md5 != expected_clean:
+            return f"хэш MD5 {local_md5} вместо ожидаемого {expected_clean}"
+    return None

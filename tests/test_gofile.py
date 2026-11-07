@@ -1021,6 +1021,229 @@ class TestDownloadFile:
         monkeypatch.setattr(client.session, "pin", lambda host: "203.0.113.9", raising=False)
         target = tmp_path / "out.bin"
         with pytest.raises(GofileError, match="скачивани"):
-            client.download_file("https://store.gofile.io/download/x", target)
+            client.download_file(
+                "https://store.gofile.io/download/x",
+                target,
+                sleep=lambda _s: None,  # transient errors are retried — keep the test CPU-safe
+                jitter=lambda: 0.0,
+            )
         assert not target.exists()
         assert not target.with_name("out.bin.part").exists()
+
+
+class _DLResponse:
+    """Streaming download response double with context-manager protocol."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        *,
+        payload: bytes = b"",
+        chunks: int = 2,
+        fail_after: int | None = None,
+        fail_exc: Exception | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.headers = {"Content-Length": str(len(payload))}
+        self.payload = payload
+        self.chunks = chunks
+        self.fail_after = fail_after
+        self.fail_exc = fail_exc or gofile.requests.ConnectionError(
+            "Connection broken: IncompleteRead(5 bytes read, 5 more expected)"
+        )
+        self.requested_headers: dict[str, str] = {}
+
+    def iter_content(self, chunk_size: int):
+        emitted = 0
+        chunk_len = max(1, len(self.payload) // self.chunks)
+        while emitted < len(self.payload):
+            if self.fail_after is not None and emitted >= self.fail_after:
+                raise self.fail_exc
+            piece = self.payload[emitted : emitted + chunk_len]
+            emitted += len(piece)
+            yield piece
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *a: object) -> None:
+        return None
+
+
+class TestDownloadRetryResume:
+    """Transient-retry + Range/206 resume for download_file (live-batch wave).
+
+    gofile store servers honor Range (verified: owner's gofile-dl run.py:967-977
+    resumes with ``Range: bytes={size}-``; third-party gofile-downloader.py does
+    the same), so a mid-stream failure resumes from the byte offset instead of
+    paying the full re-download."""
+
+    @staticmethod
+    def _wired_client(
+        monkeypatch: pytest.MonkeyPatch, responses: list[_DLResponse]
+    ) -> GofileClient:
+        client = _client(_FakeSession(), state_path=Path("unused-state.toml"))
+        # ensure_token: a saved token must exist so no network happens.
+        client.token = "tok"
+        seen_headers: list[dict[str, str]] = []
+        urls: list[str] = []
+
+        def fake_get(url: str, **kw: object) -> _DLResponse:
+            urls.append(url)
+            headers = dict(kw.get("headers") or {})  # ty: ignore[arg-type]
+            seen_headers.append(headers)
+            response = responses.pop(0)
+            response.requested_headers = headers
+            return response
+
+        monkeypatch.setattr(client.session, "get", fake_get, raising=False)
+        monkeypatch.setattr(client.session, "pin", lambda host: "203.0.113.9", raising=False)
+        client._dl_seen_headers = seen_headers  # ty: ignore[attr-defined]
+        client._dl_urls = urls  # ty: ignore[attr-defined]
+        return client
+
+    def test_502_retries_then_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = b"VIDEODATA" * 8
+        responses = [
+            _DLResponse(502),
+            _DLResponse(200, payload=payload),
+        ]
+        client = self._wired_client(monkeypatch, responses)
+        sleeps: list[float] = []
+        target = tmp_path / "out.bin"
+        client.download_file(
+            "https://store.gofile.io/download/x", target, sleep=sleeps.append, jitter=lambda: 0.0
+        )
+        assert target.read_bytes() == payload
+        assert len(client._dl_urls) == 2  # ty: ignore[attr-defined]
+        assert sleeps == [1.0]
+        assert not target.with_name("out.bin.part").exists()
+
+    def test_three_failures_loud_and_part_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        responses = [_DLResponse(502), _DLResponse(503), _DLResponse(504)]
+        client = self._wired_client(monkeypatch, responses)
+        sleeps: list[float] = []
+        target = tmp_path / "out.bin"
+        with pytest.raises(GofileError, match="3 попыток"):
+            client.download_file(
+                "https://store.gofile.io/download/x",
+                target,
+                sleep=sleeps.append,
+                jitter=lambda: 0.0,
+            )
+        assert sleeps == [1.0, 2.0]
+        assert not target.exists()
+        assert not target.with_name("out.bin.part").exists()
+
+    def test_incomplete_read_resumes_from_byte_offset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = b"0123456789abcdef"
+        responses = [
+            _DLResponse(200, payload=payload, chunks=len(payload), fail_after=5),
+            _DLResponse(206, payload=payload[5:]),
+        ]
+        client = self._wired_client(monkeypatch, responses)
+        target = tmp_path / "out.bin"
+        client.download_file(
+            "https://store.gofile.io/download/x", target, sleep=lambda _s: None, jitter=lambda: 0.0
+        )
+        headers2 = client._dl_seen_headers[1]  # ty: ignore[attr-defined]
+        assert headers2.get("Range") == "bytes=5-"
+        assert target.read_bytes() == payload
+        assert not target.with_name("out.bin.part").exists()
+
+    def test_resume_negotiated_200_restarts_fresh(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Server ignoring Range (200 instead of 206) must NOT append onto the
+        partial file — the temp restarts from scratch (no duplicated bytes)."""
+        payload = b"0123456789abcdef"
+        responses = [
+            _DLResponse(200, payload=payload, chunks=len(payload), fail_after=5),
+            _DLResponse(200, payload=payload),
+        ]
+        client = self._wired_client(monkeypatch, responses)
+        target = tmp_path / "out.bin"
+        client.download_file(
+            "https://store.gofile.io/download/x", target, sleep=lambda _s: None, jitter=lambda: 0.0
+        )
+        headers2 = client._dl_seen_headers[1]  # ty: ignore[attr-defined]
+        assert "Range" in headers2  # resume attempted...
+        assert target.read_bytes() == payload  # ...but body restarted cleanly
+
+    def test_non_transient_status_fails_immediately(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        responses = [_DLResponse(403)]
+        client = self._wired_client(monkeypatch, responses)
+        sleeps: list[float] = []
+        target = tmp_path / "out.bin"
+        with pytest.raises(GofileError, match="403"):
+            client.download_file(
+                "https://store.gofile.io/download/x",
+                target,
+                sleep=sleeps.append,
+                jitter=lambda: 0.0,
+            )
+        assert len(client._dl_urls) == 1  # ty: ignore[attr-defined]
+        assert sleeps == []
+        assert not target.with_name("out.bin.part").exists()
+
+    def test_on_retry_callback_receives_attempt_and_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = b"data"
+        responses = [_DLResponse(502), _DLResponse(200, payload=payload)]
+        client = self._wired_client(monkeypatch, responses)
+        events: list[tuple[int, int, str]] = []
+        target = tmp_path / "out.bin"
+        client.download_file(
+            "https://store.gofile.io/download/x",
+            target,
+            sleep=lambda _s: None,
+            jitter=lambda: 0.0,
+            on_retry=lambda attempt, total, reason: events.append((attempt, total, reason)),
+        )
+        assert events and events[0][0] == 1 and events[0][1] == 3
+        assert "502" in events[0][2]
+
+    def test_progress_reports_absolute_offset_across_resume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = b"0123456789"
+        responses = [
+            _DLResponse(200, payload=payload, chunks=len(payload), fail_after=4),
+            _DLResponse(206, payload=payload[4:]),
+        ]
+        client = self._wired_client(monkeypatch, responses)
+        progress: list[tuple[int, int]] = []
+        target = tmp_path / "out.bin"
+        client.download_file(
+            "https://store.gofile.io/download/x",
+            target,
+            progress=lambda done, total: progress.append((done, total)),
+            sleep=lambda _s: None,
+            jitter=lambda: 0.0,
+        )
+        assert progress[-1] == (len(payload), len(payload))
+        # The resumed attempt's last callback is the FULL size, not the chunk count.
+        assert progress[-1][0] >= len(payload)
+
+    def test_jitter_added_to_backoff(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        responses = [_DLResponse(502), _DLResponse(502), _DLResponse(502)]
+        client = self._wired_client(monkeypatch, responses)
+        sleeps: list[float] = []
+        target = tmp_path / "out.bin"
+        with pytest.raises(GofileError):
+            client.download_file(
+                "https://store.gofile.io/download/x",
+                target,
+                sleep=sleeps.append,
+                jitter=lambda: 0.5,
+            )
+        assert sleeps == [1.5, 2.5]

@@ -298,6 +298,16 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
         ensure_vsrife_seed(root / config.models.manifest)
     output_override = _resolve_output_override(args.output, len(queue))
 
+    # [batch] skip_existing_output (default true): episodes with a finished
+    # output are dropped BEFORE dispatch — no download, no GPU work, loud
+    # note per drop. Fan-out receives the already-filtered queue, so its
+    # spec.total reflects the actual work.
+    if config.batch.skip_existing_output:
+        queue = _filter_existing_outputs(queue, output_dir, output_override, reporter)
+        if not queue:
+            reporter.note("очередь пуста: все серии уже обработаны (skip_existing_output)")
+            return EXIT_OK
+
     # Multi-GPU dispatch (plan §9.3 as-built): two or more visible CUDA cards
     # engage fan-out — one spawned worker per GPU over a shared dynamic queue.
     # One card or a CPU-only box keeps the exact sequential v1 driver below
@@ -870,6 +880,42 @@ def _resolve_output_override(output: str | None, queue_len: int) -> str | None:
     return output if output.endswith(".mkv") else f"{output}.mkv"
 
 
+def _entry_output_name(item: QueueItem, output_override: str | None) -> str:
+    """
+    Return the final output file name for one queue item.
+
+    The skip check keys on THIS name, so «-2»-disambiguated entries are
+    checked as their final selves.
+    """
+    return output_override or f"{Path(item.name).stem}.mkv"
+
+
+def _filter_existing_outputs(
+    queue: list[QueueItem],
+    output_dir: Path,
+    output_override: str | None,
+    reporter: Reporter,
+) -> list[QueueItem]:
+    """
+    Drop entries whose final output already exists ([batch] skip_existing_output).
+
+    The check runs BEFORE any dispatch (sequential loop and fan-out feeder
+    alike), so a skipped episode costs neither the download nor GPU time.
+    Every drop is a loud Russian note naming the remedy flag.
+    """
+    kept: list[QueueItem] = []
+    for item in queue:
+        output_name = _entry_output_name(item, output_override)
+        if (output_dir / output_name).exists():
+            reporter.note(
+                f"вывод уже существует ({output_name}) — серия пропущена "
+                "(поставьте skip_existing_output = false для переработки)"
+            )
+            continue
+        kept.append(item)
+    return kept
+
+
 def _delete_uploaded_output(path: Path, name: str, reporter: Reporter) -> None:
     """
     Delete an uploaded output file; cleanup must never reclassify the upload.
@@ -923,7 +969,7 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
         from anime_upscale import pipeline as pipeline_mod
 
         source_path = fetch_queue_item(item, input_dir, client_factory, reporter)
-        output_name = output_override or f"{Path(item.name).stem}.mkv"
+        output_name = _entry_output_name(item, output_override)
         output_path = output_dir / output_name
         if output_path.exists():
             reporter.warn(f"Файл существует, будет перезаписан: output/{output_name}")

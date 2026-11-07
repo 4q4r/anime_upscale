@@ -405,3 +405,41 @@ class TestMemoryFraction:
         cfg = load_config(self._write(tmp_path, "[hardware]\nmemory_fraction = 0.75\n"))
         run = resolve_run(cfg, stages=("encode",))
         assert run.memory_fraction == 0.75
+
+
+class TestBatchConfig:
+    """[batch] — поведение очереди: скип серий с существующим выводом."""
+
+    def test_skip_existing_output_defaults_true(self) -> None:
+        cfg = _load_default()
+        assert cfg.batch.skip_existing_output is True
+
+    def test_skip_existing_output_absent_section_defaults_true(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('[upload.gofile]\ntoken = "abc"\n', encoding="utf-8")
+        cfg = load_config(cfg_file)
+        assert cfg.batch.skip_existing_output is True
+
+    def test_skip_existing_output_false_parses(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[batch]\nskip_existing_output = false\n", encoding="utf-8")
+        cfg = load_config(cfg_file)
+        assert cfg.batch.skip_existing_output is False
+
+    def test_skip_existing_output_true_parses(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[batch]\nskip_existing_output = true\n", encoding="utf-8")
+        cfg = load_config(cfg_file)
+        assert cfg.batch.skip_existing_output is True
+
+    def test_skip_existing_output_non_bool_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text('[batch]\nskip_existing_output = "yes"\n', encoding="utf-8")
+        with pytest.raises(ConfigError, match="skip_existing_output должен быть булевым"):
+            load_config(cfg_file)
+
+    def test_unknown_batch_key_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text("[batch]\nskip_outputs = true\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match=r"Неизвестный ключ в \[batch\]"):
+            load_config(cfg_file)
