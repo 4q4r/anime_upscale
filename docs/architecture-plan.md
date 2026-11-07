@@ -706,6 +706,12 @@ Kaggle Notebooks and Google Colab are an **additional runtime mode** for the pip
 
 ---
 
+## 14. Performance guide (v1.x) — addendum 2026-11-07
+
+Guaranteed-performance behavior for regular users is documented in [performance.md](performance.md). Architectural position: the Tier 1 measures are **part of the pipeline itself, not user setup** — batch-scoped keep-awake (`SetThreadExecutionState`, cleared in `finally`), EcoQoS opt-out per process (`SetProcessInformation`), a read-only startup power doctor (loud Russian warnings, one exact fix command each, zero system changes), and the RateWatch fps-drop detector; memory watchdog / per-episode VRAM hygiene / allocator cap follow in the memory-watchdog wave. Tier 2 documents optional **system-wide** one-liners (High performance plan, `nvidia-smi -lgc`, `systemd-inhibit`, cpufreq governor) with sources and dates. The OS-mechanism canon (idle sleep timers that ignore CPU activity, QoS/EcoQoS heuristics, GPU P-states, Modern Standby DC limits) and every source were verified 2026-11-07 in the power-throttling plan; Windows live behavior is owner acceptance.
+
+---
+
 ## Provenance
 
 ### Provenance (v1.1 addendum)
