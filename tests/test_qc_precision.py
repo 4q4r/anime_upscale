@@ -624,3 +624,218 @@ class TestVapourSynthSeams:
         cand = qc.build_fixture_clip(plan_b, width=32, height=16)
         with pytest.raises(RuntimeError, match="кадр"):
             qc.extract_pair_metrics(ref, cand)
+
+
+# ---------------------------------------------------------------------------
+# Long-run VRAM plateau mode (P3 anti-leak): decision logic on a fake allocator
+# ---------------------------------------------------------------------------
+
+
+class TestLongrunConstants:
+    def test_longrun_constants_are_the_dispatch_canon(self, qc: ModuleType) -> None:
+        assert qc.LONGRUN_SCHEMA_VERSION == 1
+        assert qc.LONGRUN_FILENAME == "longrun.json"
+        assert qc.LONGRUN_DEFAULT_EPISODES == 3
+        assert pytest.approx(0.10) == qc.LONGRUN_TOLERANCE
+        assert pytest.approx(0.5) == qc.LONGRUN_FPS_DROP_RATIO
+
+
+class TestDecidePlateau:
+    """Plateau verdict over a reserved-MB series (the fake-allocator seam)."""
+
+    def test_flat_plateau_passes(self, qc: ModuleType) -> None:
+        verdict, reason = qc.decide_plateau([100.0, 101.0, 100.0, 102.0], tolerance=0.10)
+        assert verdict == "PLATEAU"
+        assert "плато" in reason
+
+    def test_monotonic_growth_fails_with_russian_leak_message(self, qc: ModuleType) -> None:
+        verdict, reason = qc.decide_plateau([100.0, 120.0, 140.0, 160.0], tolerance=0.10)
+        assert verdict == "LEAK"
+        assert "деградация VRAM" in reason
+        assert "похоже на утечку" in reason
+        assert "120" in reason  # the first leaking episode's value, МБ
+        assert "100" in reason  # the warm-up baseline, МБ
+        assert "эпизод 1" in reason
+
+    def test_warmup_spike_is_ignored(self, qc: ModuleType) -> None:
+        # Episode 0 (warm-up) may park one-off allocations; later episodes
+        # settling BELOW the warm-up baseline must not fail.
+        verdict, reason = qc.decide_plateau([500.0, 110.0, 105.0, 108.0], tolerance=0.10)
+        assert verdict == "PLATEAU"
+        assert "500" in reason
+
+    def test_tolerance_boundary_is_inclusive(self, qc: ModuleType) -> None:
+        # exactly baseline*(1+tolerance) is still a plateau
+        verdict, _ = qc.decide_plateau([100.0, 110.0], tolerance=0.10)
+        assert verdict == "PLATEAU"
+        verdict, _ = qc.decide_plateau([100.0, 110.0001], tolerance=0.10)
+        assert verdict == "LEAK"
+
+    def test_growth_within_tolerance_passes(self, qc: ModuleType) -> None:
+        verdict, _ = qc.decide_plateau([100.0, 108.0, 109.5, 107.0], tolerance=0.10)
+        assert verdict == "PLATEAU"
+
+    def test_single_episode_cannot_be_judged(self, qc: ModuleType) -> None:
+        with pytest.raises(ValueError, match="эпизод"):
+            qc.decide_plateau([100.0], tolerance=0.10)
+
+    def test_nan_reserved_is_error_never_pass(self, qc: ModuleType) -> None:
+        verdict, reason = qc.decide_plateau([100.0, math.nan, 120.0], tolerance=0.10)
+        assert verdict == "ERROR"
+        assert verdict != "PLATEAU"
+        assert "Некорректн" in reason
+
+    def test_inf_reserved_is_error(self, qc: ModuleType) -> None:
+        verdict, _ = qc.decide_plateau([math.inf, 200.0], tolerance=0.10)
+        assert verdict == "ERROR"
+
+
+class TestFpsWatch:
+    """Self-contained fps-collapse notes (P2 watchdog semantics, no P2 imports)."""
+
+    def test_collapse_after_warmup_is_reported(self, qc: ModuleType) -> None:
+        notes = qc.fps_watch_notes([90.0, 100.0, 40.0], ratio=0.5)
+        assert len(notes) == 1
+        assert "40" in notes[0] and "100" in notes[0]
+        assert "sysmem fallback" in notes[0]
+
+    def test_healthy_series_has_no_notes(self, qc: ModuleType) -> None:
+        assert qc.fps_watch_notes([100.0, 98.0, 97.0, 99.0], ratio=0.5) == []
+
+    def test_series_too_short_to_judge(self, qc: ModuleType) -> None:
+        # reference = episode 1 (first post-warm-up); nothing to judge before it
+        assert qc.fps_watch_notes([100.0, 99.0], ratio=0.5) == []
+
+    def test_warmup_slow_episode_is_not_the_reference(self, qc: ModuleType) -> None:
+        # episode 0 is warm-up (first engine build): 20 fps there must not
+        # become the reference the later healthy episodes are judged against
+        notes = qc.fps_watch_notes([20.0, 100.0, 95.0], ratio=0.5)
+        assert notes == []
+
+    def test_nonfinite_reference_disables_watch(self, qc: ModuleType) -> None:
+        assert qc.fps_watch_notes([math.nan, math.nan, 1.0], ratio=0.5) == []
+
+
+class TestLongrunCli:
+    def test_longrun_flag_absent_means_precision_mode(self, qc: ModuleType) -> None:
+        args = qc.parse_qc_args([])
+        assert args.longrun is None
+        assert args.plateau_tolerance == pytest.approx(0.10)
+        assert args.fps_watch is False
+
+    def test_longrun_default_is_three(self, qc: ModuleType) -> None:
+        assert qc.parse_qc_args(["--longrun"]).longrun == 3
+
+    def test_longrun_accepts_episode_count(self, qc: ModuleType) -> None:
+        assert qc.parse_qc_args(["--longrun", "5"]).longrun == 5
+
+    def test_longrun_below_two_rejected(
+        self, qc: ModuleType, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # a plateau verdict needs the warm-up episode + at least one judged
+        # episode; the rejection must name the episode minimum (not argparse's
+        # generic "unrecognized option" — that would pass on any broken flag)
+        with pytest.raises(SystemExit):
+            qc.parse_qc_args(["--longrun", "1"])
+        err = capsys.readouterr().err
+        assert "эпизод" in err
+        assert "unrecognized" not in err
+
+    def test_plateau_tolerance_is_tunable(self, qc: ModuleType) -> None:
+        args = qc.parse_qc_args(["--plateau-tolerance", "0.2"])
+        assert args.plateau_tolerance == pytest.approx(0.2)
+
+    def test_plateau_tolerance_bounds(
+        self, qc: ModuleType, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # the rejection must name the tolerance band, not a generic parse error
+        with pytest.raises(SystemExit):
+            qc.parse_qc_args(["--plateau-tolerance", "-0.1"])
+        assert "plateau-tolerance" in capsys.readouterr().err
+        with pytest.raises(SystemExit):
+            qc.parse_qc_args(["--plateau-tolerance", "1.5"])
+        assert "plateau-tolerance" in capsys.readouterr().err
+
+    def test_fps_watch_flag(self, qc: ModuleType) -> None:
+        assert qc.parse_qc_args(["--fps-watch"]).fps_watch is True
+
+
+class TestLongrunSchema:
+    def _episode(self, index: int, fixture: str, fps: float, reserved: float) -> dict:
+        return {
+            "episode": index,
+            "fixture": fixture,
+            "frames_out": 360,
+            "fps": fps,
+            "reserved_mb": reserved,
+            "allocated_mb": reserved * 0.6,
+        }
+
+    def test_report_top_level_keys(self, qc: ModuleType) -> None:
+        episodes = [
+            self._episode(0, "hard_cuts", 40.0, 500.0),
+            self._episode(1, "pan_motion", 41.0, 505.0),
+            self._episode(2, "mixed", 40.5, 503.0),
+        ]
+        report = qc.build_longrun_report(
+            gpu_name="NVIDIA GeForce RTX 5080",
+            episodes=episodes,
+            tolerance=0.10,
+            run_config={"mode": "longrun"},
+            fps_watch_notes=[],
+        )
+        for key in (
+            "schema_version",
+            "date",
+            "gpu_name",
+            "run_config",
+            "tolerance",
+            "episodes",
+            "fps_watch_notes",
+            "plateau_verdict",
+            "plateau_reason",
+        ):
+            assert key in report
+        assert report["schema_version"] == qc.LONGRUN_SCHEMA_VERSION == 1
+        assert report["plateau_verdict"] == "PLATEAU"
+        assert report["tolerance"] == pytest.approx(0.10)
+
+    def test_report_embeds_leak_verdict(self, qc: ModuleType) -> None:
+        episodes = [
+            self._episode(0, "hard_cuts", 40.0, 500.0),
+            self._episode(1, "pan_motion", 20.0, 900.0),
+            self._episode(2, "mixed", 10.0, 1300.0),
+        ]
+        report = qc.build_longrun_report(
+            gpu_name="GPU", episodes=episodes, tolerance=0.10, run_config={}, fps_watch_notes=[]
+        )
+        assert report["plateau_verdict"] == "LEAK"
+        assert "похоже на утечку" in report["plateau_reason"]
+
+    def test_json_serialization_maps_nonfinite_to_null(self, qc: ModuleType) -> None:
+        episode = self._episode(0, "hard_cuts", math.nan, 500.0)
+        episode2 = self._episode(1, "pan_motion", 40.0, 505.0)
+        report = qc.build_longrun_report(
+            gpu_name="GPU",
+            episodes=[episode, episode2],
+            tolerance=0.10,
+            run_config={},
+            fps_watch_notes=[],
+        )
+        assert report["plateau_verdict"] == "ERROR"
+        payload = json.loads(qc.serialize_qc_report(report))
+        assert payload["episodes"][0]["fps"] is None  # nan -> null, valid JSON
+        assert payload["episodes"][1]["reserved_mb"] == pytest.approx(505.0)
+
+
+class TestLongrunDryRun:
+    def test_dry_run_longrun_prints_plan(
+        self, qc: ModuleType, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc = qc.main(["--dry-run", "--longrun", "5"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "long-run" in out.lower()
+        assert "5" in out  # episode count
+        assert "longrun.json" in out  # output path named
+        assert "10" in out  # tolerance shown (0.10 / 10%)

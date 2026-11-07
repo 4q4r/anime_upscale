@@ -25,6 +25,14 @@ separate decision after reading this verdict (docs/qc-precision.md).
 The clip is NEVER split (vsrife has no global frame offset — canon): both
 runs interpolate each fixture whole.
 
+The --longrun N mode is a different instrument on the same fixtures: N
+consecutive whole-clip interpolations in the PRODUCTION RULE format
+(hardware.recommended_interp_format) with a VRAM plateau assert —
+torch.cuda.memory_reserved sampled after every episode must settle at a
+plateau after the warm-up episode (0); monotonic growth past the tolerance
+is reported as a leak (the degradation-incident gate). No precision
+comparison is made in this mode: it measures the TREND, not the pixels.
+
 Measurement honesty: the fixture's numpy content is regenerated inside the
 timed drain (identically on both sides), so ABSOLUTE fps figures are lower
 than production decode-fed throughput — only the A/B delta is decision-
@@ -63,6 +71,23 @@ QC_SCHEMA_VERSION = 1
 QC_FILENAME = "qc_rgbh.json"
 # Display precision per candidate format (vsrife: RGBH = fp16, RGBS = fp32).
 _FORMAT_PRECISION = {"rgbh": "fp16", "rgbs": "fp32"}
+
+# --- long-run plateau canon (degradation plan §4(в): anti-leak trend gate) ----
+LONGRUN_SCHEMA_VERSION = 1
+LONGRUN_FILENAME = "longrun.json"
+LONGRUN_DEFAULT_EPISODES = 3
+# A plateau verdict needs the warm-up episode + at least one judged episode.
+LONGRUN_MIN_EPISODES = 2
+# fps-watch needs the warm-up, the reference episode (index 1) and at least
+# one judged episode after it.
+LONGRUN_FPS_WATCH_MIN_SERIES = 3
+# Plateau tolerance: a fraction of the warm-up baseline later episodes may
+# reach before the trend is called a leak (0.10 = +10%).
+LONGRUN_TOLERANCE = 0.10
+# fps-watch: an episode slower than this fraction of the first post-warm-up
+# episode earns a sysmem-fallback note (P2 watchdog semantics, self-contained
+# — no imports from the runtime watchdog; the QC stand must stay standalone).
+LONGRUN_FPS_DROP_RATIO = 0.5
 
 # --- fixture plan constants --------------------------------------------------
 FIXTURE_NAMES = ("hard_cuts", "pan_motion", "mixed")
@@ -453,14 +478,125 @@ def serialize_qc_report(report: dict) -> str:
     return json.dumps(_null_infinite(report), indent=2, ensure_ascii=False) + "\n"
 
 
-def write_qc_report(out_dir: Path, report: dict) -> Path:
-    """One QC file per GPU, overwritten per run (same layout as anchor.json)."""
+def write_qc_report(out_dir: Path, report: dict, filename: str = QC_FILENAME) -> Path:
+    """One report file per GPU, overwritten per run (same layout as anchor.json)."""
     from anime_upscale.hardware import gpu_slug  # noqa: PLC0415 - lazy, keeps import light
 
-    path = out_dir / gpu_slug(report["gpu_name"]) / QC_FILENAME
+    path = out_dir / gpu_slug(report["gpu_name"]) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialize_qc_report(report), encoding="utf-8")
     return path
+
+
+# --- long-run VRAM plateau (P3 anti-leak; decision logic is CPU-safe) ---------
+
+
+def decide_plateau(reserved_mb: list[float], tolerance: float) -> tuple[str, str]:
+    """
+    Plateau verdict over the per-episode reserved-VRAM series, in MB.
+
+    Episode 0 is the warm-up: its reserved level is the baseline, so a warm-up
+    spike (one-off engine/workspace allocations) is ignored by construction —
+    later episodes only have to stay BELOW it. Every later episode must not
+    exceed baseline * (1 + tolerance); the boundary itself is inclusive.
+    Monotonic growth past the bound is a LEAK with a loud Russian reason.
+    Non-finite samples are ERROR and never PASS (same contract as
+    decide_verdict); fewer than two episodes cannot be judged at all.
+    """
+    if len(reserved_mb) < LONGRUN_MIN_EPISODES:
+        msg = (
+            f"Плато нельзя оценить по {len(reserved_mb)} эпизоду — минимум "
+            f"{LONGRUN_MIN_EPISODES}: прогрев + хотя бы один замер."
+        )
+        raise ValueError(msg)
+    broken = [i for i, value in enumerate(reserved_mb) if not math.isfinite(value)]
+    if broken:
+        listed = ", ".join(f"#{index}" for index in broken)
+        return (
+            "ERROR",
+            f"Некорректные метрики VRAM (NaN/inf) в эпизодах {listed} — прогон недостоверен.",
+        )
+    baseline = reserved_mb[0]
+    limit = baseline * (1.0 + tolerance)
+    for index, value in enumerate(reserved_mb[1:], start=1):
+        if value > limit:
+            reason = (
+                f"деградация VRAM: эпизод {index} занял {value:.0f} МБ против базовых "
+                f"{baseline:.0f} МБ (допуск {tolerance:.0%}) — похоже на утечку."
+            )
+            return "LEAK", reason
+    peak_after = max(reserved_mb[1:])
+    reason = (
+        f"VRAM вышла на плато: базовые {baseline:.0f} МБ, максимум далее "
+        f"{peak_after:.0f} МБ при допуске {tolerance:.0%} — признаков утечки нет."
+    )
+    return "PLATEAU", reason
+
+
+def fps_watch_notes(fps_series: list[float], ratio: float) -> list[str]:
+    """
+    Self-contained P2-style fps watch over the per-episode series.
+
+    Reference = the FIRST POST-WARM-UP episode (index 1): episode 0 pays the
+    one-off engine build, so its speed must never anchor the judgement. Each
+    later episode below ratio * reference earns a Russian sysmem-fallback
+    note (warning only — it never changes the plateau verdict). Series too
+    short to judge or with a non-finite reference disable the watch honestly.
+    """
+    if len(fps_series) < LONGRUN_FPS_WATCH_MIN_SERIES:
+        return []
+    reference = fps_series[1]
+    if not math.isfinite(reference) or reference <= 0:
+        return []
+    notes: list[str] = []
+    for index, fps in enumerate(fps_series[2:], start=2):
+        if math.isfinite(fps) and fps < ratio * reference:
+            notes.append(
+                f"Эпизод {index}: скорость упала с {reference:.1f} до {fps:.1f} кадр/с "
+                "при том же этапе — типичный признак ухода VRAM в shared GPU memory "
+                "(sysmem fallback). Проверьте «Общая память GPU» в nvidia-smi / "
+                "Диспетчере задач."
+            )
+    return notes
+
+
+def build_longrun_report(
+    *,
+    gpu_name: str,
+    episodes: list[dict],
+    tolerance: float,
+    run_config: dict,
+    fps_watch_notes: list[str],
+) -> dict:
+    """
+    Machine-readable long-run record for benchmarks/<gpu-slug>/longrun.json.
+
+    Composition rule: a non-finite fps in ANY episode makes the whole run
+    ERROR (never PASS) — a broken episode is not a comparable work unit —
+    then the reserved trend is judged by decide_plateau.
+    """
+    broken_fps = [i for i, episode in enumerate(episodes) if not math.isfinite(episode["fps"])]
+    if broken_fps:
+        listed = ", ".join(f"#{index}" for index in broken_fps)
+        verdict = "ERROR"
+        reason = (
+            f"Некорректные метрики fps (NaN/inf) в эпизодах {listed} — "
+            "прогон недостоверен, плато не оценивалось."
+        )
+    else:
+        reserved = [episode["reserved_mb"] for episode in episodes]
+        verdict, reason = decide_plateau(reserved, tolerance)
+    return {
+        "schema_version": LONGRUN_SCHEMA_VERSION,
+        "date": datetime.now(tz=UTC).strftime("%Y-%m-%d"),
+        "gpu_name": gpu_name,
+        "run_config": run_config,
+        "tolerance": tolerance,
+        "episodes": episodes,
+        "fps_watch_notes": list(fps_watch_notes),
+        "plateau_verdict": verdict,
+        "plateau_reason": reason,
+    }
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -486,6 +622,33 @@ def parse_qc_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--outdir", default="benchmarks", help="Каталог для qc_rgbh.json (по gpu-slug)."
     )
+    parser.add_argument(
+        "--longrun",
+        nargs="?",
+        const=LONGRUN_DEFAULT_EPISODES,
+        default=None,
+        type=int,
+        metavar="N",
+        help=(
+            "Режим long-run против утечек VRAM: N подряд интерполяций "
+            "(3 фикстуры циклически) в формате прод-правила с ассертом плато. "
+            "Без значения N=3; флаг не задан — режим precision-QC."
+        ),
+    )
+    parser.add_argument(
+        "--plateau-tolerance",
+        type=float,
+        default=LONGRUN_TOLERANCE,
+        help="Допуск плато VRAM — доля от базового уровня прогрева (0..1).",
+    )
+    parser.add_argument(
+        "--fps-watch",
+        action="store_true",
+        help=(
+            "Сравнивать fps эпизодов с первым пост-прогревочным; падение — "
+            "RU-заметка о sysmem fallback (не влияет на вердикт плато)."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Печатает план QC и выходит.")
     args = parser.parse_args(argv)
     if not _SECONDS_MIN <= args.seconds <= _SECONDS_MAX:
@@ -494,6 +657,13 @@ def parse_qc_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--warmup должен быть >= 0")
     if args.repeats < 1:
         parser.error("--repeats должен быть >= 1")
+    if args.longrun is not None and args.longrun < LONGRUN_MIN_EPISODES:
+        parser.error(
+            f"--longrun: нужно минимум {LONGRUN_MIN_EPISODES} эпизода "
+            "(прогрев + хотя бы один замер)"
+        )
+    if not 0.0 <= args.plateau_tolerance <= 1.0:
+        parser.error("--plateau-tolerance: допустимо 0..1 (доля от базового уровня)")
     return args
 
 
@@ -595,6 +765,20 @@ def _torch_reserved_peak_mb() -> float:
     import torch  # noqa: PLC0415 - lazy GPU stack
 
     return torch.cuda.max_memory_reserved() / (1024 * 1024)
+
+
+def _torch_reserved_mb() -> float:
+    """Allocator-managed pool LEVEL after an episode (trend metric, not peak)."""
+    import torch  # noqa: PLC0415 - lazy GPU stack
+
+    return torch.cuda.memory_reserved() / (1024 * 1024)
+
+
+def _torch_allocated_mb() -> float:
+    """Live tensor memory LEVEL after an episode (trend metric, not peak)."""
+    import torch  # noqa: PLC0415 - lazy GPU stack
+
+    return torch.cuda.memory_allocated() / (1024 * 1024)
 
 
 def measure_speed(
@@ -819,6 +1003,126 @@ def run_qc(args: argparse.Namespace, root: Path, reporter: object) -> int:
     return 0
 
 
+def run_longrun(  # noqa: PLR0913 - driver-context bundle + injected CPU-test seams
+    args: argparse.Namespace,
+    root: Path,
+    reporter: object,
+    *,
+    rife_fn: Callable | None = None,
+    reserved_fn: Callable[[], float] | None = None,
+    allocated_fn: Callable[[], float] | None = None,
+) -> int:
+    """
+    Long-run anti-leak gate: N consecutive whole-clip interpolations.
+
+    Production parity: the same config/hardware resolution as run_qc, the
+    rule's OWN clip format (hardware.recommended_interp_format — RGBS fp32 on
+    Blackwell, TRT off) and the production TRT gate. A fresh graph per
+    episode mirrors the per-episode lifecycle of the production batch loop —
+    exactly the churn-vs-leak surface the plateau assert covers: reserved
+    VRAM sampled after every drain must settle at a plateau after the
+    warm-up episode (decide_plateau). No precision comparison is made: this
+    mode measures the TREND, not the pixels.
+    """
+    from anime_upscale.config import load_config  # noqa: PLC0415 - lazy project stack
+    from anime_upscale.hardware import detect_hardware  # noqa: PLC0415
+
+    config = load_config(root / "config.toml")
+    interpolate_cfg = config.stages.interpolate
+    hardware = detect_hardware(config.hardware, cli_num_streams=None, nn_stages_selected=True)
+    device_index = hardware.gpus[0].index
+    trt_allowed = hardware.recommended_trt
+    rule_format = hardware.recommended_interp_format
+    if interpolate_cfg.trt and not trt_allowed:
+        reporter.note(
+            "TensorRT отключен правилом архитектуры GPU (Blackwell) — long-run гоняет "
+            "native PyTorch path в формате правила, как прод."
+        )
+
+    kwargs = build_rife_kwargs(
+        clip_width=1920,
+        clip_height=1080,
+        interpolate_cfg=interpolate_cfg,
+        device_index=device_index,
+        trt_allowed=trt_allowed,
+        cache_dir=Path(interpolate_cfg.trt_cache_dir),
+    )
+    sample_reserved = reserved_fn if reserved_fn is not None else _torch_reserved_mb
+    sample_allocated = allocated_fn if allocated_fn is not None else _torch_allocated_mb
+    frames_src = seconds_to_frames(args.seconds)
+    episodes: list[dict] = []
+    fps_series: list[float] = []
+    for index in range(args.longrun):
+        name = FIXTURE_NAMES[index % len(FIXTURE_NAMES)]
+        plan = fixture_plan(name, frames_src=frames_src)
+        clip = build_fixture_clip(plan, width=1920, height=1080)
+        if rule_format == "rgbh":
+            clip = to_candidate_format(clip)
+        graph = apply_rife(clip, kwargs, rife_fn=rife_fn)
+        frames_out = len(graph)
+        wall = drain_wall_seconds(graph)
+        fps = frames_out / wall if wall > 0 and frames_out else math.nan
+        reserved = sample_reserved()
+        allocated = sample_allocated()
+        role = "прогрев" if index == 0 else "замер"
+        episodes.append(
+            {
+                "episode": index,
+                "fixture": name,
+                "frames_out": frames_out,
+                "fps": fps,
+                "reserved_mb": reserved,
+                "allocated_mb": allocated,
+            }
+        )
+        fps_series.append(fps)
+        reporter.note(
+            f"[{role}] эпизод {index + 1}/{args.longrun} ({name}): {fps:.1f} кадр/с, "
+            f"reserved {reserved:.0f} МБ, allocated {allocated:.0f} МБ"
+        )
+
+    notes = fps_watch_notes(fps_series, LONGRUN_FPS_DROP_RATIO) if args.fps_watch else []
+    for note in notes:
+        reporter.warn(note)
+
+    report = build_longrun_report(
+        gpu_name=hardware.gpus[0].name,
+        episodes=episodes,
+        tolerance=args.plateau_tolerance,
+        run_config={
+            "mode": "longrun",
+            "rule_format": rule_format,
+            "model": interpolate_cfg.model,
+            "target_fps": f"{interpolate_cfg.target_fps[0]}/{interpolate_cfg.target_fps[1]}",
+            "scene_detection": interpolate_cfg.scene_detection,
+            "trt": kwargs["trt"],
+            "device_index": device_index,
+            "seconds": args.seconds,
+            "episodes": args.longrun,
+            "fps_watch": args.fps_watch,
+        },
+        fps_watch_notes=notes,
+    )
+    out_path = write_qc_report(Path(args.outdir), report, filename=LONGRUN_FILENAME)
+
+    verdict = report["plateau_verdict"]
+    reason = report["plateau_reason"]
+    reporter.note("")
+    if verdict == "PLATEAU":
+        reporter.success(f"ВЕРДИКТ: PLATEAU — {reason}")
+    elif verdict == "LEAK":
+        reporter.error(f"ВЕРДИКТ: LEAK — {reason}")
+        reporter.note(
+            "Что делать: перезапустить процесс батча (незавершённые серии продолжатся "
+            "со следующего запуска) и искать источник роста в свежих версиях "
+            "torch/vsrife/драйвера."
+        )
+    else:
+        reporter.error(f"ВЕРДИКТ: ERROR — {reason}")
+    reporter.success(f"Результат записан: {out_path}")
+    return 0 if verdict == "PLATEAU" else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """QC harness entry: dry-run prints the plan; a real run needs a CUDA GPU."""
     args = parse_qc_args(argv)
@@ -828,6 +1132,24 @@ def main(argv: list[str] | None = None) -> int:
 
     reporter = Reporter(resolve_mode(no_color=True, no_tty=True))
     if args.dry_run:
+        if args.longrun is not None:
+            frames_src = seconds_to_frames(args.seconds)
+            reporter.note("План long-run (без выполнения):")
+            reporter.note(
+                f"  эпизодов: {args.longrun}, фикстуры циклически ({len(FIXTURE_NAMES)} шт.), "
+                f"{frames_src} исходных кадров на эпизод ({args.seconds} с)"
+            )
+            reporter.note(
+                "  формат: правило hardware (recommended_interp_format — на Blackwell "
+                "RGBS fp32, TRT off); модель и параметры из config.toml"
+            )
+            reporter.note(
+                f"  ассерт плато: reserved после каждого эпизода, базовые = эпизод 0 "
+                f"(прогрев), допуск {args.plateau_tolerance:.0%}; fps-watch: "
+                f"{'вкл' if args.fps_watch else 'выкл'}"
+            )
+            reporter.note(f"  результат: {args.outdir}/<gpu-slug>/{LONGRUN_FILENAME}")
+            return 0
         frames_src = seconds_to_frames(args.seconds)
         precision = _FORMAT_PRECISION[args.format]
         reporter.note("План QC (без выполнения):")
@@ -849,6 +1171,8 @@ def main(argv: list[str] | None = None) -> int:
         reporter.note(f"  результат: {args.outdir}/<gpu-slug>/{QC_FILENAME}")
         return 0
     try:
+        if args.longrun is not None:
+            return run_longrun(args, root, reporter)
         return run_qc(args, root, reporter)
     except (HardwareError, ImportError, RuntimeError) as exc:
         # Operational failures (no GPU, missing VS/vsrife/torch, frame-count
