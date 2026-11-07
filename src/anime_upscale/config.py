@@ -18,6 +18,13 @@ from typing import Any
 
 STAGE_ORDER: tuple[str, ...] = ("descale", "deband", "upscale", "interpolate", "encode")
 
+# [hardware] memory_fraction: torch caching-allocator cap as a share of VRAM
+# (torch.cuda.set_per_process_memory_fraction). 1.0 = uncapped; below 1.0 the
+# allocator raises CUDA OOM earlier than the driver would spill to system RAM.
+_MEMORY_FRACTION_MIN = 0.1
+_MEMORY_FRACTION_MAX = 1.0
+_MEMORY_FRACTION_DEFAULT = 0.9
+
 # Common broadcast decimals map to their EXACT rationals (never float-round).
 _NTSC_TABLE: dict[Decimal, tuple[int, int]] = {
     Decimal("23.976"): (24000, 1001),
@@ -103,6 +110,9 @@ class HardwareOverrides:
     num_streams: int | None = None
     gpus: tuple[int, ...] | None = None
     encode_threads: int | None = None
+    # Доля VRAM для аллокатора PyTorch (см. константы диапазона выше);
+    # дефолт 0.9 = OOM внутри процесса раньше WDDM-спилла в системную RAM.
+    memory_fraction: float = _MEMORY_FRACTION_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -201,6 +211,7 @@ class RunConfig:
     encode: EncodeConfig
     descale_height: int | None
     upload: bool
+    memory_fraction: float = _MEMORY_FRACTION_DEFAULT
 
 
 def parse_fps_argument(value: str) -> tuple[int, int]:
@@ -501,6 +512,34 @@ def _validate_network(table: dict[str, Any]) -> NetworkConfig:
     return NetworkConfig(strict_tls=strict_tls)
 
 
+def _validate_memory_fraction(raw: dict[str, Any]) -> float:
+    """
+    Validate [hardware] memory_fraction: allocator cap share of VRAM.
+
+    bool is rejected BEFORE the numeric checks (sharp edge: ``true`` would
+    otherwise silently pass as 1.0 — an int subclass). Outside 0.1..1.0 the
+    config is loud Russian: below the floor the cap would strangle the
+    working set, above 1.0 torch itself rejects the value.
+    """
+    fraction_raw = raw.get("memory_fraction", _MEMORY_FRACTION_DEFAULT)
+    if isinstance(fraction_raw, bool) or not isinstance(fraction_raw, (int, float)):
+        msg = (
+            "[hardware]: memory_fraction должен быть числом "
+            f"({_MEMORY_FRACTION_MIN}..{_MEMORY_FRACTION_MAX}), получено {fraction_raw!r}."
+        )
+        raise ConfigError(msg)
+    if not _MEMORY_FRACTION_MIN <= fraction_raw <= _MEMORY_FRACTION_MAX:
+        msg = (
+            f"[hardware]: memory_fraction={fraction_raw} вне допустимого диапазона "
+            f"{_MEMORY_FRACTION_MIN}..{_MEMORY_FRACTION_MAX}. Значение = доля VRAM, "
+            "отданная аллокатору PyTorch; запас ниже 1.0 оставляет место под "
+            "CUDA-контекст и фрагментацию, чтобы OOM случился внутри процесса, "
+            "а не уходом памяти в системную RAM."
+        )
+        raise ConfigError(msg)
+    return float(fraction_raw)
+
+
 def load_config(path: Path) -> Config:
     """Load and validate config.toml into ONE frozen Config object."""
     if not path.is_file():
@@ -537,7 +576,9 @@ def load_config(path: Path) -> Config:
         )
 
     hardware_raw = raw.get("hardware", {})
-    _reject_unknown(hardware_raw, {"num_streams", "gpus", "encode_threads"}, "hardware")
+    _reject_unknown(
+        hardware_raw, {"num_streams", "gpus", "encode_threads", "memory_fraction"}, "hardware"
+    )
     gpus_raw = hardware_raw.get("gpus")
     if gpus_raw is not None and (
         not isinstance(gpus_raw, list) or not all(isinstance(g, int) for g in gpus_raw)
@@ -548,6 +589,7 @@ def load_config(path: Path) -> Config:
         num_streams=hardware_raw.get("num_streams"),
         gpus=tuple(gpus_raw) if gpus_raw is not None else None,
         encode_threads=hardware_raw.get("encode_threads"),
+        memory_fraction=_validate_memory_fraction(hardware_raw),
     )
 
     models_raw = raw.get("models", {})
@@ -680,6 +722,7 @@ def resolve_run(  # noqa: PLR0913 - mirrors the CLI surface 1:1
         encode=effective_encode,
         descale_height=height,
         upload=upload_effective,
+        memory_fraction=config.hardware.memory_fraction,
     )
 
 

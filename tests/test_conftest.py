@@ -120,6 +120,7 @@ class TestVsCollectionGate:
             "test_batch.py",
             "test_batch_fanout.py",
             "test_benchmark.py",
+            "test_memory_watchdog.py",
         } == set(ignored)
 
     def test_conftest_computes_ignores_for_this_machine(self) -> None:

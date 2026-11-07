@@ -362,3 +362,46 @@ class TestNetworkSection:
         cfg_file.write_text('[network]\nstrict_tls = "yes"\n', encoding="utf-8")
         with pytest.raises(ConfigError, match="strict_tls"):
             load_config(cfg_file)
+
+
+class TestMemoryFraction:
+    """[hardware] memory_fraction: allocator cap (0.1..1.0, default 0.9)."""
+
+    def _write(self, tmp_path: Path, body: str) -> Path:
+        cfg_file = tmp_path / "config.toml"
+        cfg_file.write_text(body, encoding="utf-8")
+        return cfg_file
+
+    def test_absent_key_defaults_to_09(self, tmp_path: Path) -> None:
+        cfg = load_config(self._write(tmp_path, "[hardware]\nencode_threads = 8\n"))
+        assert cfg.hardware.memory_fraction == 0.9
+
+    def test_explicit_09_accepted(self, tmp_path: Path) -> None:
+        cfg = load_config(self._write(tmp_path, "[hardware]\nmemory_fraction = 0.9\n"))
+        assert cfg.hardware.memory_fraction == 0.9
+
+    def test_boundary_10_accepted(self, tmp_path: Path) -> None:
+        cfg = load_config(self._write(tmp_path, "[hardware]\nmemory_fraction = 1.0\n"))
+        assert cfg.hardware.memory_fraction == 1.0
+
+    def test_below_range_is_russian_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="диапазона"):
+            load_config(self._write(tmp_path, "[hardware]\nmemory_fraction = 0.05\n"))
+
+    def test_above_range_is_russian_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="memory_fraction"):
+            load_config(self._write(tmp_path, "[hardware]\nmemory_fraction = 1.5\n"))
+
+    def test_string_value_is_russian_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="числом"):
+            load_config(self._write(tmp_path, '[hardware]\nmemory_fraction = "0.9"\n'))
+
+    def test_bool_value_is_russian_error(self, tmp_path: Path) -> None:
+        """Sharp edge: bool is an int subclass — must never pass as 1.0/0.0."""
+        with pytest.raises(ConfigError, match="числом"):
+            load_config(self._write(tmp_path, "[hardware]\nmemory_fraction = true\n"))
+
+    def test_runconfig_carries_the_fraction(self, tmp_path: Path) -> None:
+        cfg = load_config(self._write(tmp_path, "[hardware]\nmemory_fraction = 0.75\n"))
+        run = resolve_run(cfg, stages=("encode",))
+        assert run.memory_fraction == 0.75
