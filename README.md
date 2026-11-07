@@ -21,7 +21,7 @@ A research-backed VapourSynth pipeline assembled as one in-process graph: spandr
 [![Last commit](https://img.shields.io/github/last-commit/4q4r/anime_upscale?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/anime_upscale/commits)
 [![Repo size](https://img.shields.io/github/repo-size/4q4r/anime_upscale?style=flat-square&logo=github&logoColor=white)](https://github.com/4q4r/anime_upscale)
 
-[Architecture](#-system-architecture) · [Notebooks](#-notebooks) · [Docker](#-docker) · [Multi-GPU](#-multi-gpu-load-distribution) · [Benchmarks](#-benchmarks) · [Testing](#-testing)
+[Architecture](#-system-architecture) · [Notebooks](#-notebooks) · [Docker](#-docker) · [Multi-GPU](#-multi-gpu-load-distribution) · [Performance](docs/performance.md) · [Benchmarks](#-benchmarks) · [Testing](#-testing)
 
 </div>
 
@@ -36,6 +36,7 @@ A research-backed VapourSynth pipeline assembled as one in-process graph: spandr
 - [Configuration](#-configuration)
 - [Docker](#-docker)
 - [Notebooks](#-notebooks)
+- [Performance Guide](docs/performance.md)
 - [Benchmarks](#-benchmarks)
 - [Quick Start](#-quick-start)
 - [Testing](#-testing)
