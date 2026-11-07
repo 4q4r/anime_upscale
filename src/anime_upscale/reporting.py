@@ -7,7 +7,7 @@ allowed; otherwise plain machine-readable lines with zero ANSI.
 
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Self, TextIO
 
@@ -164,10 +164,10 @@ def format_eta(seconds: float | None) -> str:
     - > 0 hours: `Чч Ммин Сс` (e.g. `1ч 24мин 15с`)
     - 0 hours and > 0 minutes: `Ммин Сс` (e.g. `8мин 42с`)
     - 0 hours and 0 minutes: `Сс` (e.g. `35с`)
-    - None or negative: `?`
+    - None or negative: `—` (unknown ETA is never rendered as «?»)
     """
     if seconds is None or seconds < 0:
-        return "?"
+        return "—"
     total_seconds = round(seconds)
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
@@ -180,6 +180,35 @@ def format_eta(seconds: float | None) -> str:
     return f"{secs}с"
 
 
+def _eta_seconds(d: Mapping[str, object]) -> float | None:
+    """
+    Derive remaining seconds from a tqdm ``format_dict`` snapshot.
+
+    tqdm (verified against 4.70.1, std.py ``format_dict`` property) exposes only
+    ``n/total/elapsed/rate/...`` — the ``remaining`` key exists solely inside
+    ``format_meter``'s render-time dict, so it must be recomputed here:
+
+    - primary: ``remaining = (total - n) / rate`` when the EMA rate is available;
+    - fallback: ``remaining = (total - n) * elapsed / n`` when no rate sample yet;
+    - ``None`` when nothing honest is derivable (no progress, done, unknown total).
+    """
+    total = d.get("total")
+    n = d.get("n")
+    if not isinstance(total, (int, float)) or not isinstance(n, (int, float)):
+        return None
+    if total <= 0 or n <= 0 or n >= total:
+        return None
+
+    rate = d.get("rate")
+    if isinstance(rate, (int, float)) and rate > 0:
+        return (total - n) / rate
+
+    elapsed = d.get("elapsed")
+    if isinstance(elapsed, (int, float)) and elapsed > 0:
+        return (total - n) * elapsed / n
+    return None
+
+
 class _CustomTqdm(tqdm):
     """tqdm subclass with customized format_dict for Russian time/rate formatting."""
 
@@ -190,10 +219,9 @@ class _CustomTqdm(tqdm):
         if rate:
             d["custom_rate"] = f"{rate:.1f} кадр/с"
         else:
-            d["custom_rate"] = "? кадр/с"
+            d["custom_rate"] = "—"
 
-        remaining = d.get("remaining")
-        d["custom_eta"] = format_eta(remaining if isinstance(remaining, (int, float)) else None)
+        d["custom_eta"] = format_eta(_eta_seconds(d))
         return d
 
 
@@ -209,10 +237,9 @@ class _UploadCustomTqdm(tqdm):
             mbytes = rate / (1024 * 1024)
             d["custom_rate"] = f"{mbytes:.1f} МБ/с"
         else:
-            d["custom_rate"] = "? МБ/с"
+            d["custom_rate"] = "—"
 
-        remaining = d.get("remaining")
-        d["custom_eta"] = format_eta(remaining if isinstance(remaining, (int, float)) else None)
+        d["custom_eta"] = format_eta(_eta_seconds(d))
         return d
 
 
