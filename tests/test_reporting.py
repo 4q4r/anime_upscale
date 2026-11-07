@@ -348,3 +348,29 @@ class TestUploadProgressBar:
             pbar.update(512 * 1024, 1024 * 1024)
             d = pbar._pbar.format_dict
             assert d.get("custom_rate") == "0.2 МБ/с"
+
+
+class TestCurrentRateProperty:
+    """P1 RateWatch feed: the bar exposes tqdm's OWN rate (the same number the
+    bar renders) — the detector must never re-measure progress itself."""
+
+    def test_none_before_any_honest_rate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _FakeClock()
+        with _tty_pipeline_bar(monkeypatch, clock, total=100) as pbar:
+            assert pbar.current_rate is None
+            pbar.update(10, 100)  # dt == 0 → no EMA sample yet
+            assert pbar.current_rate is None
+
+    def test_rate_matches_format_dict_number(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _FakeClock()
+        with _tty_pipeline_bar(monkeypatch, clock, total=100) as pbar:
+            clock.advance(10.0)
+            pbar.update(50, 100)
+            assert pbar.current_rate == pytest.approx(5.0)
+            assert pbar.current_rate == pbar._pbar.format_dict["rate"]
+
+    def test_none_when_bar_disabled_non_tty(self) -> None:
+        pbar = PipelineProgressBar(total=100, stream=_FakeStream(tty=False))
+        assert pbar.current_rate is None
+        pbar.update(50, 100)
+        assert pbar.current_rate is None

@@ -163,3 +163,235 @@ class TestTools:
         assert resolve_tool("ffmpeg")  # ffmpeg present on this machine
         with pytest.raises(ToolError, match="PATH"):
             resolve_tool("definitely-not-a-tool-42")
+
+
+# --- P1 power wave: batch wiring (doctor → EcoQoS opt-out → keep-awake) ------
+#
+# VS-free by construction: encode-only profile + patched cli._process_entry —
+# no vapoursynth import happens, so these tests are safe in this module on
+# VS-less machines (unlike the pipeline-seam tests in test_batch*).
+
+
+def _enc_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Minimal encode-only project (same shape as test_batch_fanout._tmp_project)."""
+    (tmp_path / "input").mkdir()
+    (tmp_path / "output").mkdir()
+    for name in ("a.mkv", "b.mkv"):
+        (tmp_path / "input" / name).write_bytes(name.encode())
+    (tmp_path / "config.toml").write_text(
+        "[pipeline]\n"
+        'order = ["descale", "deband", "upscale", "interpolate", "encode"]\n'
+        "[stages.encode]\n"
+        "crf = 16\n"
+        "[profiles.enc]\n"
+        'stages = ["encode"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+
+class _PowerHarness:
+    """Unified event timeline for the power entry points + the spawn seam."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def record(self, label: str) -> None:
+        self.events.append(label)
+
+    def count(self, label: str) -> int:
+        return self.events.count(label)
+
+
+def _install_power_spies(monkeypatch: pytest.MonkeyPatch, harness: _PowerHarness) -> None:
+    """Patch cli's power entry points with recording doubles (ordered events)."""
+    import contextlib
+
+    from anime_upscale import cli
+    from anime_upscale.power import KeepAwakeStatus
+
+    monkeypatch.setattr(cli, "run_startup_doctor", lambda _reporter: harness.record("doctor"))
+
+    def spy_optout(_reporter: object) -> bool:
+        harness.record("optout")
+        return True
+
+    monkeypatch.setattr(cli, "disable_power_throttling", spy_optout)
+
+    def spy_keep(_reporter: object) -> object:
+        harness.record("keep-enter")
+
+        @contextlib.contextmanager
+        def _fake_ctx():
+            try:
+                yield KeepAwakeStatus(active=True, detail="fake")
+            finally:
+                harness.record("keep-exit")
+
+        return _fake_ctx()
+
+    monkeypatch.setattr(cli, "keep_system_awake", spy_keep)
+
+
+class TestPowerWiring:
+    def _patch_batch_harness(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        harness: _PowerHarness,
+        *,
+        gpu_count: int,
+    ) -> None:
+        """Fake hardware/tool/pipeline seams; encode-only keeps VS out."""
+        from anime_upscale import cli
+        from anime_upscale.hardware import GPUInfo, HardwareProfile
+
+        gpus = tuple(GPUInfo(index=i, name=f"FAKE{i}", vram_mb=16384) for i in range(gpu_count))
+        fake = HardwareProfile(
+            gpus=gpus,
+            gpu_count=gpu_count,
+            cpu_logical_cores=8,
+            num_streams_per_gpu=2,
+            encode_threads=8,
+            precision="fp16",
+        )
+
+        def fake_detect(_overrides: object, **_kw: object) -> HardwareProfile:
+            return fake
+
+        monkeypatch.setattr(cli, "detect_hardware", fake_detect)
+        monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+        monkeypatch.setattr(cli, "_process_entry", lambda *_args, **_kw: (None, None))
+        _install_power_spies(monkeypatch, harness)
+
+    def test_sequential_batch_runs_doctor_optout_and_keeps_awake(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import multiprocessing
+
+        from anime_upscale import cli
+
+        def boom(method: str) -> object:
+            raise AssertionError(f"spawn requested on single-GPU run ({method!r})")
+
+        monkeypatch.setattr(multiprocessing, "get_context", boom)
+        _enc_project(tmp_path, monkeypatch)
+        harness = _PowerHarness()
+        self._patch_batch_harness(monkeypatch, harness, gpu_count=1)
+        exit_code = cli.main(["--profile", "enc", "-i", "a.mkv", "--config", "config.toml"])
+        assert exit_code == 0
+        assert harness.events == ["doctor", "optout", "keep-enter", "keep-exit"]
+
+    def test_power_guard_survives_ctrl_c_with_130(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from anime_upscale import cli
+
+        _enc_project(tmp_path, monkeypatch)
+        harness = _PowerHarness()
+        self._patch_batch_harness(monkeypatch, harness, gpu_count=1)
+
+        def interrupt(*_args: object, **_kw: object) -> tuple[None, None]:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "_process_entry", interrupt)
+        exit_code = cli.main(["--profile", "enc", "-i", "a.mkv", "--config", "config.toml"])
+        assert exit_code == 130
+        assert harness.events == ["doctor", "optout", "keep-enter", "keep-exit"]
+
+    def test_fanout_parent_and_children_each_keep_awake(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_spawn_ctx: object,
+    ) -> None:
+        from anime_upscale import cli
+
+        _enc_project(tmp_path, monkeypatch)
+        harness = _PowerHarness()
+        self._patch_batch_harness(monkeypatch, harness, gpu_count=2)
+        monkeypatch.setattr(cli, "_process_entry", lambda *_args, **_kw: (None, None))
+        # Record child spawns onto the shared timeline (the fixture's Process
+        # objects are wrapped, not replaced).
+        real_process_factory = fake_spawn_ctx.Process  # type: ignore[attr-defined]
+
+        def recording_process(**kwargs: object) -> object:
+            proc = real_process_factory(**kwargs)
+            real_start = proc.start  # type: ignore[attr-defined]
+
+            def spy_start() -> None:
+                harness.record("spawn")
+                real_start()
+
+            proc.start = spy_start  # type: ignore[attr-defined]
+            return proc
+
+        monkeypatch.setattr(
+            fake_spawn_ctx,
+            "Process",
+            recording_process,  # type: ignore[attr-defined]
+        )
+        exit_code = cli.main(
+            ["--profile", "enc", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+        )
+        assert exit_code == 0
+        # Parent: doctor + opt-out once. Children (spawned processes) re-run the
+        # opt-out and keep-awake themselves (execution state is per-process).
+        assert harness.count("doctor") == 1
+        assert harness.count("optout") == 3
+        assert harness.count("keep-enter") == 3
+        assert harness.count("keep-exit") == 3
+        # Ordering pin: the opt-out happens BEFORE any child spawns.
+        assert harness.events.index("spawn") > harness.events.index("optout")
+        # No leaked worker threads.
+        for proc in fake_spawn_ctx.processes:  # type: ignore[attr-defined]
+            if proc.thread is not None:
+                proc.thread.join(timeout=10)
+                assert not proc.thread.is_alive()
+
+
+@pytest.fixture
+def fake_spawn_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> object:
+    """In-process spawn double running the REAL _fanout_worker in threads."""
+    import multiprocessing
+    import os
+    import queue as queue_mod
+    import threading
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+
+    class _FakeProcess:
+        def __init__(self, *, target: object, args: tuple, daemon: bool = False) -> None:
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+            self.thread: threading.Thread | None = None
+
+        def start(self) -> None:
+            self.thread = threading.Thread(target=self.target, args=self.args, daemon=True)
+            self.thread.start()
+
+        def join(self) -> None:
+            if self.thread is not None:
+                self.thread.join()
+
+    class _FakeSpawnContext:
+        def __init__(self) -> None:
+            self.processes: list[_FakeProcess] = []
+
+        def Queue(self) -> queue_mod.Queue:
+            return queue_mod.Queue()
+
+        def Process(self, *, target: object, args: tuple, daemon: bool = False) -> _FakeProcess:
+            proc = _FakeProcess(target=target, args=args, daemon=daemon)
+            self.processes.append(proc)
+            return proc
+
+    ctx = _FakeSpawnContext()
+
+    def fake_get_context(method: str) -> _FakeSpawnContext:
+        return ctx
+
+    monkeypatch.setattr(multiprocessing, "get_context", fake_get_context)
+    return ctx

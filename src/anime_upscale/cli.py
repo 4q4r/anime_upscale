@@ -40,6 +40,12 @@ from anime_upscale.hardware import (
 )
 from anime_upscale.models.fetch import FetchError, ensure_vsrife_seed, verify_all
 from anime_upscale.models.manifest import ManifestError
+from anime_upscale.power import (
+    RateWatch,
+    disable_power_throttling,
+    keep_system_awake,
+    run_startup_doctor,
+)
 from anime_upscale.reporting import (
     Reporter,
     enable_windows_console_vt,
@@ -254,6 +260,11 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     run, hardware, ffmpeg_path, entries = _resolve_batch_inputs(args, config, root)
     print_banner(reporter, hardware, run.stages)
 
+    # P1 power wave: the read-only doctor sits next to the other startup
+    # probes (encoder capability probe, zero-GPU gate inside detect_hardware).
+    run_startup_doctor(reporter)
+    disable_power_throttling(reporter)
+
     input_dir = root / "input"
     output_dir = root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -274,34 +285,39 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     # engage fan-out — one spawned worker per GPU over a shared dynamic queue.
     # One card or a CPU-only box keeps the exact sequential v1 driver below
     # (zero-regression contract, pinned by tests/test_batch_fanout.py).
-    if hardware.gpu_count >= _FANOUT_MIN_GPUS:
-        return _run_batch_fanout(
+    # The keep-awake request is held from here to the driver's return on EVERY
+    # exit path (finally-discipline: Ctrl+C unwinds through the context
+    # manager); fan-out children hold their own (execution state is
+    # per-process — see _fanout_worker).
+    with keep_system_awake(reporter):
+        if hardware.gpu_count >= _FANOUT_MIN_GPUS:
+            return _run_batch_fanout(
+                queue=queue,
+                hardware=hardware,
+                config=config,
+                run=run,
+                ffmpeg_path=ffmpeg_path,
+                output_override=output_override,
+                root=root,
+                reporter=reporter,
+                num_streams=args.num_streams,
+                no_color=args.no_color,
+                no_tty=args.no_tty,
+            )
+
+        ctx = _stage_context(config, run, hardware, root, reporter)
+        return _run_batch_sequential(
+            ctx=ctx,
             queue=queue,
-            hardware=hardware,
             config=config,
             run=run,
             ffmpeg_path=ffmpeg_path,
             output_override=output_override,
-            root=root,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            client_factory=client_factory,
             reporter=reporter,
-            num_streams=args.num_streams,
-            no_color=args.no_color,
-            no_tty=args.no_tty,
         )
-
-    ctx = _stage_context(config, run, hardware, root, reporter)
-    return _run_batch_sequential(
-        ctx=ctx,
-        queue=queue,
-        config=config,
-        run=run,
-        ffmpeg_path=ffmpeg_path,
-        output_override=output_override,
-        input_dir=input_dir,
-        output_dir=output_dir,
-        client_factory=client_factory,
-        reporter=reporter,
-    )
 
 
 def _run_batch_sequential(  # noqa: PLR0913 - driver wiring bundle
@@ -511,39 +527,45 @@ def _fanout_worker(
     except Exception as exc:  # noqa: BLE001 - F1: start-time death must surface, never hang
         result_queue.put(_FanoutResult(0, f"GPU {gpu_index}", "pipeline", str(exc), None))
         return
-    while True:
-        task = task_queue.get()
-        if task is None:  # sentinel: the queue is fully drained
-            return
-        # M1 (sequential-driver parity): an earlier entry's successful repair
-        # replaces the stale resolved path for later entries in this worker.
-        repaired = ffmpeg_repair.repaired_ffmpeg()
-        if repaired is not None:
-            ffmpeg_path = str(repaired)
-        reporter.file_banner(task.ordinal, spec.total, task.item.name)
-        try:
-            outcome, upload_info = _process_entry(
-                ctx,
-                task.item,
-                input_dir,
-                output_dir,
-                client_factory,
-                ffmpeg_path,
-                output_override=spec.output_override,
-                upload_enabled=spec.upload_enabled,
-                auto_repair=spec.auto_repair,
-                folder_id=task.folder_id,
-                delete_after_upload=spec.delete_after_upload,
-            )
-        except Exception as exc:  # noqa: BLE001 - see the docstring hang guard
-            outcome, upload_info = ("pipeline", str(exc)), None
-        if outcome is None:
-            reporter.success(f"{task.item.name} — готово")
-            result_queue.put(_FanoutResult(task.ordinal, task.item.name, None, "", upload_info))
-        else:
-            kind, detail = outcome
-            reporter.error(f"{task.item.name}: {detail}")
-            result_queue.put(_FanoutResult(task.ordinal, task.item.name, kind, detail, None))
+    # P1 power wave: the spawned child is its own process, so it holds its own
+    # EcoQoS opt-out and keep-awake request for its whole queue-serving life
+    # (the parent's request does not cross the spawn boundary). Both calls are
+    # non-raising by design — they can never trip the F1 start guard above.
+    disable_power_throttling(reporter)
+    with keep_system_awake(reporter):
+        while True:
+            task = task_queue.get()
+            if task is None:  # sentinel: the queue is fully drained
+                return
+            # M1 (sequential-driver parity): an earlier entry's successful repair
+            # replaces the stale resolved path for later entries in this worker.
+            repaired = ffmpeg_repair.repaired_ffmpeg()
+            if repaired is not None:
+                ffmpeg_path = str(repaired)
+            reporter.file_banner(task.ordinal, spec.total, task.item.name)
+            try:
+                outcome, upload_info = _process_entry(
+                    ctx,
+                    task.item,
+                    input_dir,
+                    output_dir,
+                    client_factory,
+                    ffmpeg_path,
+                    output_override=spec.output_override,
+                    upload_enabled=spec.upload_enabled,
+                    auto_repair=spec.auto_repair,
+                    folder_id=task.folder_id,
+                    delete_after_upload=spec.delete_after_upload,
+                )
+            except Exception as exc:  # noqa: BLE001 - see the docstring hang guard
+                outcome, upload_info = ("pipeline", str(exc)), None
+            if outcome is None:
+                reporter.success(f"{task.item.name} — готово")
+                result_queue.put(_FanoutResult(task.ordinal, task.item.name, None, "", upload_info))
+            else:
+                kind, detail = outcome
+                reporter.error(f"{task.item.name}: {detail}")
+                result_queue.put(_FanoutResult(task.ordinal, task.item.name, kind, detail, None))
 
 
 def _run_batch_fanout(  # noqa: PLR0913 - driver wiring bundle
@@ -878,13 +900,23 @@ def _process_entry(  # noqa: PLR0913, PLR0917 - driver wiring bundle
             reporter.warn(f"Файл существует, будет перезаписан: output/{output_name}")
 
         # Smooth live TQDM progress bar with Russian ETA and fps rate.
+        # RateWatch (P1): the detector consumes tqdm's OWN rate — the same
+        # number the bar renders (no duplicate measurement). On a non-TTY
+        # fallback there is no rate and the detector stays honestly silent.
+        rate_watch = RateWatch(reporter, label=f"[{item.name}]")
         with reporter.progress_bar(label=f"[{item.name}] Обработка") as pbar:
+            base_callback = pbar.callback()
+
+            def progress_with_rate(done: int, total: int) -> None:
+                base_callback(done, total)
+                rate_watch.update(pbar.current_rate)
+
             pipeline_mod.run_pipeline(
                 ctx,
                 source_path,
                 output_path,
                 ffmpeg_path=ffmpeg_path,
-                progress_update=pbar.callback(),
+                progress_update=progress_with_rate,
                 auto_repair=auto_repair,
             )
         if upload_enabled:
