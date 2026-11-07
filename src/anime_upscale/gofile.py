@@ -13,7 +13,9 @@ headers/params, retry rules).
 """
 
 import hashlib
+import http.client
 import os
+import random
 import re
 import sys
 import time
@@ -66,6 +68,9 @@ DOH_ENDPOINTS: tuple[str, ...] = (
     "https://1.1.1.1/dns-query",  # Cloudflare DoH by bare IP — same cert property
 )
 _HTTP_OK = 200
+# Range/206 resume negotiation statuses (download ladder).
+_HTTP_PARTIAL_CONTENT = 206
+_HTTP_RANGE_NOT_SATISFIABLE = 416
 _MAX_FOLDER_DEPTH = 10
 # Pagination runaway guard (official /contents contract): a page budget well
 # beyond any real album (50 × pageSize 1000 = 50k entries); exceeding it means
@@ -75,6 +80,10 @@ _MAX_CONTENTS_PAGES = 50
 
 class GofileError(Exception):
     """Loud gofile/DoH failure (Russian message)."""
+
+
+class GofileTransientError(GofileError):
+    """Transient gofile HTTP failure (502/503/504, 416-restart) — retryable."""
 
 
 # ── Interception-adaptive TLS (live Windows-server feedback, 2026-10-28) ────────────────
@@ -874,14 +883,49 @@ class GofileClient:
             found.append(ResolvedChild(name=name, link=str(link), size=size, md5=md5))
 
     # -- file download ------------------------------------------------------
-    def download_file(
+    # Transient-failure classes for the retry ladder (live-batch wave):
+    # HTTP 502/503/504 from the store, connection breaks mid-stream (urllib3
+    # surfaces them as requests' ConnectionError / ChunkedEncodingError, the
+    # owner's screenshot shows "Connection broken: IncompleteRead(...)"), and
+    # a raw IncompleteRead / ProtocolError in case a layer skips the wrapping.
+    TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
+    _TRANSIENT_EXCEPTIONS: tuple[type[Exception], ...] = (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ChunkedEncodingError,
+        http.client.IncompleteRead,
+        urllib3.exceptions.ProtocolError,
+    )
+
+    def download_file(  # noqa: PLR0913 - retry-wiring bundle, mirrors upload_file
         self,
         link: str,
         destination: Path,
         progress: Callable[[int, int], None] | None = None,
         chunk_size: int = 1024 * 1024,
+        *,
+        max_attempts: int = 3,
+        backoff_base: float = 1.0,
+        sleep: Callable[[float], None] = time.sleep,
+        jitter: Callable[[], float] = random.random,
+        on_retry: Callable[[int, int, str], None] | None = None,
     ) -> None:
-        """GET <link> with accountToken cookie; .part + atomic rename (run.py:945-1000)."""
+        """
+        GET <link> with accountToken cookie; .part + atomic rename (run.py:945-1000).
+
+        Transient failures (HTTP 502/503/504, ConnectionError,
+        ChunkedEncodingError, IncompleteRead) are retried up to ``max_attempts``
+        (default 3) with exponential backoff ``backoff_base * 2**(attempt-1) +
+        jitter`` (1/2/4 s + jitter at defaults); every retry prints nothing by
+        itself — the caller wires ``on_retry(attempt, total, reason)`` for the
+        Russian warn line. Range/206 resume: store-*.gofile.io honors Range
+        (verified against the owner's gofile-dl run.py:967-977, which resumes
+        with ``Range: bytes={size}-``, and the wider gofile downloader
+        ecosystem), so a mid-stream failure resumes from the .part byte
+        offset: a 206 answer appends, a 200 answer (Range ignored) restarts
+        from scratch, 416 drops the partial and retries. The .part file is
+        deleted after the final attempt and on permanent (non-transient)
+        failures — a broken file never lands under the final name.
+        """
         self.ensure_token()
         host = urlparse(link).hostname or ""
         if not host:
@@ -889,32 +933,81 @@ class GofileClient:
             raise GofileError(msg)
         self.session.pin(host)
         temp = destination.with_name(destination.name + ".part")
-        try:
-            with adaptive_tls_request(
-                self.session.get,
-                url=link,
-                strict_tls=self.strict_tls,
-                headers={
-                    "Cookie": f"accountToken={self.token}",
-                    "User-Agent": self.user_agent,
-                    "Referer": "https://gofile.io/",
-                },
-                stream=True,
-                timeout=(10, 300),
-            ) as response:
-                if response.status_code != _HTTP_OK:
-                    msg = f"Скачивание {link}: HTTP {response.status_code}."
-                    raise GofileError(msg)
-                total = int(response.headers.get("Content-Length", 0))
-                done = 0
-                with temp.open("wb") as handle:
-                    for chunk in response.iter_content(chunk_size=chunk_size):
-                        handle.write(chunk)
-                        done += len(chunk)
-                        if progress is not None:
-                            progress(done, total)
-            temp.rename(destination)  # atomic: only complete files land in input/
-        except (requests.RequestException, OSError) as exc:
-            temp.unlink(missing_ok=True)
-            msg = f"Ошибка скачивания {link}: {exc}"
-            raise GofileError(msg) from exc
+        for attempt in range(1, max_attempts + 1):
+            offset = temp.stat().st_size if temp.is_file() else 0
+            try:
+                self._download_attempt(link, temp, destination, progress, chunk_size, offset)
+            except (GofileTransientError, *self._TRANSIENT_EXCEPTIONS) as exc:
+                if attempt == max_attempts:
+                    temp.unlink(missing_ok=True)
+                    msg = (
+                        f"Ошибка скачивания {link}: не удалось после {max_attempts} попыток: {exc}"
+                    )
+                    raise GofileError(msg) from exc
+                delay = backoff_base * 2 ** (attempt - 1) + jitter()
+                if on_retry is not None:
+                    on_retry(attempt, max_attempts, str(exc))
+                sleep(delay)
+            except GofileError:
+                # Permanent refusal (403/404/…): no retry makes it transient.
+                temp.unlink(missing_ok=True)
+                raise
+            except (requests.RequestException, OSError) as exc:
+                # Non-transient network residue (SSL, timeouts, socket I/O):
+                # the loud-error contract wraps them in Russian, temp is junk.
+                temp.unlink(missing_ok=True)
+                msg = f"Ошибка скачивания {link}: {exc}"
+                raise GofileError(msg) from exc
+            else:
+                return  # complete attempt: .part renamed onto the destination
+        msg = f"Ошибка скачивания {link}: исчерпаны попытки ({max_attempts})."
+        raise GofileError(msg)  # pragma: no cover - loop returns or raises above
+
+    def _download_attempt(  # noqa: PLR0913, PLR0917 - one-attempt bundle, mirrors download_file
+        self,
+        link: str,
+        temp: Path,
+        destination: Path,
+        progress: Callable[[int, int], None] | None,
+        chunk_size: int,
+        offset: int,
+    ) -> None:
+        """One download attempt; resumes from ``offset`` when the server honors it."""
+        headers = {
+            "Cookie": f"accountToken={self.token}",
+            "User-Agent": self.user_agent,
+            "Referer": "https://gofile.io/",
+        }
+        if offset > 0:
+            headers["Range"] = f"bytes={offset}-"
+        with adaptive_tls_request(
+            self.session.get,
+            url=link,
+            strict_tls=self.strict_tls,
+            headers=headers,
+            stream=True,
+            timeout=(10, 300),
+        ) as response:
+            if response.status_code in self.TRANSIENT_HTTP_STATUSES:
+                msg = f"Скачивание {link}: HTTP {response.status_code}."
+                raise GofileTransientError(msg)
+            if response.status_code == _HTTP_RANGE_NOT_SATISFIABLE:
+                # partial ≥ full size: drop the stale partial and retry fresh.
+                temp.unlink(missing_ok=True)
+                msg = f"Скачивание {link}: HTTP 416 (диапазон не удовлетворим) — запуск заново."
+                raise GofileTransientError(msg)
+            if response.status_code not in {_HTTP_OK, _HTTP_PARTIAL_CONTENT}:
+                msg = f"Скачивание {link}: HTTP {response.status_code}."
+                raise GofileError(msg)
+            resume = response.status_code == _HTTP_PARTIAL_CONTENT
+            content_length = int(response.headers.get("Content-Length", 0))
+            total = offset + content_length if resume else content_length
+            done = offset if resume else 0
+            # 200 after a resume request = Range ignored → truncate, start over.
+            with temp.open("ab" if resume else "wb") as handle:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    handle.write(chunk)
+                    done += len(chunk)
+                    if progress is not None:
+                        progress(done, total)
+        temp.rename(destination)  # atomic: only complete files land in input/

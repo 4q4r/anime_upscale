@@ -374,3 +374,73 @@ class TestCurrentRateProperty:
         assert pbar.current_rate is None
         pbar.update(50, 100)
         assert pbar.current_rate is None
+
+
+class TestDownloadProgressBar:
+    """Бар скачивания = та же ETA-механика #41, что на барах обработки/выгрузки:
+    проценты, размер, rate (МБ/с) и русский ETA через _eta_seconds — никогда «?»."""
+
+    def test_factory_desc_and_enabled_on_tty(self) -> None:
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        reporter = Reporter(mode, stream=stream)
+        with reporter.download_progress_bar(total=10 * 1024 * 1024, filename="ep03.mkv") as pbar:
+            assert pbar.disabled is False
+            assert pbar._pbar is not None
+            assert "[ep03.mkv] Скачивание" in pbar._pbar.desc
+            cb = pbar.callback()
+            cb(5 * 1024 * 1024, 10 * 1024 * 1024)
+            assert pbar._current_n == 5 * 1024 * 1024
+        assert pbar.closed is True
+
+    def test_eta_and_rate_format_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _FakeClock()
+        monkeypatch.setattr(tqdm.std, "time", clock)
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        reporter = Reporter(mode, stream=stream)
+        with reporter.download_progress_bar(total=1024 * 1024, filename="ep.mkv") as pbar:
+            clock.advance(2.0)
+            pbar.update(512 * 1024, 1024 * 1024)
+            d = pbar._pbar.format_dict  # ty: ignore[index]
+            assert d.get("custom_rate") == "0.2 МБ/с"
+            eta = d.get("custom_eta")
+            assert eta is not None and "?" not in eta
+            # (1MiB - 0.5MiB) / (0.5MiB/2s) = 2 s.
+            assert eta == "2с"
+
+    def test_non_tty_fallback_throttled_lines(self) -> None:
+        stream = _FakeStream(tty=False)
+        reporter = Reporter(resolve_mode(no_color=True, no_tty=True), stream=stream)
+        with reporter.download_progress_bar(total=100 * 1024 * 1024, filename="ep.mkv") as pbar:
+            cb = pbar.callback()
+            for step in range(1, 11):
+                cb(step * 10 * 1024 * 1024, 100 * 1024 * 1024)
+        lines = [line for line in stream.written if "Скачивание" in line]
+        assert lines, "не-TTY фолбэк обязан печатать долю"
+        assert all("?" not in line for line in lines)
+        assert any("100%" in line for line in lines)
+
+    def test_update_backward_reset_restarts_progress(self) -> None:
+        """Retry after a failed attempt rewinds the callback to small offsets —
+        the bar must accept the reset (tqdm counter included) instead of
+        freezing until the new attempt passes the old maximum."""
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        reporter = Reporter(mode, stream=stream)
+        with reporter.download_progress_bar(total=100, filename="ep.mkv") as pbar:
+            pbar.update(90, 100)
+            assert pbar._pbar.n == 90  # ty: ignore[index]
+            pbar.update(5, 100)
+            assert pbar._current_n == 5
+            assert pbar._pbar.n == 5  # ty: ignore[index]
+
+    def test_upload_bar_reset_safe_too(self) -> None:
+        stream = _DummyTtyStream()
+        mode = OutputMode(color=True, tty=True)
+        reporter = Reporter(mode, stream=stream)
+        with reporter.upload_progress_bar(total=100, filename="ep.mkv") as pbar:
+            pbar.update(90, 100)
+            pbar.update(5, 100)
+            assert pbar._current_n == 5
+            assert pbar._pbar.n == 5  # ty: ignore[index]

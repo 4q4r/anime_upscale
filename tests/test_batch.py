@@ -479,7 +479,13 @@ def test_upload_time_network_error_gets_dedicated_exit_3(
 
     _tmp_project(tmp_path, monkeypatch)
     # The real upload runs: the (faked) pipeline's output must exist so
-    # upload_file reaches pick_server, where the session dies.
+    # upload_file reaches pick_server, where the session dies. The skip
+    # filter (default true) would drop this entry before processing —
+    # disable it here: this pin is about the upload exit code, not the skip.
+    config = (tmp_path / "config.toml").read_text(encoding="utf-8")
+    (tmp_path / "config.toml").write_text(
+        config + "[batch]\nskip_existing_output = false\n", encoding="utf-8"
+    )
     (tmp_path / "output" / "a.mkv").write_bytes(b"x")
     monkeypatch.setattr(
         "anime_upscale.pipeline.run_pipeline",
@@ -977,3 +983,111 @@ def test_cli_wires_auto_repair_from_tools_override(
     )
     cli.main(["--profile", "enc", "-i", "a.mkv", "--config", "config.toml"])
     assert captured == [True, False]  # pinned [tools] ffmpeg → ladder disabled
+
+
+class TestSkipExistingOutput:
+    """[batch] skip_existing_output: серия с готовым output/<имя>.mkv не
+    ставится в очередь (экономия скачивания и GPU); false = прежнее поведение
+    перезаписи. Скип сверяется по ИТОГОВОМУ имени серии (совместимо с «-2»)."""
+
+    @staticmethod
+    def _patch_harness(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
+        def fake_run_pipeline(ctx, source, output, ffmpeg_path, progress_update=None, **_kw):
+            calls.append(f"pipeline:{source.name}")
+            return (60, 1)
+
+        monkeypatch.setattr("anime_upscale.pipeline.run_pipeline", fake_run_pipeline)
+        monkeypatch.setattr(cli, "detect_hardware", lambda *a, **kw: _fake_hw())
+        monkeypatch.setattr(cli, "resolve_tool", lambda name, override=None: "/usr/bin/ffmpeg")
+
+    def test_existing_output_skips_entry_default_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Default (no [batch] section) = skip: готовый вывод не перерабатывается."""
+        _tmp_project(tmp_path, monkeypatch)
+        (tmp_path / "output" / "a.mkv").write_bytes(b"done")
+        calls: list[str] = []
+        self._patch_harness(monkeypatch, calls)
+        exit_code = cli.main(
+            ["--profile", "enc", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+        )
+        out = capsys.readouterr().out
+        assert calls == ["pipeline:b.mkv"], "готовая серия не должна попасть в очередь"
+        assert "серия пропущена" in out
+        assert "skip_existing_output = false" in out
+        # Очередь после фильтрации: баннеры и итог по фактической очереди.
+        assert "Файл 1/1: b.mkv" in out
+        assert "Итог: 1/1 успешно, 0 с ошибкой" in out
+        assert exit_code == 0
+
+    def test_skip_disabled_processes_existing_output_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """skip_existing_output = false → прежнее поведение: warn + переработка."""
+        _tmp_project(tmp_path, monkeypatch)
+        (tmp_path / "config.toml").write_text(
+            '[stages.encode]\ncrf = 16\n[profiles.enc]\nstages = ["encode"]\n'
+            "[batch]\nskip_existing_output = false\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "output" / "a.mkv").write_bytes(b"done")
+        calls: list[str] = []
+        self._patch_harness(monkeypatch, calls)
+        exit_code = cli.main(
+            ["--profile", "enc", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+        )
+        out = capsys.readouterr().out
+        assert calls == ["pipeline:a.mkv", "pipeline:b.mkv"]
+        assert "будет перезаписан" in out
+        assert "серия пропущена" not in out
+        assert exit_code == 0
+
+    def test_all_entries_skipped_exits_zero_with_note(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _tmp_project(tmp_path, monkeypatch)
+        (tmp_path / "output" / "a.mkv").write_bytes(b"done")
+        (tmp_path / "output" / "b.mkv").write_bytes(b"done")
+        calls: list[str] = []
+        self._patch_harness(monkeypatch, calls)
+        exit_code = cli.main(
+            ["--profile", "enc", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+        )
+        out = capsys.readouterr().out
+        assert calls == []
+        assert "серия пропущена" in out
+        assert "очередь пуста" in out
+        assert exit_code == 0
+
+    def test_skip_matches_final_disambiguated_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """«-2» совместимость: скип сверяется по итоговому имени серии."""
+        from anime_upscale.fetch_input import QueueItem
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir(parents=True)
+        (output_dir / "S01E06 - Не хочу умирать-2.mkv").write_bytes(b"done")
+        reporter = Reporter(resolve_mode(no_color=True, no_tty=True))
+        queue = [
+            QueueItem(source="s", origin="o", name="S01E06 - Не хочу умирать-2.mkv", kind="local"),
+            QueueItem(source="s", origin="o", name="S01E07.mkv", kind="local"),
+        ]
+        kept = cli._filter_existing_outputs(queue, output_dir, None, reporter)
+        assert [item.name for item in kept] == ["S01E07.mkv"]
+
+    def test_single_entry_output_override_respected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """-o override участвует в скипе: output/<override>.mkv существует → скип."""
+        _tmp_project(tmp_path, monkeypatch)
+        (tmp_path / "output" / "custom.mkv").write_bytes(b"done")
+        calls: list[str] = []
+        self._patch_harness(monkeypatch, calls)
+        exit_code = cli.main(
+            ["--profile", "enc", "-i", "a.mkv", "-o", "custom", "--config", "config.toml"]
+        )
+        out = capsys.readouterr().out
+        assert calls == []
+        assert "серия пропущена" in out
+        assert exit_code == 0

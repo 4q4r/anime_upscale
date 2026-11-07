@@ -5,7 +5,9 @@ Trigger: --upload > profile upload=true > off. Runs only after a completed
 pipeline; failure is loud, the output file is untouched, one attempt in v1.
 """
 
+import http.client
 import os
+import random
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 
 import requests
+import urllib3.exceptions
 
 from anime_upscale.gofile import GofileClient, GofileError, adaptive_tls_request
 
@@ -20,6 +23,19 @@ if TYPE_CHECKING:
     from anime_upscale.reporting import Reporter
 
 _HTTP_OK = 200
+
+# Transient upload failures (live-batch wave): the same classes as the
+# download ladder plus server-side blips (502/503/504) and rate-limit 429
+# (Retry-After honored when present). urllib3 surfaces mid-stream breaks to
+# requests as ConnectionError/ChunkedEncodingError; raw IncompleteRead and
+# ProtocolError are kept in the net in case a layer skips the wrapping.
+_TRANSIENT_UPLOAD_STATUSES = frozenset({429, 502, 503, 504})
+_TRANSIENT_EXCEPTIONS: tuple[type[Exception], ...] = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    http.client.IncompleteRead,
+    urllib3.exceptions.ProtocolError,
+)
 
 # F11: the file part Content-Type follows the filename suffix (gofile accepts
 # arbitrary video payloads; unknown suffixes degrade to a generic binary type).
@@ -231,28 +247,23 @@ class AdaptiveStreamingMultipart:
         yield bytes(self._closing_bytes)
 
 
-def upload_file(
-    path: Path,
+def _upload_once(  # noqa: PLR0913, PLR0917 - single-attempt wiring bundle
     client: GofileClient,
-    progress: Callable[[int, int], None] | None = None,
-    folder_id: str | None = None,
-    chunk_size: int = AdaptiveStreamingMultipart.INIT_CHUNK_SIZE,
-) -> tuple[str, str]:
+    host: str,
+    path: Path,
+    token: str,
+    folder_id: str | None,
+    progress: Callable[[int, int], None] | None,
+    chunk_size: int,
+) -> requests.Response:
     """
-    Upload one file.
+    One upload POST with a freshly built single-use streamer.
 
-    Returns tuple of (download_page, parent_folder_id); parentFolder is always
-    present per the official gofile contract — its absence raises loudly (F12).
-    Token cookie when configured (§10.3).
+    The pinned file handle never outlives the attempt (cli deletes the output
+    right after, and an open handle blocks unlink on Windows); a retry builds
+    a new streamer — fresh handle, generator and boundary, headers rebuilt to
+    match.
     """
-    if not path.is_file():
-        msg = f"Файл для загрузки не найден: {path}"
-        raise UploadError(msg)
-    server = pick_server(client)
-    host = f"{server}.gofile.io"
-    client.session.pin(host)
-
-    token = client.ensure_token()
     streamer = AdaptiveStreamingMultipart(
         path,
         token=token,
@@ -266,7 +277,7 @@ def upload_file(
             # and would override a manual header anyway.
             "Content-Type": f"multipart/form-data; boundary={streamer.boundary}",
         }
-        response = adaptive_tls_request(
+        return adaptive_tls_request(
             client.session.post,
             url=f"https://{host}/uploadfile",
             strict_tls=client.strict_tls,
@@ -276,9 +287,17 @@ def upload_file(
             timeout=(10, 3600),
         )
     finally:
-        # The pinned handle must never outlive the upload: cli deletes the
-        # output file right after, and an open handle blocks unlink on Windows.
         streamer.close()
+
+
+def _finish_upload_response(response: requests.Response) -> tuple[str, str]:
+    """
+    Validate the upload response contract (loud on every violation).
+
+    Returns (download_page, parent_folder_id); parentFolder is always present
+    per the official gofile contract — its absence raises loudly (F12), since
+    a missing folder would silently degrade album mode into orphan folders.
+    """
     if response.status_code != _HTTP_OK:
         msg = f"gofile upload: HTTP {response.status_code}."
         raise UploadError(msg)
@@ -294,8 +313,6 @@ def upload_file(
     if not download_page:
         msg = f"gofile upload не вернул downloadPage: {str(payload)[:200]}"
         raise UploadError(msg)
-    # F12: official gofile docs carry parentFolder in every upload response; a
-    # missing one means album mode would silently degrade into orphan folders.
     parent_folder = data.get("parentFolder")
     if not parent_folder:
         msg = "Gofile не вернул parentFolder — альбом невозможен."
@@ -303,16 +320,113 @@ def upload_file(
     return str(download_page), str(parent_folder)
 
 
-def upload_output(
+def upload_file(  # noqa: PLR0913
+    path: Path,
+    client: GofileClient,
+    progress: Callable[[int, int], None] | None = None,
+    folder_id: str | None = None,
+    chunk_size: int = AdaptiveStreamingMultipart.INIT_CHUNK_SIZE,
+    *,
+    max_attempts: int = 3,
+    backoff_base: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    jitter: Callable[[], float] = random.random,
+    on_retry: Callable[[int, int, str], None] | None = None,
+) -> tuple[str, str]:
+    """
+    Upload one file.
+
+    Returns tuple of (download_page, parent_folder_id).
+    Token cookie when configured (§10.3).
+
+    Transient failures (HTTP 502/503/504, 429 with Retry-After honored when
+    present, ConnectionError, ChunkedEncodingError, IncompleteRead) are retried
+    up to ``max_attempts`` with exponential backoff. The streaming body is
+    single-use: every attempt RECREATES the AdaptiveStreamingMultipart from the
+    file (fresh handle + generator + boundary), never re-iterates a consumed
+    streamer. Token resolution (and the stale-token recovery in fetch_contents)
+    is untouched — the ladder wraps only the POST. A permanent refusal (any
+    other HTTP status or business status) fails immediately.
+    """
+    if not path.is_file():
+        msg = f"Файл для загрузки не найден: {path}"
+        raise UploadError(msg)
+    server = pick_server(client)
+    host = f"{server}.gofile.io"
+    client.session.pin(host)
+
+    token = client.ensure_token()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = _upload_once(client, host, path, token, folder_id, progress, chunk_size)
+        except _TRANSIENT_EXCEPTIONS as exc:
+            if attempt == max_attempts:
+                msg = f"Загрузка на gofile не удалась после {max_attempts} попыток: {exc}"
+                raise UploadError(msg) from exc
+            delay = backoff_base * 2 ** (attempt - 1) + jitter()
+            if on_retry is not None:
+                on_retry(attempt, max_attempts, str(exc))
+            sleep(delay)
+            continue
+        if response.status_code not in _TRANSIENT_UPLOAD_STATUSES:
+            return _finish_upload_response(response)
+        if attempt == max_attempts:
+            msg = (
+                f"Загрузка на gofile не удалась после {max_attempts} попыток: "
+                f"HTTP {response.status_code}."
+            )
+            raise UploadError(msg)
+        delay = _429_retry_after(response) or backoff_base * 2 ** (attempt - 1) + jitter()
+        if on_retry is not None:
+            on_retry(attempt, max_attempts, f"HTTP {response.status_code}")
+        sleep(delay)
+    msg = f"Загрузка на gofile не удалась: исчерпаны попытки ({max_attempts})."
+    raise UploadError(msg)  # pragma: no cover - loop returns or raises above
+
+
+def _429_retry_after(response: object) -> float | None:
+    """Honor Retry-After on a 429 when the header parses to a usable delay."""
+    headers = getattr(response, "headers", None)
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return None
+    raw = getter("Retry-After")
+    if raw is None:
+        return None
+    try:
+        delay = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return delay if delay >= 0 else None
+
+
+def upload_output(  # noqa: PLR0913
     path: Path,
     client: GofileClient,
     reporter: "Reporter",
     progress: Callable[[int, int], None] | None = None,
     folder_id: str | None = None,
+    *,
+    max_attempts: int = 3,
+    backoff_base: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    jitter: Callable[[], float] = random.random,
 ) -> tuple[str, str]:
     """Post-step entry: loud failure keeps the output untouched; prints the link."""
     try:
-        link, parent_folder = upload_file(path, client, progress=progress, folder_id=folder_id)
+        link, parent_folder = upload_file(
+            path,
+            client,
+            progress=progress,
+            folder_id=folder_id,
+            max_attempts=max_attempts,
+            backoff_base=backoff_base,
+            sleep=sleep,
+            jitter=jitter,
+            on_retry=lambda attempt, total, reason: reporter.warn(
+                f"Попытка {attempt}/{total} загрузки не удалась ({reason}) — повторяю..."
+            ),
+        )
     except (GofileError, requests.RequestException) as exc:
         msg = f"Загрузка {path.name} не удалась: {exc}"
         raise UploadError(msg) from exc

@@ -1,6 +1,7 @@
 """fetch_input tests: entry grammar, filename precedence, idempotence, collisions (§11.1/§11.6)."""
 
 from pathlib import Path
+from typing import Self
 
 import pytest
 
@@ -270,7 +271,9 @@ class TestFetchQueueItem:
         download_calls: list[str] = []
 
         class _MockClient:
-            def download_file(self, url: str, destination: Path, progress: object = None) -> None:
+            def download_file(
+                self, url: str, destination: Path, progress: object = None, **_kw: object
+            ) -> None:
                 download_calls.append(url)
                 destination.write_bytes(content)
 
@@ -371,7 +374,9 @@ class TestFetchQueueItem:
         calls: list[tuple[str, Path]] = []
 
         class _FakeClient:
-            def download_file(self, url: str, destination: Path, progress: object = None) -> None:
+            def download_file(
+                self, url: str, destination: Path, progress: object = None, **_kw: object
+            ) -> None:
                 calls.append((url, destination))
                 destination.write_bytes(b"data")
 
@@ -533,7 +538,9 @@ class TestCacheIntegrity:
     @staticmethod
     def _recorder(calls: list[str], content: bytes) -> type:
         class _MockClient:
-            def download_file(self, url: str, destination: Path, progress: object = None) -> None:
+            def download_file(
+                self, url: str, destination: Path, progress: object = None, **_kw: object
+            ) -> None:
                 calls.append(url)
                 destination.write_bytes(content)
 
@@ -777,3 +784,158 @@ class TestCacheIntegrity:
         cache.record("e.mkv", "https://a", 2, None, 2, 2.0)
         assert any("Кэш входа не сохранён" in w for w in reporter.warnings)
         assert not tmp_file.exists()
+
+
+class TestPostDownloadVerification:
+    """Post-download integrity (live-batch wave): a downloaded file is verified
+    against expected_size/expected_md5 IMMEDIATELY; a mismatch deletes the bad
+    file and re-downloads (same transient-retry discipline); only after the
+    attempts are exhausted does it fail loudly. A corrupt file never stays
+    under the valid name, and the pipeline never receives unverified bytes."""
+
+    @staticmethod
+    def _recorder(calls: list[str], content: bytes) -> type:
+        class _MockClient:
+            def download_file(
+                self, url: str, destination: Path, progress: object = None, **_kw: object
+            ) -> None:
+                calls.append(url)
+                destination.write_bytes(content)
+
+        return _MockClient
+
+    @staticmethod
+    def _varying_client(calls: list[str], contents: list[bytes]) -> type:
+        class _MockClient:
+            def download_file(
+                self, url: str, destination: Path, progress: object = None, **_kw: object
+            ) -> None:
+                calls.append(url)
+                destination.write_bytes(contents[min(len(calls) - 1, len(contents) - 1)])
+
+        return _MockClient
+
+    def test_size_mismatch_redownloads(self, tmp_path: Path) -> None:
+        good = b"0123456789"
+        bad = b"01234"
+        calls: list[str] = []
+        item = QueueItem(
+            source="https://gofile.io/d/album1",
+            origin="gofile папка album1 → файл",
+            name="ep01.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/ep01.mkv",
+            expected_size=len(good),
+            expected_md5=None,
+        )
+        reporter = _MuteReporter()
+        result = fetch_queue_item(
+            item, tmp_path, self._varying_client(calls, [bad, good]), reporter
+        )
+        assert len(calls) == 2
+        assert result.read_bytes() == good
+        assert any("целостности" in w or "размер" in w for w in reporter.warnings)
+
+    def test_md5_mismatch_redownloads(self, tmp_path: Path) -> None:
+        import hashlib
+
+        good = b"valid payload"
+        bad = b"corrupt paylo"  # same length as good — isolates the MD5 check
+        valid_md5 = hashlib.md5(good, usedforsecurity=False).hexdigest()
+        calls: list[str] = []
+        item = QueueItem(
+            source="https://gofile.io/d/album1",
+            origin="gofile папка album1 → файл",
+            name="ep01.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/ep01.mkv",
+            expected_size=len(good),
+            expected_md5=valid_md5,
+        )
+        reporter = _MuteReporter()
+        result = fetch_queue_item(
+            item, tmp_path, self._varying_client(calls, [bad, good]), reporter
+        )
+        assert len(calls) == 2
+        assert result.read_bytes() == good
+        assert any("MD5" in w for w in reporter.warnings)
+
+    def test_mismatch_exhausted_is_loud_and_file_removed(self, tmp_path: Path) -> None:
+        good = b"0123456789"
+        bad = b"01234"
+        calls: list[str] = []
+        item = QueueItem(
+            source="https://gofile.io/d/album1",
+            origin="gofile папка album1 → файл",
+            name="ep01.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/ep01.mkv",
+            expected_size=len(good),
+            expected_md5=None,
+        )
+        reporter = _MuteReporter()
+        with pytest.raises(EntryError, match="целостност"):
+            fetch_queue_item(item, tmp_path, self._recorder(calls, bad), reporter)
+        assert len(calls) == 3
+        assert not (tmp_path / "ep01.mkv").exists()
+        assert not (tmp_path / "ep01.mkv.part").exists()
+        # A failed verification must never poison the cache.
+        assert FetchCache(tmp_path / ".fetch_cache.json", reporter).get("ep01.mkv") is None
+
+    def test_verified_success_records_cache(self, tmp_path: Path) -> None:
+        import hashlib
+
+        good = b"valid payload"
+        valid_md5 = hashlib.md5(good, usedforsecurity=False).hexdigest()
+        calls: list[str] = []
+        item = QueueItem(
+            source="https://gofile.io/d/album1",
+            origin="gofile папка album1 → файл",
+            name="ep01.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/ep01.mkv",
+            expected_size=len(good),
+            expected_md5=valid_md5,
+        )
+        reporter = _MuteReporter()
+        fetch_queue_item(item, tmp_path, self._recorder(calls, good), reporter)
+        assert len(calls) == 1
+        cached = FetchCache(tmp_path / ".fetch_cache.json", reporter).get("ep01.mkv")
+        assert cached is not None
+        assert cached.get("md5") == valid_md5
+
+    def test_download_bar_wired_with_expected_total(self, tmp_path: Path) -> None:
+        """Бар скачивания строится через reporter.download_progress_bar с
+        ожидаемым размером как total (ETA-механика #41)."""
+        good = b"0123456789"
+        item = QueueItem(
+            source="https://gofile.io/d/album1",
+            origin="gofile папка album1 → файл",
+            name="ep01.mkv",
+            kind="gofile",
+            url="https://store.gofile.io/ep01.mkv",
+            expected_size=len(good),
+            expected_md5=None,
+        )
+        reporter = _MuteReporter()
+        seen_bars: list[dict] = []
+
+        def fake_bar(*, total: int = 0, filename: str = "") -> object:
+            seen_bars.append({"total": total, "filename": filename})
+
+            class _Bar:
+                def __enter__(self) -> Self:
+                    return self
+
+                def __exit__(self, *a: object) -> None:
+                    return None
+
+                def callback(self) -> object:
+                    return lambda done, total: None
+
+            return _Bar()
+
+        reporter.download_progress_bar = fake_bar  # type: ignore[method-assign]
+        fetch_queue_item(item, tmp_path, self._recorder([], good), reporter)
+        assert seen_bars and seen_bars[0]["total"] == len(good)
+        assert seen_bars[0]["filename"] == "ep01.mkv"

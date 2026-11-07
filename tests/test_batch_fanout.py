@@ -230,6 +230,35 @@ def test_two_gpus_dispatch_spawns_two_pinned_workers(
         assert not proc.thread.is_alive()
 
 
+def test_fanout_skips_existing_outputs_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fake_spawn: _FakeSpawnContext,
+) -> None:
+    """Сkip-фильтрация живёт ДО диспетча: воркеры никогда не видят серию с
+    готовым выводом (spec.total после фильтрации)."""
+    _tmp_project(tmp_path, monkeypatch)
+    (tmp_path / "output" / "a.mkv").write_bytes(b"done")
+    captured_queues: list[list[object]] = []
+    real_fanout = cli._run_batch_fanout
+
+    def capturing_fanout(**kwargs: object) -> int:
+        captured_queues.append(list(kwargs["queue"]))  # ty: ignore[index]
+        return real_fanout(**kwargs)
+
+    monkeypatch.setattr(cli, "_run_batch_fanout", capturing_fanout)
+    _patch_harness(monkeypatch, gpu_count=2)
+    exit_code = cli.main(
+        ["--profile", "enc", "-i", "a.mkv", "-i", "b.mkv", "--config", "config.toml"]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert [item.name for item in captured_queues[0]] == ["b.mkv"]  # ty: ignore[attr-defined]
+    assert "серия пропущена" in out
+    assert "Файл 1/1: b.mkv" in out
+
+
 def test_dynamic_queue_fast_worker_takes_more(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

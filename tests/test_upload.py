@@ -381,3 +381,152 @@ class TestContentTypeBySuffix:
         streamer = AdaptiveStreamingMultipart(file, boundary="B")
         payload = b"".join(streamer)
         assert f"Content-Type: {expected}\r\n".encode() in payload
+
+
+class _HeadersResponse:
+    """Response double carrying HTTP headers (429 Retry-After probes)."""
+
+    def __init__(
+        self, payload: dict, status_code: int, headers: dict[str, str] | None = None
+    ) -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class TestUploadTransientRetry:
+    """Transient-retry ladder for the upload POST (live-batch wave).
+
+    The streaming body is single-use: every retry RECREATES the multipart
+    streamer from the file (fresh handle + generator), never re-iterates."""
+
+    @staticmethod
+    def _flaky_post(fake: "_FakeSession", behaviors: list[object]) -> list[dict]:
+        """Queue per-call behaviors: _Response/_HeadersResponse = respond,
+        Exception instance = raise (after draining the body — a real socket
+        dies mid-send, and the drain must happen inside the call because the
+        streamer is closed by the finally right after). Returns per-call
+        captured kwargs with bodies drained to bytes."""
+        captured: list[dict] = []
+
+        def flaky_post(url: str, **kwargs: object) -> object:
+            recorded = dict(kwargs)
+            data = kwargs.get("data")
+            if (
+                data is not None
+                and hasattr(data, "__iter__")
+                and not isinstance(data, (bytes, str, dict))
+            ):
+                recorded["data"] = b"".join(data)  # emulate requests draining the stream
+            captured.append({"drained": recorded, "streamer": data})
+            behavior = behaviors.pop(0)
+            if isinstance(behavior, Exception):
+                raise behavior
+            return behavior
+
+        fake.post = flaky_post  # type: ignore[method-assign]
+        return captured
+
+    def test_connection_error_retries_with_recreated_body(self, tmp_path: Path) -> None:
+        file, fake = _setup(tmp_path)
+        import requests
+
+        behaviors: list[object] = [
+            requests.ConnectionError("Connection aborted"),
+            fake.post_response,
+        ]
+        captured = self._flaky_post(fake, behaviors)
+        client = _client(fake)
+        client.token = "g"
+        sleeps: list[float] = []
+        link, _parent = upload_file(file, client, sleep=sleeps.append, jitter=lambda: 0.0)
+        assert link == "https://gofile.io/d/ZZ9"
+        assert len(captured) == 2
+        assert sleeps == [1.0]
+        # Body recreated: BOTH attempts drained a complete body (the fake drains
+        # inside the post call, like a real socket send).
+        expected_len = len(AdaptiveStreamingMultipart(file, token="g"))
+        for entry in captured:
+            assert len(entry["drained"]["data"]) == expected_len  # ty: ignore[index]
+        # Each attempt got its OWN streamer instance (single-use generator contract).
+        assert captured[0]["streamer"] is not captured[1]["streamer"]  # ty: ignore[index]
+
+    def test_502_retries_then_succeeds(self, tmp_path: Path) -> None:
+        file, fake = _setup(tmp_path)
+        behaviors: list[object] = [_HeadersResponse({}, 502), fake.post_response]
+        captured = self._flaky_post(fake, behaviors)
+        client = _client(fake)
+        client.token = "g"
+        sleeps: list[float] = []
+        upload_file(file, client, sleep=sleeps.append, jitter=lambda: 0.0)
+        assert len(captured) == 2
+        assert sleeps == [1.0]
+
+    def test_429_respects_retry_after_header(self, tmp_path: Path) -> None:
+        file, fake = _setup(tmp_path)
+        behaviors: list[object] = [
+            _HeadersResponse({}, 429, headers={"Retry-After": "5"}),
+            fake.post_response,
+        ]
+        captured = self._flaky_post(fake, behaviors)
+        client = _client(fake)
+        client.token = "g"
+        sleeps: list[float] = []
+        upload_file(file, client, sleep=sleeps.append, jitter=lambda: 0.0)
+        assert len(captured) == 2
+        assert sleeps == [5.0]
+
+    def test_429_without_retry_after_uses_backoff(self, tmp_path: Path) -> None:
+        file, fake = _setup(tmp_path)
+        behaviors: list[object] = [_HeadersResponse({}, 429), fake.post_response]
+        captured = self._flaky_post(fake, behaviors)
+        client = _client(fake)
+        client.token = "g"
+        sleeps: list[float] = []
+        upload_file(file, client, sleep=sleeps.append, jitter=lambda: 0.0)
+        assert len(captured) == 2
+        assert sleeps == [1.0]
+
+    def test_exhaustion_is_loud_upload_error(self, tmp_path: Path) -> None:
+        file, fake = _setup(tmp_path)
+        import requests
+
+        behaviors: list[object] = [
+            requests.ConnectionError("down 1"),
+            requests.ConnectionError("down 2"),
+            requests.ConnectionError("down 3"),
+        ]
+        captured = self._flaky_post(fake, behaviors)
+        client = _client(fake)
+        client.token = "g"
+        with pytest.raises(UploadError, match="3 попыток"):
+            upload_file(file, client, sleep=lambda _s: None, jitter=lambda: 0.0)
+        assert len(captured) == 3
+
+    def test_non_transient_status_not_retried(self, tmp_path: Path) -> None:
+        file, fake = _setup(tmp_path)
+        behaviors: list[object] = [_HeadersResponse({}, 403)]
+        captured = self._flaky_post(fake, behaviors)
+        client = _client(fake)
+        client.token = "g"
+        with pytest.raises(UploadError, match="403"):
+            upload_file(file, client, sleep=lambda _s: None, jitter=lambda: 0.0)
+        assert len(captured) == 1
+
+    def test_on_retry_wired_to_reporter_warn(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        file, fake = _setup(tmp_path)
+        import requests
+
+        behaviors: list[object] = [requests.ConnectionError("blip"), fake.post_response]
+        self._flaky_post(fake, behaviors)
+        client = _client(fake)
+        client.token = "g"
+        reporter = Reporter(resolve_mode(no_color=True, no_tty=True))
+        upload_output(file, client, reporter, sleep=lambda _s: None, jitter=lambda: 0.0)
+        out = capsys.readouterr().out
+        assert "повторяю" in out

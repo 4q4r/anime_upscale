@@ -156,6 +156,20 @@ class Reporter:
             mode=self.mode,
         )
 
+    def download_progress_bar(
+        self,
+        *,
+        total: int = 0,
+        filename: str,
+    ) -> "DownloadProgressBar":
+        """Create a network download progress bar respecting this reporter's mode."""
+        return DownloadProgressBar(
+            total=total,
+            filename=filename,
+            stream=self.stream,
+            mode=self.mode,
+        )
+
 
 def format_eta(seconds: float | None) -> str:
     """
@@ -243,19 +257,29 @@ class _UploadCustomTqdm(tqdm):
         return d
 
 
-class UploadProgressBar:
+class _BytesProgressBar:
     """
-    Smooth, live TQDM progress bar for network uploads (plan §10).
+    Smooth, live TQDM progress bar for byte transfers (uploads and downloads).
 
     Shows:
-    - Prefix: `[{filename}] Загрузка`
+    - Prefix: `[{filename}] {phase}` («Загрузка» / «Скачивание»)
     - Percentage: every 1% update
     - Transferred bytes out of total with unit_divisor=1024 (e.g. 512.0M/10.0G or MiB/GiB)
     - Real-time speed in `МБ/с`
     - Compact Russian ETA formatted via `format_eta` (`35с`, `8мин 42с`, `1ч 24мин 15с`)
+      — ETA derived from `_eta_seconds` (PR #41 mechanics), never «?»
     - Context manager protocol (`with reporter.upload_progress_bar(...) as pbar:`)
-    - Safe non-interactive / non-TTY fallback (line-buffered progress_bytes).
+    - Safe non-interactive / non-TTY fallback (line-buffered progress_bytes;
+      `fallback_min_step_percent` throttles the line rate for chatty sources)
+    - Retry-safe `update`: a backward jump (new attempt restarting from zero)
+      resets the underlying tqdm counter instead of freezing until recovery.
+
+    Subclasses set `phase_label` and `fallback_min_step_percent`.
     """
+
+    phase_label = "Передача"
+    # 0 = emit every fallback line (upload parity); 10 = ≤10%-step lines.
+    fallback_min_step_percent = 0
 
     def __init__(
         self,
@@ -266,18 +290,19 @@ class UploadProgressBar:
         mode: OutputMode | None = None,
         mininterval: float = 0.1,
     ) -> None:
-        """Initialize upload progress bar with filename, total bytes, and output mode."""
+        """Initialize the byte-transfer progress bar with total bytes and output mode."""
         self._stream = stream if stream is not None else sys.stdout
         self._mode = mode if mode is not None else resolve_mode(stream=self._stream)
         self._filename = filename
         self._total = total
         self._current_n = 0
         self._closed = False
+        self._last_fallback_percent = -self.fallback_min_step_percent
 
         is_tty = self._mode.tty and hasattr(self._stream, "isatty") and self._stream.isatty()
         self._disable = not is_tty
 
-        desc = f"[{filename}] Загрузка"
+        desc = f"[{filename}] {self.phase_label}"
         bar_format = (
             "{desc}: {percentage:3.0f}%|{bar}| [{n_fmt}/{total_fmt}] [{custom_eta}, {custom_rate}]"
         )
@@ -319,14 +344,29 @@ class UploadProgressBar:
             if self._pbar is not None:
                 self._pbar.total = total
 
+        # A retried attempt restarts from small offsets: reset the underlying
+        # counter (and the fallback percent step) instead of silently freezing.
+        if done < self._current_n:
+            self._current_n = 0
+            self._last_fallback_percent = -self.fallback_min_step_percent
+            if self._pbar is not None:
+                self._pbar.reset(total=self._total or None)
+
         delta = done - self._current_n
         self._current_n = done
 
         if self._pbar is not None and delta > 0:
             self._pbar.update(delta)
         elif self._fallback_reporter is not None:
+            percent = int(done * 100 / self._total) if self._total > 0 else 100
+            at_end = self._total > 0 and done >= self._total
+            if percent < self._last_fallback_percent + self.fallback_min_step_percent and (
+                not at_end
+            ):
+                return
+            self._last_fallback_percent = percent
             self._fallback_reporter.progress_bytes(
-                f"[{self._filename}] Загрузка", done, self._total
+                f"[{self._filename}] {self.phase_label}", done, self._total
             )
 
     def close(self) -> None:
@@ -358,6 +398,27 @@ class UploadProgressBar:
             self.update(done, total)
 
         return _update
+
+
+class UploadProgressBar(_BytesProgressBar):
+    """Byte-transfer bar for network uploads (`[{filename}] Загрузка`)."""
+
+    phase_label = "Загрузка"
+
+
+class DownloadProgressBar(_BytesProgressBar):
+    """
+    Byte-transfer bar for network downloads (`[{filename}] Скачивание`).
+
+    Same ETA mechanics as the processing/upload bars (PR #41): percentage,
+    transferred size, rate in МБ/с and the compact Russian ETA from
+    `_eta_seconds` — an unknown ETA renders as «—», never as «?». The non-TTY
+    fallback is throttled to ≤10% steps (a 13 GiB download at 1 MiB chunks
+    would otherwise print ~13k lines).
+    """
+
+    phase_label = "Скачивание"
+    fallback_min_step_percent = 10
 
 
 class PipelineProgressBar:
