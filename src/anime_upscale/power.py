@@ -34,6 +34,7 @@ import contextlib
 import ctypes
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -80,6 +81,15 @@ _CPUFREQ_DRIVER_PATH: Final = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_driv
 _GUID_RE: Final = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
+# Sleep-state sections of `powercfg /availablesleepstates`: the section
+# markers are localized (EN/RU covered), the S3/S0 state tokens are not.
+_SLEEP_NOT_AVAILABLE_RE: Final = re.compile(r"not\s+available|недоступн", re.IGNORECASE)
+_SLEEP_AVAILABLE_RE: Final = re.compile(r"available|доступн", re.IGNORECASE)
+_GPU_PREF_KEY: Final = r"Software\Microsoft\DirectX\UserGpuPreferences"
+# Robust to value suffixes ("GpuPreference=1;AutoHDRAmd=..."); =2 (High
+# performance) and absent keys stay silent.
+_GPU_POWER_SAVING_RE: Final = re.compile(r"GpuPreference\s*=\s*1(?!\d)")
+_AC_LINE_UNKNOWN: Final = 255  # SYSTEM_POWER_STATUS.ACLineStatus «Unknown status» (winbase.h)
 _POWERCFG_TIMEOUT: Final = 10  # seconds; any doctor subprocess must stay bounded
 
 # --- RateWatch thresholds (module constants with rationale — deliberately
@@ -112,6 +122,13 @@ _SYSTEMD_INHIBIT_NOTE: Final = (
     "anime-pipeline ... (см. docs/performance.md)."
 )
 
+_MODERN_STANDBY_NOTE: Final = (
+    "Система поддерживает только Modern Standby (S0 Low Power Idle): по таймауту "
+    "сна ОС уходит в S0-idle, а на батарее запросы keep-awake обрезаются через "
+    "5 минут после истечения сна-таймаута. Для длинных батчей подключите питание; "
+    "проверить активные запросы: powercfg /requests."
+)
+
 _ECOQOS_NOTE: Final = (
     "EcoQoS opt-out недоступен ({reason}) — на батарее ОС может снижать частоту фоновых процессов."
 )
@@ -136,7 +153,10 @@ def _is_windows() -> bool:
 
 def _set_thread_execution_state(flags: int) -> int:
     """Seam: kernel32.SetThreadExecutionState; OSError on the NULL return."""
-    result = ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_ulong(flags))  # ty: ignore[unresolved-attribute]
+    fn = ctypes.windll.kernel32.SetThreadExecutionState  # ty: ignore[unresolved-attribute]
+    fn.argtypes = [ctypes.c_ulong]  # N1: explicit, self-documenting contract
+    fn.restype = ctypes.c_ulong
+    result = fn(ctypes.c_ulong(flags))
     if result == 0:
         msg = "SetThreadExecutionState вернула 0"
         raise OSError(msg)
@@ -237,6 +257,70 @@ def _read_sysfs(path: str) -> str | None:
         return None
 
 
+def _systemd_inhibit_present() -> bool:
+    """
+    Check whether the host runs systemd with an inhibitor we could use.
+
+    Canonical boot marker ``/run/systemd/system`` (freedesktop canon) plus the
+    binary on PATH. False on Docker/Kaggle hosts — where the in-process note
+    would be noise (the host-level wrap is a docs matter).
+    """
+    return shutil.which("systemd-inhibit") is not None and Path("/run/systemd/system").exists()
+
+
+def _read_gpu_preference(exe_path: str) -> str | None:
+    """
+    Read the HKCU UserGpuPreferences value for exe_path; None if absent.
+
+    A missing key/value is the normal case (silence — the user never set a
+    per-app preference); only a «Power saving» value becomes a doctor warn.
+    """
+    try:
+        import winreg  # noqa: PLC0415 - Windows-only module, nt path only
+    except ImportError:  # non-Windows interpreter
+        return None
+    try:
+        with winreg.OpenKey(  # ty: ignore[unresolved-attribute]
+            winreg.HKEY_CURRENT_USER,
+            _GPU_PREF_KEY,  # ty: ignore[unresolved-attribute]
+        ) as key:
+            value, _value_type = winreg.QueryValueEx(key, exe_path)  # ty: ignore[unresolved-attribute]
+    except OSError:
+        return None
+    return str(value)
+
+
+def _sleep_state_profile() -> tuple[bool | None, bool | None]:
+    """
+    Read the sleep-state profile: ``(s3_available, s0_idle_available)``.
+
+    (None, None) = unparsable or the probe failed. Sections are classified by
+    the available/not-available markers (EN + RU covered — localized words,
+    never plan names); the S3/S0 state tokens themselves are locale-
+    independent. Never raises.
+    """
+    returncode, out = _run_powercfg(["/availablesleepstates"])
+    if returncode != 0:
+        return None, None
+    s3_available: bool | None = None
+    s0_available: bool | None = None
+    for line in out.splitlines():
+        if _SLEEP_NOT_AVAILABLE_RE.search(line):
+            in_available_section = False
+        elif _SLEEP_AVAILABLE_RE.search(line):
+            in_available_section = True
+        else:
+            continue
+        lowered = line.lower()
+        if "(s3)" in lowered:
+            s3_available = in_available_section
+        if "s0" in lowered:
+            s0_available = in_available_section
+    if s3_available is None and s0_available is None:
+        return None, None
+    return s3_available, s0_available
+
+
 # --- keep-awake --------------------------------------------------------------
 
 
@@ -259,8 +343,10 @@ def keep_system_awake(reporter: Reporter) -> Generator[KeepAwakeStatus, None, No
     SetThreadExecutionState(ES_CONTINUOUS)» (system-sleep-criteria page).
     The reset runs on every exit path, including KeyboardInterrupt unwinding.
 
-    Linux: no in-process keep-awake API — one note pointing at the
-    systemd-inhibit wrapper (docs/performance.md).
+    Linux: no in-process keep-awake API. One note points at the systemd-inhibit
+    wrapper — only when the host actually runs systemd and the run is not
+    itself already inhibited (INVOCATION_ID best-effort marker, plan §2.1);
+    silent elsewhere (Docker/Kaggle noise avoided).
 
     Cloud runtimes (kaggle/colab): silent no-op — platform sessions have no
     host sleep manager to fight.
@@ -272,7 +358,8 @@ def keep_system_awake(reporter: Reporter) -> Generator[KeepAwakeStatus, None, No
         return
 
     if not _is_windows():
-        reporter.note(_SYSTEMD_INHIBIT_NOTE)
+        if _systemd_inhibit_present() and os.environ.get("INVOCATION_ID") is None:
+            reporter.note(_SYSTEMD_INHIBIT_NOTE)
         yield KeepAwakeStatus(active=False, detail="linux")
         return
 
@@ -368,6 +455,9 @@ def _doctor_windows(reporter: Reporter) -> list[str]:
             "Статус питания не удалось определить (GetSystemPowerStatus) — "
             "проверка батареи пропущена."
         )
+    elif ac_line == _AC_LINE_UNKNOWN:
+        # N2: the documented "Unknown" status must not fall into total silence.
+        reporter.note("Статус питания неизвестен (ACLineStatus=255) — проверка батареи пропущена.")
     elif ac_line == 0:
         warn = (
             "Питание от батареи: Windows может снижать частоту фоновых процессов "
@@ -401,6 +491,32 @@ def _doctor_windows(reporter: Reporter) -> list[str]:
         )
     # GUID_HIGH_PERFORMANCE / GUID_ULTIMATE / custom GUIDs: silence.
 
+    # 3. Sleep model (guide row «Available sleep states»): informational only —
+    # Modern-Standby-only systems idle out into S0, and on DC power the
+    # requests are cut 5 minutes after the sleep timeout (plan §1.5/§1.3).
+    s3_available, s0_available = _sleep_state_profile()
+    if s3_available is None and s0_available is None:
+        reporter.note(
+            "Режимы сна не удалось определить (powercfg /availablesleepstates) — "
+            "проверка пропущена."
+        )
+    elif s0_available and not s3_available:
+        reporter.note(_MODERN_STANDBY_NOTE)
+
+    # 4. Per-app GPU preference (guide row «Per-app GPU preference»): a manual
+    # «Power saving» assignment for our executable would push a hybrid-GPU
+    # machine onto the integrated GPU (plan §1.9). Absent value = silence.
+    preference = _read_gpu_preference(sys.executable)
+    if preference is not None and _GPU_POWER_SAVING_RE.search(preference):
+        warn = (
+            "Для исполняемого файла пайплайна задан «Power saving» GPU "
+            "(реестр UserGpuPreferences: GpuPreference=1) — на гибридной графике "
+            "батч может уйти на встроенное GPU. Фикс: Настройки > Система > "
+            "Дисплей > Графика — назначить «Высокая производительность»."
+        )
+        reporter.warn(warn)
+        warnings.append(warn)
+
     return warnings
 
 
@@ -432,8 +548,10 @@ class RateWatch:
     first ``RATE_WARMUP_WINDOWS`` are discarded (engine warm-up), the baseline
     is the median of the next ``RATE_BASELINE_WINDOWS`` windows, and two
     consecutive windows below ``RATE_DROP_RATIO`` of the baseline produce
-    exactly one loud Russian warning per stage. ``reset()`` starts a new
-    stage (new baseline, warn guard cleared).
+    exactly one loud Russian warning per instance. The stage boundary is the
+    instance boundary: ``_process_entry`` constructs a fresh RateWatch per
+    batch entry, so each entry carries a fresh baseline and a fresh warn
+    guard (there is deliberately no ``reset()`` — one mechanism, no dead API).
 
     Honest boundary (plan §P2): the detector does not diagnose WHY the rate
     sagged (throttling vs thermal vs foreground competition) — the warning
@@ -461,10 +579,6 @@ class RateWatch:
         self._baseline: float | None = None
         self._low_streak = 0
         self._warned = False
-
-    def reset(self) -> None:
-        """Start a new stage: fresh baseline, warn guard cleared."""
-        self._reset_state()
 
     def update(self, fps: float | None) -> None:
         """Feed one rate sample (None/non-positive = nothing honest, ignored)."""

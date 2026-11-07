@@ -49,6 +49,17 @@ class TestParser:
         assert args.num_streams == 3
         assert build_parser().parse_args(["--profile", "full"]).num_streams is None
 
+    def test_power_opt_out_flags_parse_and_default_off(self) -> None:
+        """F1: the two flags shipped in docs/performance.md must exist."""
+        plain = build_parser().parse_args(["--profile", "full"])
+        assert plain.no_keep_awake is False
+        assert plain.no_power_check is False
+        flagged = build_parser().parse_args(
+            ["--profile", "full", "--no-keep-awake", "--no-power-check"]
+        )
+        assert flagged.no_keep_awake is True
+        assert flagged.no_power_check is True
+
 
 class TestNumStreamsPassthrough:
     """W6: --num-streams → cli_num_streams → detect_hardware, приоритет флага."""
@@ -347,6 +358,87 @@ class TestPowerWiring:
             if proc.thread is not None:
                 proc.thread.join(timeout=10)
                 assert not proc.thread.is_alive()
+
+    def test_no_keep_awake_flag_gates_parent_and_children(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_spawn_ctx: object,
+    ) -> None:
+        """F1: --no-keep-awake removes the keep-awake request everywhere
+        (parent AND spawned workers — children must not hold it either),
+        while doctor and EcoQoS opt-out stay in place."""
+        from anime_upscale import cli
+
+        _enc_project(tmp_path, monkeypatch)
+        harness = _PowerHarness()
+        self._patch_batch_harness(monkeypatch, harness, gpu_count=2)
+        monkeypatch.setattr(cli, "_process_entry", lambda *_args, **_kw: (None, None))
+        exit_code = cli.main(
+            [
+                "--profile",
+                "enc",
+                "-i",
+                "a.mkv",
+                "-i",
+                "b.mkv",
+                "--config",
+                "config.toml",
+                "--no-keep-awake",
+            ]
+        )
+        assert exit_code == 0
+        assert harness.count("doctor") == 1
+        assert harness.count("optout") == 3
+        assert harness.count("keep-enter") == 0
+        assert harness.count("keep-exit") == 0
+
+    def test_no_power_check_flag_skips_power_doctor_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F1: --no-power-check skips the power doctor; the EcoQoS opt-out and
+        keep-awake stay (the hardware/encoder probes are untouched by design)."""
+        from anime_upscale import cli
+
+        _enc_project(tmp_path, monkeypatch)
+        harness = _PowerHarness()
+        self._patch_batch_harness(monkeypatch, harness, gpu_count=1)
+        exit_code = cli.main(
+            [
+                "--profile",
+                "enc",
+                "-i",
+                "a.mkv",
+                "--config",
+                "config.toml",
+                "--no-power-check",
+            ]
+        )
+        assert exit_code == 0
+        assert harness.events == ["optout", "keep-enter", "keep-exit"]
+
+    def test_both_flags_leave_only_the_ecoqos_optout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from anime_upscale import cli
+
+        _enc_project(tmp_path, monkeypatch)
+        harness = _PowerHarness()
+        self._patch_batch_harness(monkeypatch, harness, gpu_count=1)
+        exit_code = cli.main(
+            [
+                "--profile",
+                "enc",
+                "-i",
+                "a.mkv",
+                "--config",
+                "config.toml",
+                "--no-keep-awake",
+                "--no-power-check",
+            ]
+        )
+        assert exit_code == 0
+        assert harness.events == ["optout"]
 
 
 @pytest.fixture

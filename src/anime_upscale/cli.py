@@ -12,6 +12,7 @@ and usage errors must never load the GPU stacks.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import multiprocessing
 import os
 import sys
@@ -127,6 +128,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-color", action="store_true", help="Отключить цветной вывод.")
     parser.add_argument("--no-tty", action="store_true", help="Простой вывод без анимации и ANSI.")
+    parser.add_argument(
+        "--no-keep-awake",
+        action="store_true",
+        help="Не удерживать систему бодрой на время батча (не рекомендуется).",
+    )
+    parser.add_argument(
+        "--no-power-check",
+        action="store_true",
+        help=(
+            "Пропустить проверки питания при старте (доктор); остальная диагностика "
+            "(оборудование, энкодер) остаётся."
+        ),
+    )
     sub = parser.add_subparsers(dest="command")
     models = sub.add_parser("models", help="Управление моделями из models/manifest.toml.")
     models.add_argument(
@@ -262,7 +276,10 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
 
     # P1 power wave: the read-only doctor sits next to the other startup
     # probes (encoder capability probe, zero-GPU gate inside detect_hardware).
-    run_startup_doctor(reporter)
+    # --no-power-check skips the POWER doctor only; the hardware/encoder probes
+    # above are untouched.
+    if not args.no_power_check:
+        run_startup_doctor(reporter)
     disable_power_throttling(reporter)
 
     input_dir = root / "input"
@@ -287,9 +304,13 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
     # (zero-regression contract, pinned by tests/test_batch_fanout.py).
     # The keep-awake request is held from here to the driver's return on EVERY
     # exit path (finally-discipline: Ctrl+C unwinds through the context
-    # manager); fan-out children hold their own (execution state is
-    # per-process — see _fanout_worker).
-    with keep_system_awake(reporter):
+    # manager); --no-keep-awake opts out everywhere (parent and fan-out
+    # children — children must not hold the request the user declined).
+    # Fan-out children hold their own request (execution state is per-process
+    # — see _fanout_worker).
+    with contextlib.ExitStack() as stack:
+        if not args.no_keep_awake:
+            stack.enter_context(keep_system_awake(reporter))
         if hardware.gpu_count >= _FANOUT_MIN_GPUS:
             return _run_batch_fanout(
                 queue=queue,
@@ -303,6 +324,7 @@ def _run_batch(args: argparse.Namespace, reporter: Reporter) -> int:
                 num_streams=args.num_streams,
                 no_color=args.no_color,
                 no_tty=args.no_tty,
+                no_keep_awake=args.no_keep_awake,
             )
 
         ctx = _stage_context(config, run, hardware, root, reporter)
@@ -436,6 +458,7 @@ class _FanoutSpec:
     num_streams: int | None
     no_color: bool
     no_tty: bool
+    no_keep_awake: bool
 
 
 @dataclass(frozen=True)
@@ -529,10 +552,14 @@ def _fanout_worker(
         return
     # P1 power wave: the spawned child is its own process, so it holds its own
     # EcoQoS opt-out and keep-awake request for its whole queue-serving life
-    # (the parent's request does not cross the spawn boundary). Both calls are
-    # non-raising by design — they can never trip the F1 start guard above.
+    # (the parent's request does not cross the spawn boundary). --no-keep-awake
+    # (plumbed via _FanoutSpec) gates the child's request too — the user
+    # declined the guarantee everywhere, not only in the parent. Both calls
+    # are non-raising by design — they can never trip the F1 start guard above.
     disable_power_throttling(reporter)
-    with keep_system_awake(reporter):
+    with contextlib.ExitStack() as stack:
+        if not spec.no_keep_awake:
+            stack.enter_context(keep_system_awake(reporter))
         while True:
             task = task_queue.get()
             if task is None:  # sentinel: the queue is fully drained
@@ -581,6 +608,7 @@ def _run_batch_fanout(  # noqa: PLR0913 - driver wiring bundle
     num_streams: int | None,
     no_color: bool,
     no_tty: bool,
+    no_keep_awake: bool,
 ) -> int:
     """
     Dispatch mode: one spawned worker per GPU over a shared dynamic queue.
@@ -627,6 +655,7 @@ def _run_batch_fanout(  # noqa: PLR0913 - driver wiring bundle
         num_streams=num_streams,
         no_color=no_color,
         no_tty=no_tty,
+        no_keep_awake=no_keep_awake,
     )
     workers = [
         mp_ctx.Process(

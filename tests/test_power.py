@@ -32,6 +32,23 @@ POWERCFG_SAVER_RU = f"GUID схемы питания: {GUID_SAVER.upper()}  (Э�
 POWERCFG_ULTIMATE = f"Power Scheme GUID: {GUID_ULTIMATE.upper()}  (Ultimate Performance)"
 POWERCFG_GARBAGE = "внезапно сломанный вывод без GUID"
 
+POWERCFG_SLEEP_TRADITIONAL = (
+    "The following sleep states are available on this system: "
+    "Standby (S3) Hibernate Fast Startup\n"
+    "The following sleep states are not available on this system: "
+    "Standby (S0 Low Power Idle) Network Connected Hybrid Sleep"
+)
+POWERCFG_SLEEP_MODERN_ONLY = (
+    "The following sleep states are available on this system: "
+    "Standby (S0 Low Power Idle) Network Connected Fast Startup\n"
+    "The following sleep states are not available on this system: "
+    "Standby (S3) Hibernate Hybrid Sleep"
+)
+POWERCFG_SLEEP_GARBAGE = "следующие спящие состояния внезапно не парсятся: что-то локализованное"
+
+GPU_PREF_POWER_SAVING = "GpuPreference=1;AutoHDRAmd=true;"
+GPU_PREF_HIGH_PERF = "GpuPreference=2;AutoHDRAmd=true;"
+
 WINDOW = power.RATE_WINDOW_SECONDS
 
 
@@ -145,8 +162,14 @@ class TestKeepSystemAwake:
             assert len(reporter.warns) == 1
         assert setter.calls == [SET_FLAGS]  # reset must not be attempted
 
-    def test_linux_is_noop_with_systemd_inhibit_note(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_linux_wrapped_run_gets_systemd_inhibit_note(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guide contract: the note fires when the host runs systemd AND the
+        pipeline is not itself wrapped in an inhibitor."""
         monkeypatch.setattr(power, "_is_windows", lambda: False)
+        monkeypatch.setattr(power, "_systemd_inhibit_present", lambda: True)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
         setter = _FakeStateSetter()
         monkeypatch.setattr(power, "_set_thread_execution_state", setter)
         reporter = _CapReporter()
@@ -155,6 +178,29 @@ class TestKeepSystemAwake:
         assert setter.calls == []
         assert len(reporter.notes) == 1
         assert "systemd-inhibit" in reporter.notes[0]
+
+    def test_linux_without_systemd_is_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(power, "_is_windows", lambda: False)
+        monkeypatch.setattr(power, "_systemd_inhibit_present", lambda: False)
+        setter = _FakeStateSetter()
+        monkeypatch.setattr(power, "_set_thread_execution_state", setter)
+        reporter = _CapReporter()
+        with power.keep_system_awake(reporter):
+            pass
+        assert setter.calls == []
+        assert reporter.notes == [] and reporter.warns == []
+
+    def test_linux_already_inhibited_is_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(power, "_is_windows", lambda: False)
+        monkeypatch.setattr(power, "_systemd_inhibit_present", lambda: True)
+        monkeypatch.setenv("INVOCATION_ID", "some-invocation")  # best-effort marker
+        setter = _FakeStateSetter()
+        monkeypatch.setattr(power, "_set_thread_execution_state", setter)
+        reporter = _CapReporter()
+        with power.keep_system_awake(reporter):
+            pass
+        assert setter.calls == []
+        assert reporter.notes == [] and reporter.warns == []
 
     def test_cloud_runtime_is_silent_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_runtime() -> RuntimeProfile:
@@ -221,12 +267,26 @@ class TestDisablePowerThrottling:
 def _patch_doctor_windows(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    powercfg: tuple[int, str],
+    powercfg: tuple[int, str] = (0, POWERCFG_HIGH),
     ac_line_status: int | None = 1,
+    sleep_states: tuple[int, str] | None = (0, POWERCFG_SLEEP_TRADITIONAL),
+    gpu_preference: str | None = None,
 ) -> None:
+    """Per-command dispatch: getactivescheme → `powercfg`, availablesleepstates
+    → `sleep_states`; battery and GPU-preference seams separate. Defaults keep
+    the sleep/GPU checks silent so plan-focused tests stay noise-free."""
     monkeypatch.setattr(power, "_is_windows", lambda: True)
-    monkeypatch.setattr(power, "_run_powercfg", lambda _args: powercfg)
+
+    def fake_powercfg(args: list[str]) -> tuple[int, str]:
+        if args and args[0] == "/availablesleepstates":
+            if sleep_states is None:
+                raise AssertionError("availablesleepstates called unexpectedly")
+            return sleep_states
+        return powercfg
+
+    monkeypatch.setattr(power, "_run_powercfg", fake_powercfg)
     monkeypatch.setattr(power, "_get_ac_line_status", lambda: ac_line_status)
+    monkeypatch.setattr(power, "_read_gpu_preference", lambda _exe: gpu_preference)
 
 
 class TestDoctorWindows:
@@ -309,6 +369,91 @@ class TestDoctorWindows:
         reporter = _CapReporter()
         assert power.run_startup_doctor(reporter) == []
         assert len(reporter.notes) == 1
+
+    def test_modern_standby_only_notes_the_risks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Guide row «Available sleep states»: informational — a Modern-Standby-
+        only system gets one RU-note (S0 idle-out; 5-minute DC cut), never a warn."""
+        _patch_doctor_windows(
+            monkeypatch,
+            powercfg=(0, POWERCFG_HIGH),
+            sleep_states=(0, POWERCFG_SLEEP_MODERN_ONLY),
+        )
+        reporter = _CapReporter()
+        warns = power.run_startup_doctor(reporter)
+        assert warns == []
+        assert any("Modern Standby" in note for note in reporter.notes)
+
+    def test_traditional_sleep_states_are_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_doctor_windows(
+            monkeypatch,
+            powercfg=(0, POWERCFG_HIGH),
+            sleep_states=(0, POWERCFG_SLEEP_TRADITIONAL),
+        )
+        reporter = _CapReporter()
+        assert power.run_startup_doctor(reporter) == []
+        assert reporter.notes == [] and reporter.warns == []
+
+    def test_unparsable_sleep_states_become_a_note(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_doctor_windows(
+            monkeypatch,
+            powercfg=(0, POWERCFG_HIGH),
+            sleep_states=(0, POWERCFG_SLEEP_GARBAGE),
+        )
+        reporter = _CapReporter()
+        assert power.run_startup_doctor(reporter) == []
+        assert any("availablesleepstates" in note for note in reporter.notes)
+
+    def test_failed_sleep_probe_becomes_a_note(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_doctor_windows(
+            monkeypatch,
+            powercfg=(0, POWERCFG_HIGH),
+            sleep_states=(1, ""),
+        )
+        reporter = _CapReporter()
+        assert power.run_startup_doctor(reporter) == []
+        assert any("availablesleepstates" in note for note in reporter.notes)
+
+    def test_gpu_preference_power_saving_warns_with_fix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guide row «Per-app GPU preference»: GpuPreference=1 → warn + fix path."""
+        _patch_doctor_windows(
+            monkeypatch,
+            powercfg=(0, POWERCFG_HIGH),
+            gpu_preference=GPU_PREF_POWER_SAVING,
+        )
+        reporter = _CapReporter()
+        warns = power.run_startup_doctor(reporter)
+        assert len(warns) == 1
+        assert "UserGpuPreferences" in warns[0]
+        assert "Высокая производительность" in warns[0]
+
+    def test_gpu_preference_high_perf_is_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_doctor_windows(
+            monkeypatch,
+            powercfg=(0, POWERCFG_HIGH),
+            gpu_preference=GPU_PREF_HIGH_PERF,
+        )
+        reporter = _CapReporter()
+        assert power.run_startup_doctor(reporter) == []
+        assert reporter.warns == [] and reporter.notes == []
+
+    def test_gpu_preference_absent_is_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_doctor_windows(monkeypatch, powercfg=(0, POWERCFG_HIGH), gpu_preference=None)
+        reporter = _CapReporter()
+        assert power.run_startup_doctor(reporter) == []
+        assert reporter.warns == [] and reporter.notes == []
+
+    def test_acline_unknown_status_is_a_note_not_silence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """N2: ACLineStatus=255 (documented «Unknown») must not fall into total
+        silence — «не смогли проверить» becomes a note, never a fake all-clear."""
+        _patch_doctor_windows(monkeypatch, powercfg=(0, POWERCFG_HIGH), ac_line_status=255)
+        reporter = _CapReporter()
+        assert power.run_startup_doctor(reporter) == []
+        assert len(reporter.notes) == 1
+        assert reporter.warns == []
 
 
 # --- run_startup_doctor: Linux -----------------------------------------------
@@ -410,23 +555,24 @@ class TestRateWatch:
         _feed_window(watch, clock, 100.0)
         assert reporter.warns == []
 
-    def test_reset_lets_a_new_stage_warn_again(self) -> None:
+    def test_fresh_instance_starts_fresh_warn_guard(self) -> None:
+        """F3 fix-sensitive pin: a new entry constructs a NEW RateWatch — the
+        fresh instance must be able to warn again. Breaks if the baseline or
+        warn guard ever becomes shared/module-level state."""
         clock = _Clock()
         reporter = _CapReporter()
-        watch = power.RateWatch(reporter, now=clock)
+        first = power.RateWatch(reporter, now=clock)
         for _ in range(6):
-            _feed_window(watch, clock, 100.0)
-        _feed_window(watch, clock, 50.0)
-        _feed_window(watch, clock, 50.0)
+            _feed_window(first, clock, 100.0)
+        _feed_window(first, clock, 50.0)
+        _feed_window(first, clock, 50.0)
         assert len(reporter.warns) == 1
-        watch.reset()
-        clock2 = _Clock(start=clock.value)
-        watch2_state = power.RateWatch(reporter, now=clock2)
+        second = power.RateWatch(reporter, now=clock)  # the next batch entry
         for _ in range(6):
-            _feed_window(watch2_state, clock2, 80.0)
-        _feed_window(watch2_state, clock2, 40.0)
-        _feed_window(watch2_state, clock2, 40.0)
-        assert len(reporter.warns) == 2
+            _feed_window(second, clock, 80.0)
+        _feed_window(second, clock, 40.0)
+        _feed_window(second, clock, 40.0)
+        assert len(reporter.warns) == 2  # fresh guard, fresh baseline (80→40)
 
     def test_none_zero_negative_fps_never_crash_or_roll(self) -> None:
         clock = _Clock()
