@@ -1,12 +1,14 @@
 """ProgressThrottle tests (F3) + resolve_mode policy matrix (M10, §10.4)."""
 
 import pytest
+import tqdm.std
 
 from anime_upscale.reporting import (
     OutputMode,
     PipelineProgressBar,
     ProgressThrottle,
     Reporter,
+    _eta_seconds,
     format_eta,
     resolve_mode,
 )
@@ -145,8 +147,108 @@ class TestFormatEta:
         assert format_eta(7805) == "2ч 10мин 5с"
 
     def test_invalid_or_none(self) -> None:
-        assert format_eta(None) == "?"
-        assert format_eta(-5) == "?"
+        assert format_eta(None) == "—"
+        assert format_eta(-5) == "—"
+
+
+class _FakeClock:
+    """Deterministic tqdm clock; rebind tqdm.std.time BEFORE bar construction."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def advance(self, dt: float) -> None:
+        self.now += dt
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _tty_pipeline_bar(
+    monkeypatch: pytest.MonkeyPatch, clock: _FakeClock, *, total: int
+) -> PipelineProgressBar:
+    monkeypatch.setattr(tqdm.std, "time", clock)
+    return PipelineProgressBar(
+        total=total,
+        stream=_DummyTtyStream(),
+        mode=OutputMode(color=True, tty=True),
+    )
+
+
+class TestEtaFromFormatDict:
+    """Regression: tqdm 4.70.1 format_dict has NO `remaining` key (upstream computes
+    it only inside format_meter's render dict), so ETA must be derived from
+    rate/total/n (elapsed-based fallback) — «?» is never a valid ETA."""
+
+    def test_eta_from_rate_at_episode_scale(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _FakeClock()
+        with _tty_pipeline_bar(monkeypatch, clock, total=85211) as pbar:
+            clock.advance(10.0)
+            pbar.update(17664, 85211)  # 21% — the owner's live screenshot state
+            d = pbar._pbar.format_dict
+            assert "remaining" not in d  # the upstream gap this fix routes around
+            assert d["rate"] == pytest.approx(1766.4)  # 17664 frames / 10 s
+            assert d["custom_eta"] == "38с"  # (85211 - 17664) / 1766.4 = 38.24 -> 38с
+            assert d["custom_rate"] == "1766.4 кадр/с"
+            rendered = str(pbar._pbar)
+            assert "[17664/85211] [38с, 1766.4 кадр/с]" in rendered
+            assert "?" not in rendered
+
+    def test_eta_dash_and_rate_dash_at_zero_progress(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with _tty_pipeline_bar(monkeypatch, _FakeClock(), total=7) as pbar:
+            d = pbar._pbar.format_dict
+            assert d["custom_eta"] == "—"
+            assert d["custom_rate"] == "—"
+            assert "?" not in str(pbar._pbar)
+
+    def test_eta_dash_when_rate_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _FakeClock()
+        with _tty_pipeline_bar(monkeypatch, clock, total=1000) as pbar:
+            pbar.update(100, 1000)  # dt == 0 -> no EMA sample -> rate stays None
+            d = pbar._pbar.format_dict
+            assert d["rate"] is None
+            assert d["custom_eta"] == "—"
+            assert d["custom_rate"] == "—"
+
+    def test_upload_eta_from_rate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _FakeClock()
+        monkeypatch.setattr(tqdm.std, "time", clock)
+        reporter = Reporter(OutputMode(color=True, tty=True), stream=_DummyTtyStream())
+        with reporter.upload_progress_bar(total=10 * 1024 * 1024, filename="ep02.mkv") as pbar:
+            clock.advance(2.0)
+            pbar.update(5 * 1024 * 1024, 10 * 1024 * 1024)
+            d = pbar._pbar.format_dict
+            assert d["custom_eta"] == "2с"  # (10 - 5) MiB / (5 MiB / 2 s) = 2 s
+            assert d["custom_rate"] == "2.5 МБ/с"
+            assert "?" not in str(pbar._pbar)
+
+    def test_elapsed_fallback_when_rate_not_yet_sampled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _FakeClock()
+        with _tty_pipeline_bar(monkeypatch, clock, total=85211) as pbar:
+            clock.advance(0.05)  # below mininterval -> no EMA sample -> rate stays None
+            pbar.update(17664, 85211)
+            d = pbar._pbar.format_dict
+            assert d["rate"] is None
+            # (85211 - 17664) frames * 0.05 s / 17664 frames ~= 0.19 s -> rounds to 0.
+            assert d["custom_eta"] == "0с"
+
+    def test_helper_rate_and_elapsed_paths(self) -> None:
+        # Rate path at full episode scale (85211 frames must not break the arithmetic).
+        d_rate = {"total": 85211, "n": 17664, "rate": 1766.4}
+        assert _eta_seconds(d_rate) == pytest.approx((85211 - 17664) / 1766.4)
+        # Elapsed fallback at hour scale: 84211 frames * 100 s / 1000 frames = 8421.1 s.
+        d_elapsed = {"total": 85211, "n": 1000, "rate": None, "elapsed": 100.0}
+        assert _eta_seconds(d_elapsed) == pytest.approx(8421.1)
+        assert format_eta(_eta_seconds(d_elapsed)) == "2ч 20мин 21с"
+
+    def test_helper_unknown_inputs_yield_none(self) -> None:
+        assert _eta_seconds({}) is None
+        assert _eta_seconds({"total": None, "n": 0, "rate": None, "elapsed": 0.0}) is None
+        assert _eta_seconds({"total": 10, "n": 0, "rate": None, "elapsed": 5.0}) is None
+        assert _eta_seconds({"total": 10, "n": 5, "rate": 0, "elapsed": 0.0}) is None
+        assert _eta_seconds({"total": 10, "n": 10, "rate": 5.0, "elapsed": 2.0}) is None
 
 
 class _DummyTtyStream(_FakeStream):
@@ -174,14 +276,15 @@ class TestPipelineProgressBar:
             assert pbar._current_n == 50
         assert pbar.closed is True
 
-    def test_rate_formatting_in_format_dict(self) -> None:
-        stream = _DummyTtyStream()
-        mode = OutputMode(color=True, tty=True)
-        with PipelineProgressBar(total=100, stream=stream, mode=mode) as pbar:
+    def test_rate_formatting_in_format_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _FakeClock()
+        with _tty_pipeline_bar(monkeypatch, clock, total=100) as pbar:
             assert pbar._pbar is not None
-            # Force rate in format_dict
-            d = pbar._pbar.format_dict
-            assert "кадр/с" in str(d.get("custom_rate"))
+            # At zero progress there is no honest rate: dash, not «?».
+            assert pbar._pbar.format_dict.get("custom_rate") == "—"
+            clock.advance(10.0)
+            pbar.update(50, 100)
+            assert pbar._pbar.format_dict.get("custom_rate") == "5.0 кадр/с"
 
     def test_context_manager_closes_on_error(self) -> None:
         stream = _DummyTtyStream()
@@ -231,11 +334,17 @@ class TestUploadProgressBar:
             assert pbar._current_n == 5 * 1024 * 1024
         assert pbar.closed is True
 
-    def test_rate_formatting_in_format_dict(self) -> None:
+    def test_rate_formatting_in_format_dict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = _FakeClock()
+        monkeypatch.setattr(tqdm.std, "time", clock)
         stream = _DummyTtyStream()
         mode = OutputMode(color=True, tty=True)
         reporter = Reporter(mode, stream=stream)
         with reporter.upload_progress_bar(total=1024 * 1024, filename="ep03.mkv") as pbar:
             assert pbar._pbar is not None
+            # At zero progress there is no honest rate: dash, not «?».
+            assert pbar._pbar.format_dict.get("custom_rate") == "—"
+            clock.advance(2.0)
+            pbar.update(512 * 1024, 1024 * 1024)
             d = pbar._pbar.format_dict
-            assert "МБ/с" in str(d.get("custom_rate"))
+            assert d.get("custom_rate") == "0.2 МБ/с"
