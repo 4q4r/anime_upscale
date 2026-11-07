@@ -281,8 +281,8 @@ def _read_gpu_preference(exe_path: str) -> str | None:
         return None
     try:
         with winreg.OpenKey(  # ty: ignore[unresolved-attribute]
-            winreg.HKEY_CURRENT_USER,
-            _GPU_PREF_KEY,  # ty: ignore[unresolved-attribute]
+            winreg.HKEY_CURRENT_USER,  # ty: ignore[unresolved-attribute]
+            _GPU_PREF_KEY,
         ) as key:
             value, _value_type = winreg.QueryValueEx(key, exe_path)  # ty: ignore[unresolved-attribute]
     except OSError:
