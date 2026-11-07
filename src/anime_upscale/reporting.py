@@ -428,6 +428,22 @@ class PipelineProgressBar:
         """Whether the progress bar has been closed."""
         return self._closed
 
+    @property
+    def current_rate(self) -> float | None:
+        """
+        Rate from the underlying tqdm bar (frames/sec); None if unavailable.
+
+        The single rate source for RateWatch: the same number the bar renders,
+        never a duplicate measurement (anti-throttling wave P1). Disabled
+        (non-TTY) bars have no tqdm behind them → honestly None.
+        """
+        if self._pbar is None:
+            return None
+        rate = self._pbar.format_dict.get("rate")
+        if isinstance(rate, (int, float)) and rate > 0:
+            return float(rate)
+        return None
+
     def update(self, done: int, total: int) -> None:
         """Update progress from VapourSynth progress_update(done, total)."""
         if self._closed:
